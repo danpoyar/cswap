@@ -57,8 +57,12 @@ uv tool install --force git+https://github.com/danpoyar/cswap@main
 
 Same package name (`claude-swap`) and the same two entrypoints (`cswap`,
 `claude-swap`), so `~/bin/cswap`, the launchd job `com.amouen.cswap-auto` and
-Quota keep working untouched. Rollback to upstream is one command:
-`uv tool install --force claude-swap==0.22.0`.
+Quota keep working untouched. Rollback is one command — `uv tool install --force claude-swap==0.22.0` — but
+know what it costs: no PUBLISHED upstream release carries `lastGoodUsage`
+(it landed on main on 2026-07-28), so Quota loses every stored reading and
+shows "No data" for each parked slot. It says so in the footer rather than
+going quiet, and the way back is this fork. To roll back only OUR commits,
+install an earlier ref of this repo instead: `…@<sha>`.
 
 State lives outside the install and is never touched by reinstalling:
 `~/.claude-swap-backup/` (sequence, usage store, autoswitch state) and the
