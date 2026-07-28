@@ -73,7 +73,7 @@ def _make_fake_keyring() -> types.ModuleType:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_real_home(request, tmp_path_factory, monkeypatch):
+def _isolate_real_home(request, tmp_path_factory):
     """Safety net: no test may read or write the developer's real ``$HOME``.
 
     Some tests (CLI/TUI argument tests that call ``main()``, etc.) construct a real
@@ -95,22 +95,33 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     either exported could otherwise have tests read/write real Claude config or
     backup paths — and on macOS that leads back to the real Keychain. Tests that
     exercise those vars set them explicitly, overriding this.
+
+    Patches through a PRIVATE ``MonkeyPatch``, not the shared fixture: a test
+    that calls ``monkeypatch.undo()`` to drop its own injected failure would
+    otherwise revert this safety net too, and the rest of that test would run
+    against the developer's real home.
     """
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    if "temp_home" in request.fixturenames:
-        return  # temp_home provides its own isolated home
-    if "tmp_keychain" in request.fixturenames:
-        return  # real-keychain integration tests need the real $HOME
-    safe_home = tmp_path_factory.mktemp("isolated_home")
-    (safe_home / ".claude").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HOME", str(safe_home))
-    monkeypatch.setenv("USERPROFILE", str(safe_home))
-    monkeypatch.setattr("pathlib.Path.home", lambda: safe_home)
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        mp.delenv("XDG_DATA_HOME", raising=False)
+        if "temp_home" in request.fixturenames:
+            yield  # temp_home provides its own isolated home
+        elif "tmp_keychain" in request.fixturenames:
+            yield  # real-keychain integration tests need the real $HOME
+        else:
+            safe_home = tmp_path_factory.mktemp("isolated_home")
+            (safe_home / ".claude").mkdir(parents=True, exist_ok=True)
+            mp.setenv("HOME", str(safe_home))
+            mp.setenv("USERPROFILE", str(safe_home))
+            mp.setattr("pathlib.Path.home", lambda: safe_home)
+            yield
+    finally:
+        mp.undo()
 
 
 @pytest.fixture(autouse=True)
-def block_real_keychain(request, monkeypatch):
+def block_real_keychain(request):
     """Safety net: no test may touch the real macOS Keychain.
 
     Replaces the ``security``-CLI wrapper (``claude_swap.macos_keychain``) with an
@@ -121,17 +132,28 @@ def block_real_keychain(request, monkeypatch):
     against a temporary keychain on GitHub Actions.
 
     Yields the in-memory :class:`_KeychainStore` so tests can seed/inspect it.
+
+    Patches through a PRIVATE ``MonkeyPatch`` for the same reason as
+    ``_isolate_real_home``: ``monkeypatch.undo()`` inside a test used to strip
+    this fake, and every later read went to the real macOS Keychain — which is
+    why six swap/move rollback tests "failed" on macOS while passing on Linux
+    CI. They were reading a real Keychain that had never heard of their
+    fixture accounts.
     """
     if request.node.get_closest_marker("no_keychain_fake"):
         yield None
         return
+    mp = pytest.MonkeyPatch()
     store = _KeychainStore()
-    monkeypatch.setattr(_macos_keychain, "get_password", store.get_password)
-    monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
-    monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
-    monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
-    monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
-    yield store
+    try:
+        mp.setattr(_macos_keychain, "get_password", store.get_password)
+        mp.setattr(_macos_keychain, "item_exists", store.item_exists)
+        mp.setattr(_macos_keychain, "set_password", store.set_password)
+        mp.setattr(_macos_keychain, "delete_password", store.delete_password)
+        mp.setitem(sys.modules, "keyring", _make_fake_keyring())
+        yield store
+    finally:
+        mp.undo()
 
 
 @pytest.fixture
