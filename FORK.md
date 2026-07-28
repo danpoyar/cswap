@@ -29,6 +29,14 @@ read in one sitting.
   purpose: `move` is outside the fleet law this fork is maintained for, and
   the fix belongs upstream where the ordering was designed.
 
+- `list --json` also reports `lastError` + `consecutiveFailures` on a slot
+  with an open failure streak (`json_output.fetch_failure_fields`). Upstream
+  exposes the last-good measurement but not WHY it stopped moving, so a
+  consumer cannot tell an account parked at its limit from one whose token
+  died — both serve the same quiet numbers, and stale zeroes read like a free
+  account. This is what lets Quota render "http-429 · 5d ago" without reading
+  cswap's private store file. Worth sending upstream.
+
 ## Syncing with upstream
 
 ```

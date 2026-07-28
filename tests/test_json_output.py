@@ -662,3 +662,47 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+class TestAccountRowFetchFailure:
+    """The additive ``lastError``/``consecutiveFailures`` fields on --list rows.
+
+    A parked account (at its limit, next poll scheduled for the reset) and one
+    whose token died hours ago both serve quiet last-good numbers; without
+    these a consumer cannot tell them apart, and stale zeroes read like a free
+    account.
+    """
+
+    def test_failure_streak_reported(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="http-429", consecutive_failures=617,
+        )
+        assert row["lastError"] == "http-429"
+        assert row["consecutiveFailures"] == 617
+
+    def test_absent_without_a_streak(self):
+        """A slot that recovered carries no error: the streak is what matters,
+        not the last error string the store still remembers."""
+        row = account_row(
+            1, "a@example.com", "", "", False, None,
+            last_error="http-429", consecutive_failures=0,
+        )
+        assert "lastError" not in row
+        assert "consecutiveFailures" not in row
+
+    def test_absent_by_default(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "lastError" not in row
+
+    def test_reported_alongside_a_live_measurement(self):
+        """A slot can be failing NOW while its last success is still inside the
+        decision window — the error must not wait for the usage to go stale."""
+        usage = {"five_hour": {"pct": 10.0}}
+        row = account_row(
+            3, "c@example.com", "", "", False, usage,
+            usage_fetched_at=1700000000.0, usage_age_s=12.0,
+            last_error="timeout", consecutive_failures=2,
+        )
+        assert row["usage"]["fiveHour"]["pct"] == 10.0
+        assert row["lastError"] == "timeout"

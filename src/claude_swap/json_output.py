@@ -194,6 +194,21 @@ def last_good_usage_fields(
     return out
 
 
+def fetch_failure_fields(last_error: str | None, consecutive_failures: int) -> dict:
+    """Why a slot's measurement stopped moving, when it is a failure rather
+    than the scheduler's own cadence.
+
+    Without it a consumer cannot tell a deliberately parked account (at its
+    limit, next poll scheduled for the reset) from one whose token died hours
+    ago: both serve the same quiet last-good numbers, and stale zeroes read
+    like a free account. Emitted only while a failure streak is open, so a
+    slot that recovered carries nothing.
+    """
+    if not last_error or consecutive_failures <= 0:
+        return {}
+    return {"lastError": last_error, "consecutiveFailures": consecutive_failures}
+
+
 def account_row(
     number: int,
     email: str,
@@ -205,6 +220,8 @@ def account_row(
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
+    last_error: str | None = None,
+    consecutive_failures: int = 0,
     alias: str = "",
     disabled: bool = False,
 ) -> dict:
@@ -234,6 +251,9 @@ def account_row(
                 last_good_usage, usage_fetched_at, usage_age_s
             )
         )
+    # Independent of which usage shape was served: a slot can be failing while
+    # its last successful measurement is still inside the decision window.
+    row.update(fetch_failure_fields(last_error, consecutive_failures))
     return row
 
 

@@ -3529,6 +3529,8 @@ class ClaudeAccountSwitcher:
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
+                    last_error=entry.last_error,
+                    consecutive_failures=entry.consecutive_failures,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                 )
