@@ -29,6 +29,17 @@ read in one sitting.
   purpose: `move` is outside the fleet law this fork is maintained for, and
   the fix belongs upstream where the ordering was designed.
 
+- Quiet gate on voluntary switches (`autoswitch.py`): proactive/consume-first
+  switches are held until no `~/.claude/projects/**/*.jsonl` transcript has
+  been written for 5 minutes (`QUIET_WINDOW_S`), because prompt caches are
+  per-organization and a swap under live traffic full-misses the next turn of
+  every running session (measured on this fleet: 47/64 FULL-MISS turns within
+  ±2 min of a switch). At-limit/failover bypass the gate. Every `switch` event
+  carries an additive `gate: "quiet"|"forced"` field = traffic state at swap
+  time, so cache damage per switch is measurable from the log. Fleet policy
+  on this machine (settings.json, not code): threshold 95, cooldownSeconds
+  7200. Upstream may want this too, but the transcript-path heuristic is
+  Claude-Code-layout-specific — offer upstream after it survives the fleet.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a

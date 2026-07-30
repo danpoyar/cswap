@@ -14,7 +14,13 @@ still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 ``hysteresis_pct`` below the threshold so two accounts hovering at the line
 never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
+(bypassed only when the active account is hard at its limit). Voluntary
+switches also wait for session-traffic silence (the quiet gate): every org
+has its own prompt-cache namespace, so a swap under live traffic full-misses
+the next turn of every running session — proactive switches are held until
+no ``~/.claude/projects/**/*.jsonl`` transcript has been written for
+``QUIET_WINDOW_S`` (by then those caches have expired on their own);
+at-limit and failover are escapes and ignore the gate. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
 under-lock re-read sees a fresh token and aborts its own refresh); a target
@@ -32,6 +38,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -41,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, paths, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -77,6 +84,39 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# Quiet gate for voluntary switches. Prompt caches are per-organization, so a
+# switch under live session traffic full-misses the next turn of every running
+# session (measured: 47/64 FULL-MISS turns landed within ±2 min of a switch).
+# A session transcript under ~/.claude/projects/ is appended on every turn —
+# main sessions and workflow subagents alike — so "newest *.jsonl mtime older
+# than the 5-minute cache TTL" means every cache a swap could burn has already
+# expired. Voluntary (proactive/consume-first) switches wait for that silence;
+# at-limit and failover switches are forced and skip the gate.
+QUIET_WINDOW_S = 5 * 60.0
+
+
+def latest_session_activity_ts(projects_dir: Path) -> float | None:
+    """Newest mtime among session transcripts (``<projects_dir>/**/*.jsonl``),
+    or None when there are none (or the directory doesn't exist).
+
+    ``os.walk`` swallows unreadable directories and a per-file ``stat`` race
+    is skipped: the gate must degrade toward "assume quiet" only when there
+    is provably nothing to read, never crash a tick.
+    """
+    latest: float | None = None
+    for dirpath, _dirnames, filenames in os.walk(projects_dir):
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                mtime = os.stat(os.path.join(dirpath, name)).st_mtime
+            except OSError:
+                continue
+            if latest is None or mtime > latest:
+                latest = mtime
+    return latest
+
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -205,6 +245,13 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Session-traffic state at the moment of the swap, so the cache damage per
+    # switch is measurable from the log alone: "quiet" = no transcript write
+    # for QUIET_WINDOW_S (live prompt caches already expired — the swap burned
+    # nothing); "forced" = live traffic existed but the switch had to happen
+    # anyway (at-limit/failover). Voluntary triggers can only ever log "quiet"
+    # — the quiet gate blocks them otherwise. Additive field.
+    gate: str = "forced"
 
     def _fields(self) -> dict:
         return {
@@ -213,6 +260,7 @@ class SwitchEvent(AutoSwitchEvent):
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
+            "gate": self.gate,
         }
 
     def human(self) -> str:
@@ -225,7 +273,7 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate})"
 
 
 @dataclass(frozen=True)
@@ -428,6 +476,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        claude_projects_dir: Path | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -445,6 +494,13 @@ class AutoSwitchEngine:
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
+        # Where the quiet gate looks for session transcripts; injectable for
+        # tests, defaults to the same config home Claude Code resolves.
+        self.claude_projects_dir = (
+            claude_projects_dir
+            if claude_projects_dir is not None
+            else paths.get_claude_config_home() / "projects"
+        )
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
@@ -818,6 +874,12 @@ class AutoSwitchEngine:
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
+
+        if trigger in ("proactive", "consume-first"):
+            quiet, detail = self._session_quiet()
+            if not quiet:
+                self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
+                return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
         candidates = [
@@ -1268,12 +1330,14 @@ class AutoSwitchEngine:
         if self.dry_run:
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
+            quiet, _ = self._session_quiet()
             self._emit(
                 SwitchEvent(
                     trigger=trigger,
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    gate="quiet" if quiet else "forced",
                 )
             )
             return TickOutcome.SWITCHED
@@ -1288,6 +1352,16 @@ class AutoSwitchEngine:
             state = self._read_state()
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+
+            # Re-measure traffic right before the swap: candidate freshening
+            # (a network round-trip) sits between the tick-top gate and here,
+            # and a session waking up in that window must still block a
+            # voluntary switch. The same measurement labels the event, so
+            # every logged switch carries the traffic state it landed in.
+            quiet, detail = self._session_quiet()
+            if trigger in ("proactive", "consume-first") and not quiet:
+                self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
                 return TickOutcome.NO_ACTION
 
             result = self.switcher.switch_to(number, json_output=True)
@@ -1311,6 +1385,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                gate="quiet" if quiet else "forced",
             )
         )
         return TickOutcome.SWITCHED
@@ -1322,6 +1397,24 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _session_quiet(self) -> tuple[bool, str]:
+        """Whether session traffic has been silent for ``QUIET_WINDOW_S``.
+
+        Returns ``(quiet, detail)``. No transcripts at all is quiet (nothing
+        to burn). A transcript mtime *ahead* of the clock (clock skew, or a
+        write racing the scan) counts as activity — the conservative side.
+        """
+        latest = latest_session_activity_ts(self.claude_projects_dir)
+        if latest is None:
+            return True, "no session transcripts"
+        age = self.clock() - latest
+        if age >= QUIET_WINDOW_S:
+            return True, f"last session write {age:.0f}s ago"
+        return False, (
+            f"last session write {age:.0f}s ago; a voluntary switch waits "
+            f"for {QUIET_WINDOW_S / 60:.0f}m of transcript silence"
+        )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]

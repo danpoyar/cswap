@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -459,6 +460,199 @@ class TestDecisionTable:
         assert event.earliest_reset_at is None
         assert harness.engine._sleep_until_ts is None
         assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
+
+# Real transcript-record shapes, as Claude Code writes them (first lines of a
+# live ~/.claude/projects/<munged-cwd>/<session-uuid>.jsonl).
+_TRANSCRIPT_LINES = (
+    '{"type":"last-prompt","leafUuid":"0fdf8735-e4dd-4b5b-af96-090f5557e015",'
+    '"sessionId":"755b81b7-819f-4039-a59d-965564f875d2"}\n'
+    '{"type":"mode","mode":"normal",'
+    '"sessionId":"755b81b7-819f-4039-a59d-965564f875d2"}\n'
+)
+
+# Both live layouts: a main session transcript, and a workflow subagent's
+# transcript nested three directories deeper.
+_MAIN_SESSION_REL = "-Users-philosopher/755b81b7-819f-4039-a59d-965564f875d2.jsonl"
+_SUBAGENT_REL = (
+    "-Users-philosopher/0c51f7df-8906-4d82-bc46-a85d3b7154bd/subagents/"
+    "workflows/wf_61fb8766-23a/agent-ad4d85f249c88950c.jsonl"
+)
+
+
+def _write_transcript(
+    harness: EngineHarness, age_s: float, rel: str = _MAIN_SESSION_REL
+) -> Path:
+    """Write a real-format session transcript whose mtime is ``age_s`` before
+    the harness clock's now."""
+    path = harness.temp_home / ".claude" / "projects" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_TRANSCRIPT_LINES)
+    ts = harness.clock.now - age_s
+    os.utime(path, (ts, ts))
+    return path
+
+
+class TestQuietGate:
+    """Voluntary switches wait for session-traffic silence.
+
+    A proactive swap invalidates the prompt caches of every live session on
+    the account being left (orgs don't share caches), so it is only allowed
+    once the newest ``~/.claude/projects/**/*.jsonl`` mtime is at least
+    QUIET_WINDOW_S old. At-limit/failover are escapes and ignore the gate.
+    """
+
+    _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+
+    def test_fresh_transcript_blocks_proactive(self, harness):
+        _write_transcript(harness, age_s=10.0)
+        outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
+            "sessions-active"
+        ]
+        assert "lastSwitchAt" not in harness.state()
+
+    def test_stale_transcript_allows_proactive(self, harness):
+        _write_transcript(harness, age_s=360.0)  # 6 min > 5 min window
+        outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.gate == "quiet"
+        assert switch.to_json()["gate"] == "quiet"
+
+    def test_fresh_subagent_transcript_blocks_proactive(self, harness):
+        # Subagent transcripts live 3 levels deeper; the scan must recurse.
+        _write_transcript(harness, age_s=10.0, rel=_SUBAGENT_REL)
+        outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
+            "sessions-active"
+        ]
+
+    def test_newest_transcript_wins(self, harness):
+        # An old main session plus a busy subagent: the newest mtime gates.
+        _write_transcript(harness, age_s=3600.0)
+        _write_transcript(harness, age_s=10.0, rel=_SUBAGENT_REL)
+        outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_no_transcripts_is_quiet(self, harness):
+        # Nothing under projects/ → nothing to burn → proactive allowed.
+        outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.gate == "quiet"
+
+    def test_at_limit_ignores_quiet_gate(self, harness):
+        _write_transcript(harness, age_s=10.0)
+        outcome = harness.tick_with_usage({
+            "1": _usage(100), "2": _usage(40), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert switch.gate == "forced"
+        assert switch.to_json()["gate"] == "forced"
+
+    def test_at_limit_during_quiet_is_labeled_quiet(self, harness):
+        # The gate field records the traffic state at swap time, so forced
+        # triggers during real silence are measurably harmless.
+        _write_transcript(harness, age_s=360.0)
+        outcome = harness.tick_with_usage({
+            "1": _usage(100), "2": _usage(40), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert switch.gate == "quiet"
+
+    def test_failover_ignores_quiet_gate(self, harness):
+        _write_transcript(harness, age_s=10.0)
+        usage = {"1": None, "2": _usage(10), "3": _usage(50)}
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert switch.gate == "forced"
+
+    def test_perform_rechecks_quiet_under_lock(self, harness):
+        """Traffic appearing between the tick-top gate and the actual switch
+        (token freshening can take seconds) must still block the swap."""
+        real_freshen = harness.engine._freshen_target
+
+        def freshen_then_traffic(number, email):
+            status = real_freshen(number, email)
+            _write_transcript(harness, age_s=10.0)
+            return status
+
+        with patch.object(
+            harness.engine, "_freshen_target", side_effect=freshen_then_traffic
+        ):
+            outcome = harness.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert "sessions-active" in [
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ]
+
+
+class TestProactiveMinimumInterval:
+    """cooldown_seconds is the minimum spacing between voluntary switches;
+    the fleet runs it at 2 hours (settings.json), so prove the mechanism
+    holds at that value and that at-limit still escapes."""
+
+    _TWO_HOURS = 7200.0
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, cooldown_seconds=self._TWO_HOURS)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_second_proactive_within_two_hours_is_blocked(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(
+            {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+        ) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+        h.clock.advance(3600.0)  # 1h later — inside the 2h floor
+        h.events.clear()
+        outcome = h.tick_with_usage(
+            {"3": _usage(96), "1": _usage(50), "2": _usage(40)}
+        )
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "cooldown"
+        ]
+
+        h.clock.advance(3601.0)  # 2h+1s after the first switch
+        h.events.clear()
+        assert h.tick_with_usage(
+            {"3": _usage(96), "1": _usage(50), "2": _usage(40)}
+        ) is TickOutcome.SWITCHED
+
+    def test_at_limit_bypasses_two_hour_interval(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(
+            {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+        ) is TickOutcome.SWITCHED
+        h.clock.advance(60.0)
+        h.events.clear()
+        outcome = h.tick_with_usage(
+            {"3": _usage(100), "1": _usage(50), "2": _usage(40)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
 
 
 class TestIdleHold:
