@@ -3533,6 +3533,7 @@ class ClaudeAccountSwitcher:
                     consecutive_failures=entry.consecutive_failures,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    next_poll_at=entry.next_poll_at,
                 )
             )
         payload = {

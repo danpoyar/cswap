@@ -706,3 +706,74 @@ class TestAccountRowFetchFailure:
         )
         assert row["usage"]["fiveHour"]["pct"] == 10.0
         assert row["lastError"] == "timeout"
+
+
+class TestAccountRowNextPoll:
+    """The additive ``nextPollAt`` field on --list rows: when the scheduler
+    plans to measure this slot next. Same ISO-8601 UTC "Z" shape as
+    ``usageFetchedAt``."""
+
+    def test_next_poll_at_emitted_as_iso_utc(self):
+        row = account_row(
+            1, "a@example.com", "", "", False, None,
+            next_poll_at=1700000000.0,
+        )
+        assert row["nextPollAt"] == "2023-11-14T22:13:20Z"
+
+    def test_absent_when_none(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "nextPollAt" not in row
+
+    def test_emitted_alongside_live_usage(self):
+        usage = {"five_hour": {"pct": 10.0}}
+        row = account_row(
+            1, "a@example.com", "", "", False, usage,
+            usage_fetched_at=1700000000.0, usage_age_s=5.0,
+            next_poll_at=1700000600.0,
+        )
+        assert row["usage"] is not None
+        assert row["nextPollAt"] == "2023-11-14T22:23:20Z"
+
+    def test_emitted_alongside_last_good_usage(self):
+        """The plan is scheduler state, not measurement state — it must not
+        disappear just because the served usage fell back to last-good."""
+        row = account_row(
+            1, "a@example.com", "", "", False, None,
+            usage_fetched_at=1690000000.0, usage_age_s=10000000.0,
+            last_good_usage={"five_hour": {"pct": 25.0}},
+            next_poll_at=1700000000.0,
+        )
+        assert row["usage"] is None
+        assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+        assert row["nextPollAt"] == "2023-11-14T22:13:20Z"
+
+
+class TestListPayloadNextPoll:
+    """``_build_list_payload`` forwards the store's per-slot poll plan."""
+
+    def test_payload_row_carries_next_poll_at(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        import time as time_mod
+
+        from claude_swap.usage_store import UsageEntry
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        info = [
+            (1, "account1@example.com", "", "", True, "creds-1", ""),
+            (2, "account2@example.com", "", "", False, "creds-2", ""),
+        ]
+        now = time_mod.time()
+        entries = {
+            "1": UsageEntry(
+                last_good={"five_hour": {"pct": 10.0}},
+                fetched_at=now, age_s=0.0, next_poll_at=1700000000.0,
+            ),
+            "2": UsageEntry(),
+        }
+        payload = switcher._build_list_payload(info, entries)
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[1]["nextPollAt"] == "2023-11-14T22:13:20Z"
+        assert "nextPollAt" not in by_num[2]

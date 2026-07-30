@@ -34,6 +34,16 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 USAGE_RELOGIN_REQUIRED = "re-login needed"
 
 
+def _iso_utc(ts: float) -> str:
+    """Epoch seconds → ISO-8601 UTC with a ``Z`` suffix (the schema-wide
+    timestamp shape, matching the export envelope in transfer.py)."""
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _window_to_json(entry: dict) -> dict:
     """Project a 5h/7d usage window to JSON, preserving raw ``resetsAt``.
 
@@ -69,9 +79,7 @@ def _pace_fields(entry: dict, fetched_at: float | None) -> dict:
     }
     eta = pace.projected_exhaustion_ts(result, fetched_at=fetched_at)
     if eta is not None:
-        out["projectedExhaustionAt"] = (
-            datetime.fromtimestamp(eta, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        )
+        out["projectedExhaustionAt"] = _iso_utc(eta)
     will_last = pace.will_last_to_reset(result)
     if will_last is not None:
         out["willLastToReset"] = will_last
@@ -166,13 +174,7 @@ def usage_freshness_fields(
     data on fetch failure). Emitted only alongside a non-null ``usage``."""
     if fetched_at is None:
         return {}
-    fields: dict = {
-        "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-    }
+    fields: dict = {"usageFetchedAt": _iso_utc(fetched_at)}
     if age_s is not None:
         fields["usageAgeSeconds"] = round(age_s, 1)
     return fields
@@ -224,6 +226,7 @@ def account_row(
     consecutive_failures: int = 0,
     alias: str = "",
     disabled: bool = False,
+    next_poll_at: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -254,6 +257,11 @@ def account_row(
     # Independent of which usage shape was served: a slot can be failing while
     # its last successful measurement is still inside the decision window.
     row.update(fetch_failure_fields(last_error, consecutive_failures))
+    # Additive: when the scheduler plans to measure this slot next. Scheduler
+    # state, not measurement state — emitted whether live or last-good usage
+    # is being served.
+    if next_poll_at is not None:
+        row["nextPollAt"] = _iso_utc(next_poll_at)
     return row
 
 
