@@ -1377,6 +1377,11 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # Why the daemon switched, for human-facing consumers (the Quota
+            # panel). Additive fields — same contract as SwitchEvent payloads:
+            # no schema bump, readers ignore unknown keys.
+            state["lastSwitchTrigger"] = trigger
+            state["lastSwitchGate"] = "quiet" if quiet else "forced"
             atomic_write_json(self.state_path, state)
 
         self._emit(

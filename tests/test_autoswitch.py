@@ -182,6 +182,19 @@ class TestDecisionTable:
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
         assert harness.state()["lastSwitchTo"] == "3"
 
+    def test_state_records_trigger_and_gate(self, harness):
+        # The state file must carry WHY the daemon switched, so the Quota
+        # panel can explain the last switch to a human. Additive fields:
+        # schemaVersion stays put, consumers ignore unknown keys.
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        state = harness.state()
+        assert state["lastSwitchTrigger"] == "proactive"
+        # A proactive switch only proceeds through the quiet gate.
+        assert state["lastSwitchGate"] == "quiet"
+
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)
         assert h.engine.tick() is TickOutcome.NO_ACTION
