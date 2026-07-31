@@ -871,7 +871,13 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        # Cooldown only debounces the voluntary consume-first rotation
+        # (reset-order churn). Proactive means the threshold is already
+        # crossed — "time to leave", not an optimization — so holding it
+        # here just rides the account into the wall (2026-07-31 incident:
+        # eight minutes of no-switch cooldown at 98%, then a forced
+        # at-limit escape).
+        if trigger == "consume-first" and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1145,12 +1151,18 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
+            # An account at/over the threshold re-triggers on the very next
+            # tick — voluntary triggers refuse it outright; escapes keep it
+            # as a last resort but rank every healthy landing first (the
+            # unhealthy flag leads the sort key below). 2026-07-31 incident:
+            # an at-limit escape under consume-first ordering landed on a
+            # 1%-headroom account while 38%/60% accounts sat idle.
+            unhealthy = (100.0 - h) >= settings.threshold
             if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold:
+                # Landing must be healthy. At-limit and failover are escapes
+                # that skip this whole block — any account with real headroom
+                # beats a blocked or dead one.
+                if unhealthy:
                     continue
                 if consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1169,12 +1181,19 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
+            # Healthy landings before unhealthy ones (only escapes ever keep
+            # unhealthy candidates); within each group the strategy's own
+            # order applies.
             if consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
-                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+                key: tuple = (
+                    unhealthy,
+                    reset_ts if reset_ts is not None else float("inf"),
+                    -h,
+                )
             else:
-                key = (-h,)
+                key = (unhealthy, -h)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
@@ -1350,7 +1369,10 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            # Same law as the tick-top gate: cooldown holds only the
+            # voluntary consume-first rotation; proactive is already past
+            # the threshold and must go.
+            if trigger == "consume-first" and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

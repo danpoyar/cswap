@@ -323,17 +323,11 @@ class TestDecisionTable:
         )
         assert exhausted.earliest_reset_at == reset
 
-    def test_cooldown_suppresses_proactive(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
-        )
-        outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(10),
-        })
-        assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
-            "cooldown"
-        ]
+    # test_cooldown_suppresses_proactive was retired after the 2026-07-31
+    # incident: cooldown no longer holds proactive (see
+    # test_proactive_escapes_cooldown below). Its real intent — cooldown
+    # debounces VOLUNTARY switches — lives on through the consume-first
+    # trigger in TestConsumeFirstStrategy::test_respects_cooldown.
 
     def test_at_limit_bypasses_cooldown(self, harness):
         harness.engine._mutate_state(
@@ -347,15 +341,26 @@ class TestDecisionTable:
         assert switch.trigger == "at-limit"
         assert harness.active_number() == 2
 
-    def test_cooldown_expires(self, harness):
+    def test_proactive_escapes_cooldown(self, harness):
+        # Incident 2026-07-31 (~11:30 UTC, cswap-auto.log): the active slot
+        # sat at 98% with threshold 95 for eight minutes emitting "no-switch
+        # cooldown" until it hit 100% and took the forced at-limit exit.
+        # Over the threshold a switch is no longer a voluntary optimization —
+        # cooldown must only debounce the voluntary consume-first rotation.
         harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock())
+            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
         )
-        harness.clock.advance(400)  # past the 300s default cooldown
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(50),
+            "1": _usage(95), "2": _usage(10), "3": _usage(10),
         })
         assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    # test_cooldown_expires moved to
+    # TestConsumeFirstStrategy::test_cooldown_expires: since proactive
+    # escapes cooldown (2026-07-31 incident), expiry is only observable on
+    # the consume-first trigger — the proactive variant passed vacuously.
 
     def test_unknown_active_usage_waits_then_fails_over(self, harness):
         usage = {"1": None, "2": _usage(10), "3": _usage(50)}
@@ -614,44 +619,72 @@ class TestQuietGate:
         ]
 
 
-class TestProactiveMinimumInterval:
-    """cooldown_seconds is the minimum spacing between voluntary switches;
+class TestVoluntaryMinimumInterval:
+    """cooldown_seconds is the minimum spacing between VOLUNTARY switches;
     the fleet runs it at 2 hours (settings.json), so prove the mechanism
-    holds at that value and that at-limit still escapes."""
+    holds at that value. Since the 2026-07-31 incident (98% held for eight
+    minutes by "no-switch cooldown" until the wall) the only voluntary
+    trigger is consume-first below the threshold — proactive means the
+    threshold is crossed and escapes, like at-limit always did. The blocked
+    case therefore lives on the consume-first trigger."""
 
     _TWO_HOURS = 7200.0
 
-    def _harness(self, temp_home: Path) -> EngineHarness:
-        h = EngineHarness(temp_home, cooldown_seconds=self._TWO_HOURS)
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, cooldown_seconds=self._TWO_HOURS, **kwargs)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
         return h
 
-    def test_second_proactive_within_two_hours_is_blocked(self, temp_home):
-        h = self._harness(temp_home)
-        assert h.tick_with_usage(
-            {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
-        ) is TickOutcome.SWITCHED
-        assert h.active_number() == 3
+    def test_second_voluntary_within_two_hours_is_blocked(self, temp_home):
+        h = self._harness(temp_home, strategy="consume-first")
+        assert h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
 
         h.clock.advance(3600.0)  # 1h later — inside the 2h floor
         h.events.clear()
-        outcome = h.tick_with_usage(
-            {"3": _usage(96), "1": _usage(50), "2": _usage(40)}
-        )
+        outcome = h.tick_with_usage({
+            "2": _usage7(20, 20, _R_LATER),
+            "1": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),   # sooner target appears
+        })
         assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 3
+        assert h.active_number() == 2
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
             "cooldown"
         ]
 
         h.clock.advance(3601.0)  # 2h+1s after the first switch
         h.events.clear()
+        assert h.tick_with_usage({
+            "2": _usage7(20, 20, _R_LATER),
+            "1": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_proactive_bypasses_two_hour_interval(self, temp_home):
+        # The 2026-07-31 incident scenario at fleet settings: a second slot
+        # crosses the threshold inside the 2h window and must still leave.
+        h = self._harness(temp_home)
         assert h.tick_with_usage(
-            {"3": _usage(96), "1": _usage(50), "2": _usage(40)}
+            {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
         ) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.clock.advance(3600.0)  # 1h later — inside the 2h floor
+        h.events.clear()
+        outcome = h.tick_with_usage(
+            {"3": _usage(96), "1": _usage(50), "2": _usage(40)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
 
     def test_at_limit_bypasses_two_hour_interval(self, temp_home):
         h = self._harness(temp_home)
@@ -2312,6 +2345,24 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_at_limit_lands_healthy_over_sooner_reset(self, temp_home):
+        # Incident 2026-07-31: the forced at-limit escape ranked ALL h>0
+        # candidates by soonest weekly reset and landed on a 1%-headroom
+        # account — instantly at the wall again. An escape must still be
+        # able to land anywhere with headroom, but healthy landings
+        # (utilization < threshold) sort before unhealthy ones; reset order
+        # only ranks within each group.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20, _R_LATER),   # active at its limit -> must move
+            "2": _usage7(98, 40, _R_SOON),     # sooner reset, but 2% headroom
+            "3": _usage7(40, 10, _R_LATEST),   # later reset, 60% headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s
         h.tick_with_usage({
@@ -2330,6 +2381,27 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 2
         assert "cooldown" in [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_cooldown_expires(self, temp_home):
+        # Moved from TestDecisionTable when proactive stopped honoring
+        # cooldown (2026-07-31 incident): expiry is only observable on the
+        # voluntary consume-first trigger now.
+        h = self._harness(temp_home)  # default cooldown 300s
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert h.active_number() == 2
+        h.clock.advance(400)  # past the 300s default cooldown
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _usage7(20, 20, _R_LATER),
+            "1": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
 
     def test_locked_recheck_stops_concurrent_engine(self, temp_home):
         """The under-lock cooldown recheck in _perform must cover consume-first.
