@@ -987,7 +987,11 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-comparison",
-                        detail="no candidate has readable usage",
+                        detail=(
+                            "no candidate has provable headroom (usage "
+                            "unreadable, or a configured model window "
+                            "unreported)"
+                        ),
                     )
                 )
                 return TickOutcome.BLOCKED
@@ -1481,8 +1485,10 @@ class AutoSwitchEngine:
                 ConfigWarningEvent(
                     message=(
                         f"autoswitch.model: {', '.join(missing)} matches no "
-                        "account's usage windows — only the 5h/7d limits are "
-                        "being watched for it (typo?)"
+                        "account's usage windows — a configured window nobody "
+                        "reports makes every account's headroom unknown, so "
+                        "auto-switching is blocked until the name is fixed "
+                        "(typo?)"
                     )
                 )
             )
