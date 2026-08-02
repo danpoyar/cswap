@@ -84,7 +84,13 @@ class TestAccountHeadroom:
         assert oauth.account_headroom(usage, ["fable"]) == 30.0
 
     def test_unlisted_model_does_not_bind(self):
-        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Opus", "pct": 100.0}]}
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 5.0},
+                {"name": "Opus", "pct": 100.0},
+            ],
+        }
         assert oauth.account_headroom(usage, ["Fable"]) == 90.0
 
     def test_multiple_models_take_the_worst(self):
@@ -93,10 +99,11 @@ class TestAccountHeadroom:
             "scoped": [
                 {"name": "Fable", "pct": 30.0},
                 {"name": "Opus", "pct": 95.0},
-                {"name": "Haiku", "pct": 50.0},
+                {"name": "Sonnet", "pct": 50.0},
+                {"name": "Haiku", "pct": 99.0},
             ],
         }
-        # Opus binds (95%); Sonnet is absent and simply contributes nothing.
+        # Opus binds (95%); Haiku is unlisted and contributes nothing.
         assert oauth.account_headroom(usage, ["Fable", "Opus", "Sonnet"]) == 5.0
 
     def test_works_for_any_model_name(self):
@@ -122,6 +129,44 @@ class TestAccountHeadroom:
         }
         assert oauth.account_headroom(usage, ["all"]) == 3.0
         assert oauth.account_headroom(usage, ["ALL"]) == 3.0
+
+    def test_configured_model_absent_from_usage_is_unknown(self):
+        # 2026-08-02 fleet incident: an account answering with healthy 5h/7d
+        # but NO scoped list at all read as 92% free and became the at-limit
+        # escape target — while its Fable status was actually unverified
+        # (sessions died on landing). A configured window the account did not
+        # report is an unknown, not a free pass.
+        usage = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 8.0}}
+        assert oauth.account_headroom(usage, ["Fable"]) is None
+
+    def test_configured_model_missing_among_other_scoped_is_unknown(self):
+        # The scoped list exists but lacks the configured window: same hole.
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [{"name": "Opus", "pct": 40.0}],
+        }
+        assert oauth.account_headroom(usage, ["Fable"]) is None
+
+    def test_malformed_configured_scoped_pct_is_unknown(self):
+        # A Fable entry whose pct is unusable must not fall back to 5h/7d.
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": None}],
+        }
+        assert oauth.account_headroom(usage, ["Fable"]) is None
+
+    def test_any_missing_of_multiple_configured_models_is_unknown(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 30.0}],
+        }
+        assert oauth.account_headroom(usage, ["Fable", "Opus"]) is None
+
+    def test_all_sentinel_without_scoped_data_keeps_account_windows(self):
+        # "all" names no particular window, so nothing can be "missing" —
+        # the account-wide windows still decide.
+        usage = {"five_hour": {"pct": 40.0}}
+        assert oauth.account_headroom(usage, ["all"]) == 60.0
 
 
 class TestRelevantWindows:

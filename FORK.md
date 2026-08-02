@@ -47,6 +47,17 @@ read in one sitting.
   died — both serve the same quiet numbers, and stale zeroes read like a free
   account. This is what lets Quota render "http-429 · 5d ago" without reading
   cswap's private store file. Worth sending upstream.
+- `oauth.account_headroom`: a *configured* per-model window (`autoswitch.model`)
+  that an account's usage does not report yields headroom `None` (unknown,
+  never an autoswitch target) instead of silently computing from the remaining
+  5h/7d windows. 2026-08-02 incident on this fleet: an account answering with
+  healthy 5h/7d but no `scoped` list at all read as 92% free and won the
+  at-limit escape (`lastSwitchTo: 18` in the state file) — landing every live
+  session on unverified Fable access. The `all` sentinel names no particular
+  window and is exempt. Fail-safe corollary: an inert/typo model name now
+  blocks `best`/autoswitch decisions entirely (with the existing
+  config-warning explaining why) instead of being silently ignored. Worth
+  sending upstream.
 
 ## Syncing with upstream
 

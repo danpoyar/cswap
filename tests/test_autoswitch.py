@@ -2155,6 +2155,31 @@ class TestModelAwareSwitch:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_missing_scoped_window_is_never_a_target(self, temp_home):
+        # 2026-08-02 fleet incident: a candidate reporting healthy 5h/7d but
+        # NO Fable scoped window read as 92% free and won the at-limit escape
+        # — landing every live session on unverified Fable access. Unknown
+        # must lose to a candidate whose Fable status is proven.
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),  # active: Fable maxed -> must leave
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 8.0}},
+            "3": _model_usage(5, 60),   # verified Fable room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_all_candidates_missing_scoped_window_stays_put(self, temp_home):
+        # Nowhere verified to land -> stay, never gamble on unknown access.
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _model_usage(5, 100),
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 8.0}},
+            "3": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 12.0}},
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
     def test_dual_exhausted_candidate_recovers_at_its_later_reset(self, temp_home):
         # #2 is blocked on both its 5h (resets 12:00) and Fable (15:00): it's
         # only usable again at the LATER one. #3 recovers later still (20:00),
@@ -2174,6 +2199,7 @@ class TestModelAwareSwitch:
             "3": {
                 "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T20:00:00Z"},
                 "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
             },
         })
         assert outcome is TickOutcome.BLOCKED
@@ -2196,6 +2222,7 @@ class TestModelAwareSwitch:
             "3": {
                 "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T20:00:00Z"},
                 "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
             },
         })
         assert outcome is TickOutcome.BLOCKED

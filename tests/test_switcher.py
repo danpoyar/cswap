@@ -4978,7 +4978,10 @@ class TestUsageAwareSwitch:
         self._seed(s, 2, "b@example.com")
         self._make_live(temp_home, "a@example.com", 1)
 
-        # Current already best → already-best no-op.
+        # An inert model name means no account's headroom is provable
+        # (a configured window nobody reports is unknown, never a free
+        # pass), so every no-op collapses to usage-unavailable — and the
+        # warning is exactly what explains the block, so it must survive.
         usage = {"1": self._model_usage(0, 10), "2": self._model_usage(50, 10)}
         with patch.object(s, "_usage_by_account", return_value=usage):
             payload = s.switch(
@@ -4986,17 +4989,17 @@ class TestUsageAwareSwitch:
                 models=("Fabel",), model_source="cli",
             )
         assert payload["switched"] is False
-        assert payload["reason"] == "already-best"
+        assert payload["reason"] == "usage-unavailable"
         assert any("Fabel" in w for w in payload["warnings"])
 
-        # Everything exhausted → candidates-exhausted no-op.
+        # Same with everything exhausted on the real windows.
         usage = {"1": self._model_usage(100, 10), "2": self._model_usage(100, 10)}
         with patch.object(s, "_usage_by_account", return_value=usage):
             payload = s.switch(
                 strategy="best", json_output=True,
                 models=("Fabel",), model_source="cli",
             )
-        assert payload["reason"] == "candidates-exhausted"
+        assert payload["reason"] == "usage-unavailable"
         assert any("Fabel" in w for w in payload["warnings"])
 
     def test_manual_strategies_warn_on_inert_model_name(

@@ -515,9 +515,18 @@ def account_headroom(
     of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
     account is at or over a limit. Returns ``None`` when usage is unavailable
     or carries no window data, which callers treat as "unknown" (never
-    auto-skipped).
+    auto-skipped). A *named* model whose window the account did not report is
+    unknown too: computing headroom from the remaining windows would overstate
+    it exactly when the configured model's status is unverified (2026-08-02
+    fleet incident — a scoped-less account read as 92% free and won the
+    at-limit escape while its Fable access was dead). The ``all`` sentinel
+    names no particular window, so it never triggers this.
     """
-    pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
+    windows = relevant_windows(usage, models)
+    named = {m.lower() for m in models} - {"all"}
+    if named - {label.lower() for label, _, _ in windows}:
+        return None
+    pcts = [pct for _, pct, _ in windows]
     if not pcts:
         return None
     return 100.0 - max(pcts)
