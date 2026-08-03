@@ -3522,6 +3522,77 @@ class TestDeadTokenQuarantine:
         from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    def test_condemned_backup_grant_is_never_reposted(self, temp_home):
+        # CR1-F1 (round 1): the ACTIVE slot's parole compares the LIVE
+        # candidate, but the probe's recovery branch may consume the BACKUP.
+        # With live stuck on a stale foreign lineage (stale external sync /
+        # accessToken-only blob), every pass would parole and re-POST the
+        # condemned backup grant forever. The probe must refuse a condemned
+        # grant (no POST) and condemn the CANDIDATE that justified the
+        # parole, so the flow converges: exactly ONE POST total.
+        from claude_swap import oauth
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com",
+                             "accountUuid": "test-uuid-1234"},
+        }))
+        live_stale = json.dumps({"claudeAiOauth": {
+            # older generation than the backup, expired: never consumable
+            "accessToken": "at-live", "refreshToken": "rt-live",
+            "expiresAt": 500,
+        }})
+        backup_condemned = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-back", "refreshToken": "rt-dead",
+            "expiresAt": 1000,
+        }})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        info = [(1, "test@example.com", "Org", "", True, live_stale, "")]
+
+        posted = []
+
+        def fake_refresh(credentials, **kw):
+            posted.append(json.loads(credentials)["claudeAiOauth"]["refreshToken"])
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        with patch.object(switcher, "_read_credentials", return_value=live_stale), \
+             patch.object(switcher, "_read_account_credentials",
+                          return_value=backup_condemned), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=fake_refresh), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as usage_fetch:
+            e1 = switcher._collect_usage_entries(info)  # strike + stamp
+            e2 = switcher._collect_usage_entries(info)  # parole → refusal
+            e3 = switcher._collect_usage_entries(info)  # converged: quiet
+
+        usage_fetch.assert_not_called()
+        assert e1["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert e2["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert e3["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert posted == ["rt-dead"], (
+            f"condemned grant re-POSTed: {posted}"
+        )
+
+    def test_strike_stamp_prefers_consumed_lineage(self, temp_home):
+        # CR1-F2 (round 1): when the fetch chain rotated the credential before
+        # dying (pre-refresh success → 401 → retry-refresh invalid_grant), the
+        # condemned lineage is the SUCCESSOR the chain consumed, not the bytes
+        # the collector read. The outcome names it; the stamp must use it.
+        from claude_swap import oauth
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        info = (2, "test@example.com", "Org", "", False, self._dead_creds(), "")
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(
+                None, error="invalid_grant",
+                consumed_fingerprint="sha256:successor",
+            ),
+        ):
+            record = switcher._fetch_account_usage(info)
+        assert record.credential_fingerprint == "sha256:successor"
+
     def test_slot_with_no_credentials_stays_quarantined(self, temp_home):
         # No candidate bytes → nothing to parole: the empty-creds static
         # sentinel path must win, not an eternal parole loop.

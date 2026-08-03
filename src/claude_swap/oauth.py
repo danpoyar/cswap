@@ -546,6 +546,12 @@ class UsageOutcome:
     usage: dict | None
     error: str | None = None
     retry_after_s: float | None = None
+    # Fingerprint of the credential lineage whose refresh grant this attempt
+    # actually POSTed (the chain may have rotated past the caller's bytes:
+    # pre-refresh success → 401 → retry-refresh of the successor). Set only
+    # on permanent-auth failures — it names the condemned lineage for the
+    # store's quarantine stamp; None everywhere else.
+    consumed_fingerprint: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -594,7 +600,11 @@ def try_fetch_usage_for_account(
             # Don't hit the usage endpoint with a token we know is expired
             # (that just adds a 401/429 to a lost cause): report the permanent
             # failure distinctly so the store can quarantine the account.
-            return UsageOutcome(None, error="invalid_grant")
+            return UsageOutcome(
+                None,
+                error="invalid_grant",
+                consumed_fingerprint=credential_fingerprint(working_credentials),
+            )
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
@@ -621,7 +631,16 @@ def try_fetch_usage_for_account(
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error == "invalid_grant"
-            return UsageOutcome(None, error="invalid_grant" if dead else "refresh-failed")
+            return UsageOutcome(
+                None,
+                error="invalid_grant" if dead else "refresh-failed",
+                consumed_fingerprint=(
+                    # The grant POSTed here belongs to working_credentials —
+                    # possibly the successor a pre-fetch refresh persisted,
+                    # not the caller's original bytes.
+                    credential_fingerprint(working_credentials) if dead else None
+                ),
+            )
 
         working_credentials = refresh.credentials
         _persist(persist_credentials, account_num, email, working_credentials)

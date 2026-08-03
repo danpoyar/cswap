@@ -1422,3 +1422,55 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestConsumedFingerprint:
+    """The outcome names the lineage whose refresh grant the chain consumed."""
+
+    @staticmethod
+    def _creds(rt, expires_at=0):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": f"at-{rt}", "refreshToken": rt,
+            "expiresAt": expires_at,
+        }})
+
+    def test_retry_refresh_death_names_the_successor(self):
+        # Pre-refresh succeeds (rt-1 → rt-2, persisted), the fresh token 401s,
+        # the 401-retry refresh of the SUCCESSOR dies: the condemned lineage is
+        # rt-2 — the stamp source for the collector's parole bound.
+        creds_rt1 = self._creds("rt-1")
+        creds_rt2 = self._creds("rt-2", expires_at=2**62)
+        err_401 = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401,
+            "Unauthorized", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            side_effect=[
+                oauth.RefreshOutcome(creds_rt2, None),
+                oauth.RefreshOutcome(None, "invalid_grant"),
+            ],
+        ), patch(
+            "claude_swap.oauth.request_usage_data", side_effect=err_401,
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "t@example.com", creds_rt1, is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+        assert outcome.consumed_fingerprint == oauth.credential_fingerprint(
+            creds_rt2
+        )
+
+    def test_pre_refresh_death_names_the_original(self):
+        creds_rt1 = self._creds("rt-1")
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "t@example.com", creds_rt1, is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+        assert outcome.consumed_fingerprint == oauth.credential_fingerprint(
+            creds_rt1
+        )

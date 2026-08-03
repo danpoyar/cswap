@@ -2820,6 +2820,27 @@ class ClaudeAccountSwitcher:
                         restore_source = backup
                         working = backup
                     else:
+                        # Quarantine guard: never POST a grant the store has
+                        # already condemned. A parole is justified by the
+                        # CANDIDATE (live) lineage, but this branch may have
+                        # selected the slot's backup — with live stuck on a
+                        # stale foreign lineage that would re-POST the same
+                        # dead grant every pass. Refuse instead, and condemn
+                        # the candidate that justified the parole: the next
+                        # pass stays quiet until genuinely new bytes appear.
+                        condemned = self._usage_store.entries(
+                            {account_num: (email, org_uuid or "")}
+                        )[account_num].dead_token_fingerprint
+                        if condemned is not None and (
+                            oauth.credential_fingerprint(refresh_input)
+                            == condemned
+                        ):
+                            return FetchRecord(
+                                error="invalid_grant",
+                                credential_fingerprint=(
+                                    oauth.credential_fingerprint(creds)
+                                ),
+                            )
                         # The POST runs while holding the account FileLock
                         # (contended by `cswap switch` with a 10s acquire
                         # budget) and CC's credential locks. Bound it well
@@ -3098,10 +3119,14 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             # Names the lineage a permanent-auth failure condemns; the store
-            # reads it only then. The refresh this path may run POSTs exactly
-            # this credential's grant, so the fingerprint is the right one for
-            # both the pre-fetch and the 401-retry refresh failures.
-            credential_fingerprint=oauth.credential_fingerprint(creds),
+            # reads it only then. The outcome's own fingerprint wins — the
+            # chain may have rotated past ``creds`` (pre-refresh success →
+            # 401 → retry-refresh of the successor died); the caller's bytes
+            # are the fallback for paths that never rotated.
+            credential_fingerprint=(
+                outcome.consumed_fingerprint
+                or oauth.credential_fingerprint(creds)
+            ),
         )
 
     def _run_usage_fetches(
@@ -3127,8 +3152,10 @@ class ClaudeAccountSwitcher:
 
         Empty candidate bytes are never eligible (nothing to try). A row with
         no stamped lineage (legacy strike, or a strike that could not name its
-        credential) grants the one probe: the probe's outcome stamps the
-        lineage, so it cannot recur.
+        credential) grants the one probe: the probe's outcome stamps a
+        lineage either way — the consumed grant's on a POST death, the
+        candidate's on the active path's refusal to POST a condemned grant —
+        so the same candidate cannot re-parole and the flow converges.
         """
         fingerprint = oauth.credential_fingerprint(creds)
         return (
@@ -3180,31 +3207,37 @@ class ClaudeAccountSwitcher:
         # credential (live store for the active slot, backup for a parked one)
         # no longer matches the condemned lineage has been re-captured — a
         # re-login rotated it, or CC rotated past the dead copy — and earns a
-        # parole: quarantine lifted, one live fetch to prove the new token.
-        # Bounded by the fingerprint stamp: a failed parole condemns the NEW
-        # lineage, so the same bytes are never probed twice (the browser and
-        # the desktop app never touch these stores — without the parole, only
-        # a manual `cswap add` could lift the quarantine).
+        # parole: one live probe to prove the new generation. The row is NOT
+        # cleared first: the probe runs with the stamp intact (reserve's
+        # ``parole`` override), because the active-slot probe's guard reads
+        # the condemned lineage to refuse re-POSTing it, and only the probe's
+        # outcome may move the row — success resets everything, failure (or
+        # the guard's refusal) re-stamps, so the same lineage is never probed
+        # twice and the flow converges (without the parole, only a manual
+        # `cswap add` could lift the quarantine — the browser and the desktop
+        # app never touch these stores).
         # Surfacing the sentinel for the rest both drives the "re-login
         # needed" display and (via ``num not in sentinels`` below) stops the
         # endless fetch loop that would otherwise 401/429 forever.
-        paroled = [
+        paroled = {
             num
             for num, info in info_by_num.items()
             if num not in sentinels
             and entries[num].token_dead()
             and self._parole_eligible(entries[num], info[5])
-        ]
+        }
         if paroled:
-            store.clear_dead_token(paroled, identities)
-            entries = store.entries(identities, models)
             self._logger.info(
-                "Lifted dead-token quarantine for account(s) %s: a new "
-                "credential generation appeared; probing it.",
-                ", ".join(sorted(paroled)),
+                "Dead-token parole for account(s) %s: a new credential "
+                "generation appeared; probing it once.",
+                ", ".join(sorted(paroled, key=int)),
             )
         for num in info_by_num:
-            if num not in sentinels and entries[num].token_dead():
+            if (
+                num not in sentinels
+                and num not in paroled
+                and entries[num].token_dead()
+            ):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
         requested = [
             num
@@ -3222,6 +3255,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                parole=paroled,
             )
         else:
             claims = store.reserve(
@@ -3229,7 +3263,15 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                parole=paroled,
             )
+        # A paroled slot that did not win its probe this pass (not in the
+        # engine's fetch set, or a concurrent collector's claim) is still a
+        # quarantined slot to every consumer — show it as one instead of
+        # serving its dead-token failure state as an ordinary error row.
+        for num in paroled:
+            if num not in claims and num not in sentinels:
+                sentinels[num] = USAGE_RELOGIN_REQUIRED
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
         # collector's claim, poll-plan gate — must still surface the expired

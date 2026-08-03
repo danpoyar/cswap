@@ -814,6 +814,27 @@ class TestDeadTokenQuarantine:
         store.clear_dead_token(["1"], IDENT)
         assert store.entries(IDENT)["1"].dead_token_fingerprint is None
 
+    def test_reserve_refuses_quarantined_without_parole(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
+            IDENT,
+        )
+        clock.advance(10_000)  # past any backoff: the strikes gate must refuse
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+
+    def test_reserve_parole_overrides_strikes_and_backoff(self, store):
+        # The parole probe must run NOW, with the quarantine stamp intact:
+        # no clearing first (the probe's guard needs the condemned lineage),
+        # and the strike's failure backoff must not defer the one probe.
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
+            IDENT,
+        )
+        won = store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})
+        assert set(won) == {"1"}
+        # The stamp survives the reservation — only the probe's OUTCOME moves it.
+        assert store.entries(IDENT)["1"].dead_token_fingerprint == "sha256:aaa"
+
     def test_strike_without_fingerprint_overwrites_stale_one(self, store):
         # A strike that cannot name its credential must CLEAR the stamp, not
         # keep the old one: a stale fingerprint of an older generation would

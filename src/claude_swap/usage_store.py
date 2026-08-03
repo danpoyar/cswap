@@ -618,6 +618,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        parole: "set[str] | frozenset[str] | None" = None,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -640,6 +641,14 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``parole`` names quarantined slots the collector grants one probe (a
+        candidate credential of a generation the quarantine has not
+        condemned): for them the dead-strikes and failure-backoff gates are
+        skipped — the row itself (strikes, condemned fingerprint) stays
+        untouched, because the probe's guard needs the condemned lineage and
+        only the probe's OUTCOME may move the row. Claim fencing still
+        applies: two collectors can never double-probe.
         """
         nums = list(nums)
         if not nums:
@@ -656,7 +665,8 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row, now, respect_plans, repair_overslept,
+                        parole=bool(parole and num in parole),
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -812,14 +822,19 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    parole: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    (see :meth:`UsageStore.reserve` for the two caller modes; ``parole``
+    skips the quarantine and backoff gates for the collector's one probe)."""
+    if not parole and int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
-    if backoff_until is not None and now < backoff_until:
+    if not parole and backoff_until is not None and now < backoff_until:
         return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
