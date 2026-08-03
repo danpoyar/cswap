@@ -254,7 +254,7 @@ class TestConfigMisc:
 
         class FakeEngine:
             def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                         state_path=None, clock=None):
+                         state_path=None, clock=None, overrides=None):
                 captured["settings"] = settings
 
             def tick(self):

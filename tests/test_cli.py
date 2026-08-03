@@ -867,11 +867,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, overrides=None):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.overrides = overrides
             type(self).instances.append(self)
 
         def tick(self):
@@ -933,6 +934,14 @@ class TestAutoCommand:
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+        # ...and the flag is handed over as a pin, so the engine's per-tick
+        # settings reload keeps CLI above the file for the whole run, not
+        # just at startup.
+        assert engine.overrides == {"threshold": 60.0}
+
+    def test_unflagged_run_pins_nothing(self, temp_home):
+        self._run(["--once"], temp_home)
+        assert self.FakeEngine.instances[-1].overrides == {}
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)

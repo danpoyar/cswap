@@ -420,23 +420,46 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     return rows
 
 
-def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
-    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
-    overrides = {}
-    for attr, field in (
-        ("threshold", "threshold"),
-        ("interval", "interval_seconds"),
-        ("cooldown", "cooldown_seconds"),
-        ("include_api_key_accounts", "include_api_key_accounts"),
-        ("model", "model"),
-        ("strategy", "strategy"),
-    ):
+# argparse dest → AutoSwitchSettings field, for the `cswap auto` flags that
+# override the file.
+_CLI_OVERRIDE_FIELDS = (
+    ("threshold", "threshold"),
+    ("interval", "interval_seconds"),
+    ("cooldown", "cooldown_seconds"),
+    ("include_api_key_accounts", "include_api_key_accounts"),
+    ("model", "model"),
+    ("strategy", "strategy"),
+)
+
+
+def cli_overrides(args) -> dict[str, object]:
+    """Fields the user pinned with an explicit ``cswap auto`` flag.
+
+    Returned separately from the merged result so a long-running consumer can
+    keep honoring the flag while re-reading the file underneath it: an
+    explicit flag outranks settings.json for the whole run, not just at
+    startup.
+    """
+    overrides: dict[str, object] = {}
+    for attr, field in _CLI_OVERRIDE_FIELDS:
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value
+    return overrides
+
+
+def with_overrides(
+    settings: AutoSwitchSettings, overrides: dict[str, object]
+) -> AutoSwitchSettings:
+    """Overlay explicit overrides onto settings (clamped like a file load)."""
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))
+
+
+def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
+    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
+    return with_overrides(settings, cli_overrides(args))
 
 
 def atomic_write_json(path: Path, data: dict) -> None:

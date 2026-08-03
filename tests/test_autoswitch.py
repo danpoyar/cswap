@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from pathlib import Path
@@ -14,6 +15,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
+    SETTINGS_WATCH_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
@@ -29,7 +31,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, set_setting, unset_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -1765,6 +1767,247 @@ class TestSessionThreshold:
         assert {"1", "2", "3"} in self._collect_fetch_sets(harness, 90.0)
         # ...but not of 99.9 → baseline fetching only.
         assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
+
+
+def _scoped_usage(five_h: float, fable: float | None) -> dict:
+    """5h/7d plus (optionally) a per-model weekly Fable window."""
+    usage: dict = {"five_hour": {"pct": five_h}, "seven_day": {"pct": 10.0}}
+    if fable is not None:
+        usage["scoped"] = [{"name": "Fable", "pct": fable}]
+    return usage
+
+
+class TestSettingsReload:
+    """A settings.json edit reaches a *running* engine, no restart needed.
+
+    The model axes used to be frozen at construction, so toggling
+    ``autoswitch.model`` only took effect after the daemon was restarted —
+    which makes a settings-file-backed checkbox broken by construction.
+    """
+
+    def _seeded(self, temp_home: Path, **settings_kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, **settings_kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _two_ticks(self, harness, entries: dict, edit) -> list[PollEvent]:
+        """Run the loop for exactly two ticks, applying ``edit`` between them."""
+        ticks: list[int] = []
+        real_tick = harness.engine.tick
+
+        def tick_then_edit():
+            ticks.append(1)
+            outcome = real_tick()
+            if len(ticks) == 1:
+                edit()
+            else:
+                harness.engine.stop()
+            return outcome
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ), patch.object(
+            harness.engine, "tick", side_effect=tick_then_edit
+        ), patch.object(harness.engine._wake, "wait", return_value=None):
+            harness.engine.run_loop()
+        return [e for e in harness.events if isinstance(e, PollEvent)]
+
+    def test_model_key_appearing_rebinds_the_windows_mid_loop(self, harness):
+        # The fleet shape the toggle exists for: fine on 5h/7d, spent on the
+        # per-model weekly window.
+        entries = {
+            n: _entry_for(_scoped_usage(20.0, 96.0), harness.clock.now)
+            for n in ("1", "2", "3")
+        }
+        polls = self._two_ticks(
+            harness,
+            entries,
+            lambda: set_setting(
+                harness.switcher.backup_dir, "autoswitch.model", "Fable"
+            ),
+        )
+        assert len(polls) == 2
+        # Tick 1 — account-wide windows only.
+        assert list(polls[0].windows["1"]) == ["5h", "7d"]
+        assert polls[0].headroom["1"] == 80.0
+        # Tick 2 — same engine object, new binding window and headroom.
+        assert list(polls[1].windows["1"]) == ["5h", "7d", "Fable"]
+        assert polls[1].headroom["1"] == 4.0
+        assert harness.engine._models == ("Fable",)
+        # The collector's poll planning must key on the same axes, or plans
+        # would be computed against a window the decision no longer uses.
+        assert harness.switcher._poll_inputs_override == (90.0, ("Fable",))
+
+    def test_model_key_disappearing_rebinds_the_windows_mid_loop(self, temp_home):
+        h = self._seeded(temp_home, model="Fable")
+        set_setting(h.switcher.backup_dir, "autoswitch.model", "Fable")
+        h.engine = h._make_engine()  # constructed with the key already in the file
+        entries = {
+            n: _entry_for(_scoped_usage(20.0, 96.0), h.clock.now)
+            for n in ("1", "2", "3")
+        }
+        polls = self._two_ticks(
+            h,
+            entries,
+            lambda: unset_setting(h.switcher.backup_dir, "autoswitch.model"),
+        )
+        assert len(polls) == 2
+        assert list(polls[0].windows["1"]) == ["5h", "7d", "Fable"]
+        assert polls[0].headroom["1"] == 4.0
+        assert list(polls[1].windows["1"]) == ["5h", "7d"]
+        assert polls[1].headroom["1"] == 80.0
+        assert h.engine._models == ()
+        assert h.switcher._poll_inputs_override == (90.0, ())
+
+    def test_reload_carries_the_unreported_window_rule(self, harness):
+        # 2026-08-02: an account that reports no Fable window must read as
+        # UNKNOWN once Fable is configured, never as its healthy 5h/7d
+        # headroom. Turning the key on mid-loop must inherit that rule, or
+        # the toggle would hand the escape a slot with unverified Fable
+        # access — exactly the incident, re-entered through the new path.
+        entries = {
+            "1": _entry_for(_scoped_usage(20.0, 96.0), harness.clock.now),
+            "2": _entry_for(_scoped_usage(8.0, None), harness.clock.now),
+            "3": _entry_for(_scoped_usage(12.0, None), harness.clock.now),
+        }
+        polls = self._two_ticks(
+            harness,
+            entries,
+            lambda: set_setting(
+                harness.switcher.backup_dir, "autoswitch.model", "Fable"
+            ),
+        )
+        # Before the edit #2 looks like a fine target on 5h/7d alone...
+        assert polls[0].headroom["2"] == 90.0
+        # ...after it, its unreported Fable window reads as unknown, and the
+        # engine blocks instead of escaping onto an unverified account.
+        assert polls[1].headroom["2"] is None
+        assert polls[1].headroom["3"] is None
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold", "no-comparison"]
+        assert harness.active_number() == 1
+
+    def test_cli_flag_still_beats_the_file_after_a_reload(self, temp_home):
+        # `cswap auto --threshold 75` must stay at 75 even when the file is
+        # edited to 95 — an explicit flag outranks the file, before and after.
+        h = self._seeded(temp_home, threshold=75.0)
+        h.engine = h._make_engine(overrides={"threshold": 75.0})
+        set_setting(h.switcher.backup_dir, "autoswitch.threshold", "95")
+        set_setting(h.switcher.backup_dir, "autoswitch.model", "Fable")
+        outcome = h.tick_with_usage({
+            "1": _scoped_usage(80.0, 30.0),
+            "2": _scoped_usage(10.0, 5.0),
+            "3": _scoped_usage(10.0, 5.0),
+        })
+        # 80% ≥ the pinned 75 → switch; at the file's 95 nothing would move.
+        assert outcome is TickOutcome.SWITCHED
+        assert h.engine.settings.threshold == 75.0
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.threshold == 75.0
+        # ...while a field the flag did NOT pin still follows the file.
+        assert h.engine._models == ("Fable",)
+        assert list(poll.windows["1"]) == ["5h", "7d", "Fable"]
+        assert h.switcher._poll_inputs_override == (75.0, ("Fable",))
+
+    def test_session_threshold_survives_a_reload(self, harness):
+        # The TUI's session-only override is a pin too: a reload triggered by
+        # an unrelated edit must not silently restore the file value.
+        harness.engine.apply_threshold(72.0)
+        set_setting(harness.switcher.backup_dir, "autoswitch.cooldownSeconds", "10")
+        harness.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert harness.engine.settings.threshold == 72.0
+        assert harness.engine.settings.cooldown_seconds == 10.0
+
+    def test_model_name_typo_guard_rearms_on_a_new_name(self, temp_home):
+        # The guard is one-shot per model set. A name changed mid-run has
+        # never been checked, so the guard must fire again — otherwise a
+        # typo'd toggle blocks every switch with no warning at all.
+        h = self._seeded(temp_home, model="Fable")
+        set_setting(h.switcher.backup_dir, "autoswitch.model", "Fable")
+        h.engine = h._make_engine()
+        entries = {
+            n: _entry_for(_scoped_usage(20.0, 40.0), h.clock.now)
+            for n in ("1", "2", "3")
+        }
+        self._two_ticks(
+            h,
+            entries,
+            lambda: set_setting(
+                h.switcher.backup_dir, "autoswitch.model", "Fabel"
+            ),
+        )
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "Fabel" in warnings[0].message
+
+    def test_new_axis_decides_on_stored_data_without_waiting_for_a_refetch(
+        self, temp_home, monkeypatch
+    ):
+        # Poll plans in the usage store were computed against the OLD window
+        # set, so the accounts are not due for minutes after the edit. That
+        # must not delay the decision: lastGood carries the scoped windows
+        # already, so headroom re-derives from stored data on the very next
+        # tick and the switch happens with zero extra fetches.
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = self._seeded(temp_home)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        usage = {
+            "1": _scoped_usage(20.0, 96.0),
+            "2": _scoped_usage(20.0, 5.0),
+            "3": _scoped_usage(20.0, 96.0),
+        }
+        counts: dict[str, int] = {}
+
+        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
+            counts[num] = counts.get(num, 0) + 1
+            return oauth.UsageOutcome(dict(usage[num]))
+
+        def tick():
+            with patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                side_effect=fake_fetch,
+            ):
+                return h.engine.tick()
+
+        assert tick() is TickOutcome.NO_ACTION
+        fetched = dict(counts)
+        assert fetched  # the store now holds real rows with their plans
+
+        h.clock.advance(60)  # well inside every plan written a moment ago
+        set_setting(h.switcher.backup_dir, "autoswitch.model", "Fable")
+        assert tick() is TickOutcome.SWITCHED
+        assert counts == fetched  # not one extra request
+        assert h.active_number() == 2
+
+    def test_settings_edit_ends_a_long_sleep_early(self, harness):
+        # A BLOCKED tick sleeps for minutes; honoring an edit only after that
+        # is indistinguishable from "restart the daemon".
+        calls: list[float] = []
+
+        def fake_wait(timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                set_setting(
+                    harness.switcher.backup_dir, "autoswitch.model", "Fable"
+                )
+            return False
+
+        with patch.object(harness.engine._wake, "wait", side_effect=fake_wait):
+            harness.engine._wait_between_ticks(NO_RESET_FALLBACK_S)
+        assert calls == [SETTINGS_WATCH_S]
+
+    def test_untouched_settings_sleep_the_whole_delay(self, harness):
+        calls: list[float] = []
+
+        with patch.object(
+            harness.engine._wake, "wait", side_effect=lambda t: calls.append(t)
+        ):
+            harness.engine._wait_between_ticks(NO_RESET_FALLBACK_S)
+        assert len(calls) == math.ceil(NO_RESET_FALLBACK_S / SETTINGS_WATCH_S)
+        assert sum(calls) == pytest.approx(NO_RESET_FALLBACK_S)
 
 
 class TestPctLabel:
