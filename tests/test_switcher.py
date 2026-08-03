@@ -3404,15 +3404,30 @@ class TestGetCurrentAccountOrgSupport:
 class TestDeadTokenQuarantine:
     """A dead refresh-token account is surfaced as re-login-needed and not fetched."""
 
-    def _dead_creds(self):
+    def _dead_creds(self, rt="rt"):
         return json.dumps({"claudeAiOauth": {
-            "accessToken": "at", "refreshToken": "rt", "expiresAt": 1,
+            "accessToken": "at", "refreshToken": rt, "expiresAt": 1,
         }})
 
-    def _make_dead(self, switcher, num="2", identity=("test@example.com", "")):
+    def _make_dead(
+        self,
+        switcher,
+        num="2",
+        identity=("test@example.com", ""),
+        fingerprint="default",
+    ):
+        """Quarantine a slot. ``fingerprint="default"`` stamps the lineage of
+        ``_dead_creds()`` — the steady state, where every strike names the
+        generation it condemned; pass None for a legacy pre-fingerprint row."""
         store = switcher._usage_store
+        from claude_swap import oauth
         from claude_swap.usage_store import FetchRecord
-        store.record({num: FetchRecord(error="invalid_grant")}, {num: identity})
+        if fingerprint == "default":
+            fingerprint = oauth.credential_fingerprint(self._dead_creds())
+        store.record(
+            {num: FetchRecord(error="invalid_grant", credential_fingerprint=fingerprint)},
+            {num: identity},
+        )
 
     def test_collector_surfaces_relogin_sentinel_and_skips_fetch(self, temp_home):
         from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
@@ -3426,6 +3441,98 @@ class TestDeadTokenQuarantine:
 
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
         fetch.assert_not_called()  # quarantined: no endless 401/429 loop
+
+    def test_new_credential_generation_earns_a_parole_fetch(self, temp_home):
+        # A re-login rewrites the credential: the collector must notice the
+        # changed lineage, lift the quarantine, and prove the new token with a
+        # live fetch — no manual `cswap add` required.
+        from claude_swap import oauth
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-new", "refreshToken": "rt-new",
+            "expiresAt": 32503680000000,  # far future: no refresh attempt
+        }})
+        info = [(2, "test@example.com", "Org", "", False, fresh, "")]
+        usage = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}}
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(usage),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        fetch.assert_called_once()
+        assert entries["2"].sentinel is None
+        assert entries["2"].last_good == usage
+        assert not entries["2"].token_dead()
+
+    def test_failed_parole_restamps_and_requarantines(self, temp_home):
+        # A new generation earns exactly ONE probe. When it dies too, the
+        # strike stamps ITS fingerprint, and the next pass is quiet again —
+        # bounded, never the endless-retry loop.
+        from claude_swap import oauth
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
+        )
+        also_dead = self._dead_creds("rt-new")
+        info = [(2, "test@example.com", "Org", "", False, also_dead, "")]
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(None, error="invalid_grant"),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+        fetch.assert_called_once()  # the parole probe
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED  # same-pass verdict
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch2:
+            entries = switcher._collect_usage_entries(info)
+        fetch2.assert_not_called()  # rt-new is now the condemned lineage
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_legacy_row_without_fingerprint_gets_one_parole(self, temp_home):
+        # Rows quarantined before fingerprints existed name no condemned
+        # lineage: grant the single probe (its outcome stamps the fingerprint
+        # and the row converges either way).
+        from claude_swap import oauth
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher, fingerprint=None)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(None, error="invalid_grant"),
+        ) as fetch:
+            switcher._collect_usage_entries(info)
+        fetch.assert_called_once()
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch2:
+            entries = switcher._collect_usage_entries(info)
+        fetch2.assert_not_called()  # converged: the probe stamped the lineage
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_slot_with_no_credentials_stays_quarantined(self, temp_home):
+        # No candidate bytes → nothing to parole: the empty-creds static
+        # sentinel path must win, not an eternal parole loop.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher, fingerprint=None)
+        info = [(2, "test@example.com", "Org", "", False, "", "")]
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            switcher._collect_usage_entries(info)
+        fetch.assert_not_called()
 
     def test_relogin_surfaces_same_pass_on_invalid_grant(self, temp_home):
         # A fetch that returns invalid_grant crosses the dead threshold this pass;

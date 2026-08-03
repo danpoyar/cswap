@@ -47,6 +47,21 @@ read in one sitting.
   died — both serve the same quiet numbers, and stale zeroes read like a free
   account. This is what lets Quota render "http-429 · 5d ago" without reading
   cswap's private store file. Worth sending upstream.
+- Dead-token quarantine condemns a credential GENERATION, not the slot:
+  each permanent-auth strike stamps `deadTokenFingerprint` in the usage
+  store, and the collector paroles a quarantined slot whose candidate
+  credential (live store for the active slot, backup for a parked one) no
+  longer matches the condemned lineage — one live probe per new generation;
+  a failed probe condemns the new lineage, so the same bytes are never
+  POSTed twice. Before this, only a manual `cswap add` / `add-token` /
+  `import` could lift the quarantine: a user who re-logged in with Claude
+  Code still saw "re-login needed" forever, because the quarantine also
+  blocked the very fetch whose resync machinery (ef27749) would have adopted
+  the rotated credential. Live incident on this fleet, 2026-08-03: slot #5's
+  backup lineage died 07-29 (rotation-before-collection), and the panel kept
+  demanding a re-login while the account was running live sessions the whole
+  time. Mirrors the autoswitch engine's own fingerprint-keyed quarantine
+  release (`_release_recovered_quarantines`). Worth sending upstream.
 - `oauth.account_headroom`: a *configured* per-model window (`autoswitch.model`)
   that an account's usage does not report yields headroom `None` (unknown,
   never an autoswitch target) instead of silently computing from the remaining

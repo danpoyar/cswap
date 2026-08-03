@@ -2842,7 +2842,10 @@ class ClaudeAccountSwitcher:
                             # "re-login needed" — a bare sentinel is a no-op
                             # to the store and would re-POST every pass.
                             return FetchRecord(
-                                error=result.error or "invalid_grant"
+                                error=result.error or "invalid_grant",
+                                credential_fingerprint=(
+                                    oauth.credential_fingerprint(refresh_input)
+                                ),
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
@@ -3094,6 +3097,11 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            # Names the lineage a permanent-auth failure condemns; the store
+            # reads it only then. The refresh this path may run POSTs exactly
+            # this credential's grant, so the fingerprint is the right one for
+            # both the pre-fetch and the 401-retry refresh failures.
+            credential_fingerprint=oauth.credential_fingerprint(creds),
         )
 
     def _run_usage_fetches(
@@ -3111,6 +3119,22 @@ class ClaudeAccountSwitcher:
 
         with ThreadPoolExecutor() as executor:
             return dict(executor.map(fetch_one, enumerate(infos)))
+
+    @staticmethod
+    def _parole_eligible(entry: UsageEntry, creds: str) -> bool:
+        """Whether a quarantined slot's candidate credential is a generation
+        the quarantine has NOT condemned — and so deserves one live probe.
+
+        Empty candidate bytes are never eligible (nothing to try). A row with
+        no stamped lineage (legacy strike, or a strike that could not name its
+        credential) grants the one probe: the probe's outcome stamps the
+        lineage, so it cannot recur.
+        """
+        fingerprint = oauth.credential_fingerprint(creds)
+        return (
+            fingerprint is not None
+            and fingerprint != entry.dead_token_fingerprint
+        )
 
     def _collect_usage_entries(
         self,
@@ -3151,9 +3175,34 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
-        # drives the "re-login needed" display and (via ``num not in sentinels``
-        # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        # Dead refresh-token lineage: quarantine — but the quarantine condemns
+        # a credential GENERATION, not the slot. A slot whose candidate
+        # credential (live store for the active slot, backup for a parked one)
+        # no longer matches the condemned lineage has been re-captured — a
+        # re-login rotated it, or CC rotated past the dead copy — and earns a
+        # parole: quarantine lifted, one live fetch to prove the new token.
+        # Bounded by the fingerprint stamp: a failed parole condemns the NEW
+        # lineage, so the same bytes are never probed twice (the browser and
+        # the desktop app never touch these stores — without the parole, only
+        # a manual `cswap add` could lift the quarantine).
+        # Surfacing the sentinel for the rest both drives the "re-login
+        # needed" display and (via ``num not in sentinels`` below) stops the
+        # endless fetch loop that would otherwise 401/429 forever.
+        paroled = [
+            num
+            for num, info in info_by_num.items()
+            if num not in sentinels
+            and entries[num].token_dead()
+            and self._parole_eligible(entries[num], info[5])
+        ]
+        if paroled:
+            store.clear_dead_token(paroled, identities)
+            entries = store.entries(identities, models)
+            self._logger.info(
+                "Lifted dead-token quarantine for account(s) %s: a new "
+                "credential generation appeared; probing it.",
+                ", ".join(sorted(paroled)),
+            )
         for num in info_by_num:
             if num not in sentinels and entries[num].token_dead():
                 sentinels[num] = USAGE_RELOGIN_REQUIRED

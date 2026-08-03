@@ -183,6 +183,12 @@ class FetchRecord:
     error: str | None = None
     retry_after_s: float | None = None
     sentinel: str | None = None
+    # Fingerprint (oauth.credential_fingerprint) of the credential lineage this
+    # attempt consumed. Read only when ``error`` is a PERMANENT_AUTH_ERROR: the
+    # strike then condemns that specific generation, and the collector may
+    # parole the slot when a DIFFERENT generation shows up (re-login) — see
+    # ``UsageEntry.dead_token_fingerprint``.
+    credential_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +226,11 @@ class UsageEntry:
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # The lineage the dead-token strikes condemned (stamped by the strike,
+    # cleared by success/clear_dead_token). None on a quarantined row means the
+    # condemned generation is unknown (legacy strike): the collector grants
+    # one parole probe, whose outcome stamps the lineage either way.
+    dead_token_fingerprint: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -553,6 +564,11 @@ class UsageStore:
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
+                dead_token_fingerprint=(
+                    row.get("deadTokenFingerprint")
+                    if isinstance(row.get("deadTokenFingerprint"), str)
+                    else None
+                ),
             )
         return out
 
@@ -695,6 +711,7 @@ class UsageStore:
                 row["lastError"] = None
                 row["backoffUntil"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["deadTokenFingerprint"] = None
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -711,6 +728,11 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # Unconditional: a strike that cannot name its credential
+                    # clears the stamp rather than keep a stale one — a stale
+                    # fingerprint would parole the current (unknown) dead
+                    # generation on every pass.
+                    row["deadTokenFingerprint"] = rec.credential_fingerprint
 
         with self._lock():
             rows = self._read_rows()
@@ -777,6 +799,7 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["deadTokenFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None
