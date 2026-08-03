@@ -3207,15 +3207,17 @@ class ClaudeAccountSwitcher:
         # credential (live store for the active slot, backup for a parked one)
         # no longer matches the condemned lineage has been re-captured — a
         # re-login rotated it, or CC rotated past the dead copy — and earns a
-        # parole: one live probe to prove the new generation. The row is NOT
+        # parole: a live probe to prove the new generation. The row is NOT
         # cleared first: the probe runs with the stamp intact (reserve's
         # ``parole`` override), because the active-slot probe's guard reads
         # the condemned lineage to refuse re-POSTing it, and only the probe's
-        # outcome may move the row — success resets everything, failure (or
-        # the guard's refusal) re-stamps, so the same lineage is never probed
-        # twice and the flow converges (without the parole, only a manual
-        # `cswap add` could lift the quarantine — the browser and the desktop
-        # app never touch these stores).
+        # outcome may move the row — success resets everything, a permanent
+        # failure (or the guard's refusal) re-stamps, and a transient one
+        # leaves the row paced by its own failure backoff (reserve still
+        # honors it), so the same lineage is never hammered and the flow
+        # converges (without the parole, only a manual `cswap add` could lift
+        # the quarantine — the browser and the desktop app never touch these
+        # stores).
         # Surfacing the sentinel for the rest both drives the "re-login
         # needed" display and (via ``num not in sentinels`` below) stops the
         # endless fetch loop that would otherwise 401/429 forever.
@@ -3229,7 +3231,8 @@ class ClaudeAccountSwitcher:
         if paroled:
             self._logger.info(
                 "Dead-token parole for account(s) %s: a new credential "
-                "generation appeared; probing it once.",
+                "generation appeared; probing it (failure backoff still "
+                "paces retries).",
                 ", ".join(sorted(paroled, key=int)),
             )
         for num in info_by_num:

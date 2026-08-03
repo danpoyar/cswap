@@ -3429,11 +3429,19 @@ class TestDeadTokenQuarantine:
             {num: identity},
         )
 
+    @staticmethod
+    def _expire_backoff(switcher, offset=3600.0):
+        """Fast-forward the store's clock past any failure backoff — the seed
+        strike wrote one, and a parole must respect it (a probe runs only when
+        the row is due, quarantined or not)."""
+        switcher._usage_store.clock = lambda: time.time() + offset
+
     def test_collector_surfaces_relogin_sentinel_and_skips_fetch(self, temp_home):
         from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher)
+        self._expire_backoff(switcher)
         info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
 
         with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
@@ -3453,6 +3461,7 @@ class TestDeadTokenQuarantine:
             switcher,
             fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
         )
+        self._expire_backoff(switcher)
         fresh = json.dumps({"claudeAiOauth": {
             "accessToken": "at-new", "refreshToken": "rt-new",
             "expiresAt": 32503680000000,  # far future: no refresh attempt
@@ -3483,6 +3492,7 @@ class TestDeadTokenQuarantine:
             switcher,
             fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
         )
+        self._expire_backoff(switcher)
         also_dead = self._dead_creds("rt-new")
         info = [(2, "test@example.com", "Org", "", False, also_dead, "")]
 
@@ -3507,6 +3517,7 @@ class TestDeadTokenQuarantine:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher, fingerprint=None)
+        self._expire_backoff(switcher)
         info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
 
         with patch(
@@ -3562,6 +3573,7 @@ class TestDeadTokenQuarantine:
                    side_effect=fake_refresh), \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as usage_fetch:
             e1 = switcher._collect_usage_entries(info)  # strike + stamp
+            self._expire_backoff(switcher)  # parole waits out the backoff
             e2 = switcher._collect_usage_entries(info)  # parole → refusal
             e3 = switcher._collect_usage_entries(info)  # converged: quiet
 
@@ -3592,6 +3604,47 @@ class TestDeadTokenQuarantine:
         ):
             record = switcher._fetch_account_usage(info)
         assert record.credential_fingerprint == "sha256:successor"
+
+    def test_transient_parole_probe_is_backoff_paced(self, temp_home):
+        # CR2-F1 (round 2): a parole probe that dies TRANSIENTLY (network)
+        # moves neither strikes nor stamp — the slot stays parole-eligible.
+        # The probe must still respect the failure backoff its own outcome
+        # wrote: back-to-back collector passes may POST the new generation's
+        # grant exactly once, not on every pass of a flaky network.
+        from claude_swap import oauth
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-x")),
+        )
+        self._expire_backoff(switcher)  # the seed strike's backoff is history
+        new_gen = self._dead_creds("rt-y")  # expired → the probe must refresh
+        info = [(2, "test@example.com", "Org", "", False, new_gen, "")]
+
+        posted = []
+
+        def flaky_refresh(credentials, **kw):
+            posted.append(
+                json.loads(credentials)["claudeAiOauth"]["refreshToken"]
+            )
+            return oauth.RefreshOutcome(None, "transient")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=flaky_refresh), \
+             patch("claude_swap.oauth.request_usage_data",
+                   side_effect=TimeoutError("net")), \
+             patch.object(switcher, "_live_session_pids", return_value=[]):
+            entries = None
+            for _ in range(3):  # three back-to-back passes, milliseconds apart
+                entries = switcher._collect_usage_entries(info)
+
+        assert posted == ["rt-y"], (
+            f"parole bypassed the failure backoff: {posted}"
+        )
+        # Still quarantined to every consumer while the probe is in backoff.
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
     def test_slot_with_no_credentials_stays_quarantined(self, temp_home):
         # No candidate bytes → nothing to parole: the empty-creds static

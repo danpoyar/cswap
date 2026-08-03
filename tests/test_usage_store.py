@@ -822,14 +822,19 @@ class TestDeadTokenQuarantine:
         clock.advance(10_000)  # past any backoff: the strikes gate must refuse
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
 
-    def test_reserve_parole_overrides_strikes_and_backoff(self, store):
-        # The parole probe must run NOW, with the quarantine stamp intact:
-        # no clearing first (the probe's guard needs the condemned lineage),
-        # and the strike's failure backoff must not defer the one probe.
+    def test_reserve_parole_overrides_strikes_but_respects_backoff(
+        self, store, clock
+    ):
+        # The parole skips only the quarantine gate; the failure backoff still
+        # paces probes — a transient probe outcome writes a normal backoff,
+        # and without this gate a flaky network would re-POST the same
+        # new-generation grant on every collector pass.
         store.record(
             {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
             IDENT,
         )
+        assert store.reserve(["1"], IDENT, respect_plans=True, parole={"1"}) == {}
+        clock.advance(10_000)  # past the strike's backoff: the probe is due
         won = store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})
         assert set(won) == {"1"}
         # The stamp survives the reservation — only the probe's OUTCOME moves it.

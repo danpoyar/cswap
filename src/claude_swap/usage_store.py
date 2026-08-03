@@ -642,13 +642,17 @@ class UsageStore:
           due plans and stale impossible plans win, but valid future plans do
           not.
 
-        ``parole`` names quarantined slots the collector grants one probe (a
+        ``parole`` names quarantined slots the collector grants a probe (a
         candidate credential of a generation the quarantine has not
-        condemned): for them the dead-strikes and failure-backoff gates are
-        skipped — the row itself (strikes, condemned fingerprint) stays
-        untouched, because the probe's guard needs the condemned lineage and
-        only the probe's OUTCOME may move the row. Claim fencing still
-        applies: two collectors can never double-probe.
+        condemned): for them the dead-strikes gate is skipped — the row
+        itself (strikes, condemned fingerprint) stays untouched, because the
+        probe's guard needs the condemned lineage and only the probe's
+        OUTCOME may move the row. The failure backoff is NOT skipped: a
+        permanent outcome re-stamps and ends the parole, while a transient
+        one (network) moves nothing — without the backoff gate a flaky
+        network would re-POST the same new-generation grant on every
+        collector pass. Claim fencing still applies: two collectors can
+        never double-probe.
         """
         nums = list(nums)
         if not nums:
@@ -830,11 +834,12 @@ def _row_eligible(
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes; ``parole``
-    skips the quarantine and backoff gates for the collector's one probe)."""
+    skips the quarantine gate for the collector's probe — the failure
+    backoff still applies, so a transiently-failed probe stays paced)."""
     if not parole and int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
-    if not parole and backoff_until is not None and now < backoff_until:
+    if backoff_until is not None and now < backoff_until:
         return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),

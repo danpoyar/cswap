@@ -51,13 +51,15 @@ read in one sitting.
   each permanent-auth strike stamps `deadTokenFingerprint` in the usage
   store, and the collector paroles a quarantined slot whose candidate
   credential (live store for the active slot, backup for a parked one) no
-  longer matches the condemned lineage — one live probe per new generation,
-  run with the stamp intact (reserve's parole override). A probe's outcome
+  longer matches the condemned lineage — probes run with the stamp intact
+  (reserve's parole override skips only the quarantine gate; the failure
+  backoff still paces them, so a transiently-failed probe retries on the
+  store's normal cadence, not per pass). A probe's permanent death
   re-stamps the row: a POST death condemns the lineage actually consumed
   (the outcome names it — it may be a successor the chain rotated to), and
   the active path refuses to POST an already-condemned grant outright,
   condemning instead the candidate that justified the parole. Either way
-  the same bytes are never POSTed twice and the flow converges. Before
+  condemned bytes are never POSTed again and the flow converges. Before
   this, only a manual `cswap add` / `add-token` /
   `import` could lift the quarantine: a user who re-logged in with Claude
   Code still saw "re-login needed" forever, because the quarantine also
