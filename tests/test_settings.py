@@ -19,6 +19,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    read_settings,
     save_settings,
     set_setting,
     settings_path,
@@ -72,6 +73,24 @@ class TestLoadSettings:
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
         assert loaded.unhealthy_ticks == 1
+
+    def test_read_settings_reports_whether_the_file_answered(self, tmp_path: Path):
+        # The status is what a re-reading consumer needs: defaults from a
+        # missing/corrupt file must not be mistaken for a real edit.
+        missing = read_settings(tmp_path)
+        assert (missing.status, missing.ok) == ("missing", False)
+        settings_path(tmp_path).write_text("{not json")
+        broken = read_settings(tmp_path)
+        assert (broken.status, broken.ok) == ("unreadable", False)
+        assert broken.error and broken.settings == AutoSwitchSettings()
+        settings_path(tmp_path).write_text("[1, 2]")
+        assert read_settings(tmp_path).status == "unreadable"
+        settings_path(tmp_path).write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"threshold": 80}})
+        )
+        good = read_settings(tmp_path)
+        assert (good.status, good.ok) == ("ok", True)
+        assert good.settings.threshold == 80.0
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({

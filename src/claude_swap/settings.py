@@ -199,23 +199,56 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     return AutoSwitchSettings(**kwargs)
 
 
-def _read_raw(path: Path) -> dict:
+def _read_raw_checked(path: Path) -> tuple[dict, str, str]:
+    """``(raw, status, error)`` — status is "ok" | "missing" | "unreadable".
+
+    The status is what separates "the file says default" from "the file did
+    not answer". Callers that read once may ignore it (defaults are the right
+    degradation there); a caller that re-reads a file it is already running on
+    must not, or a truncated write silently rewrites a live policy.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return {}, "missing", "no such file"
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         _logger.warning("Could not read %s (%s); using defaults", path, e)
-        return {}
+        return {}, "unreadable", str(e)
     if not isinstance(raw, dict):
         _logger.warning("%s is not a JSON object; using defaults", path)
-        return {}
-    return raw
+        return {}, "unreadable", "not a JSON object"
+    return raw, "ok", ""
 
 
-def load_settings(backup_root: Path) -> AutoSwitchSettings:
-    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
-    raw = _read_raw(settings_path(backup_root))
+def _read_raw(path: Path) -> dict:
+    return _read_raw_checked(path)[0]
+
+
+@dataclass(frozen=True)
+class SettingsRead:
+    """One settings.json read, with the file's own status attached.
+
+    ``ok`` is False when the file is missing or could not be parsed; the
+    settings are then the plain defaults, which is a fine answer for a
+    one-shot read and a lie for a re-read.
+    """
+
+    settings: AutoSwitchSettings
+    status: str  # "ok" | "missing" | "unreadable"
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def read_settings(backup_root: Path) -> SettingsRead:
+    """Load the autoswitch section, reporting whether the file answered."""
+    raw, status, error = _read_raw_checked(settings_path(backup_root))
+    return SettingsRead(_autoswitch_from_raw(raw), status, error)
+
+
+def _autoswitch_from_raw(raw: dict) -> AutoSwitchSettings:
     section = raw.get("autoswitch")
     if not isinstance(section, dict):
         return AutoSwitchSettings()
@@ -228,6 +261,11 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_settings(backup_root: Path) -> AutoSwitchSettings:
+    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
+    return read_settings(backup_root).settings
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:

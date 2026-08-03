@@ -60,8 +60,8 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
-    load_settings,
     parse_model_names,
+    read_settings,
     settings_path,
     with_overrides,
 )
@@ -377,9 +377,10 @@ class ErrorEvent(AutoSwitchEvent):
 
 @dataclass(frozen=True)
 class ConfigWarningEvent(AutoSwitchEvent):
-    """A configuration value is syntactically fine but provably inert (e.g.
-    an ``autoswitch.model`` name no account reports). Not an error: the
-    engine keeps running on the axes that do exist."""
+    """The configuration could not be taken as read: a value that is
+    syntactically fine but provably inert (an ``autoswitch.model`` name no
+    account reports), or a settings.json that stopped answering mid-run. Not
+    an error — the engine keeps running on what it already has."""
 
     kind: ClassVar[str] = "config-warning"
     message: str
@@ -508,7 +509,12 @@ class AutoSwitchEngine:
         # fields whose file value moved, so a pin and a host-supplied value
         # both survive an unrelated edit.
         self._settings_base = settings
-        self._settings_file = load_settings(switcher.backup_dir)
+        read = read_settings(switcher.backup_dir)
+        self._settings_file = read.settings
+        # Whether the last read got an answer at all. Starting from the
+        # construction read keeps the "no settings.json" install (the default)
+        # silent: only a file that used to answer and stopped is worth a line.
+        self._settings_file_ok = read.ok
         self._settings_pins = dict(overrides or {})
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -758,8 +764,30 @@ class AutoSwitchEngine:
         every axis derived from it: the decision windows, the collector's
         poll-planning keys, and the one-shot model-name guard — which has
         never seen the new name and must get its shot at it.
+
+        A read that did not answer (file deleted, half-written, unreadable)
+        is not an edit: ``load_settings`` would hand back plain defaults, and
+        replaying those would revert model axes, strategy, threshold and
+        cooldown under a running daemon with nothing in the log to show for
+        it. The last snapshot that did answer stays in force, and the engine
+        says so once.
         """
-        file_now = load_settings(self.switcher.backup_dir)
+        read = read_settings(self.switcher.backup_dir)
+        if not read.ok:
+            if self._settings_file_ok:
+                self._settings_file_ok = False
+                path = settings_path(self.switcher.backup_dir)
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            f"could not read {path} ({read.error}); keeping the "
+                            "settings already in effect"
+                        )
+                    )
+                )
+            return
+        self._settings_file_ok = True
+        file_now = read.settings
         changed = {
             f.name: getattr(file_now, f.name)
             for f in fields(AutoSwitchSettings)

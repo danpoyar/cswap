@@ -31,7 +31,13 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings, set_setting, unset_setting
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    load_settings,
+    set_setting,
+    settings_path,
+    unset_setting,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -2018,7 +2024,94 @@ class TestSettingsReload:
         assert sum(calls) == pytest.approx(NO_RESET_FALLBACK_S)
 
 
-class TestPctLabel:
+class TestSettingsReloadUnreadable:
+    """A settings.json that does not answer must not rewrite a live policy.
+
+    ``load_settings`` collapses missing/corrupt into defaults, which is the
+    right semantics for a one-shot read and the wrong one for a re-read: a
+    half-written or deleted file would otherwise revert model axes, strategy,
+    threshold and cooldown on a running daemon, with nothing in the event
+    stream to explain it.
+    """
+
+    POLICY = {
+        "autoswitch.model": "Fable",
+        "autoswitch.strategy": "consume-first",
+        "autoswitch.threshold": "80",
+        "autoswitch.cooldownSeconds": "600",
+    }
+
+    def _running(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        for dotted, value in self.POLICY.items():
+            set_setting(h.switcher.backup_dir, dotted, value)
+        h.settings = load_settings(h.switcher.backup_dir)
+        h.engine = h._make_engine()
+        self._assert_policy_intact(h)
+        return h
+
+    def _assert_policy_intact(self, h: EngineHarness) -> None:
+        assert h.engine._models == ("Fable",)
+        assert h.engine.settings.strategy == "consume-first"
+        assert h.engine.settings.threshold == 80.0
+        assert h.engine.settings.cooldown_seconds == 600.0
+        assert h.switcher._poll_inputs_override == (80.0, ("Fable",))
+
+    def _quiet_tick(self, h: EngineHarness) -> None:
+        # Every account reports the configured Fable window, so the only
+        # warning this class can ever see is the one under test.
+        h.tick_with_usage({
+            n: _scoped_usage(pct, 20.0)
+            for n, pct in (("1", 50.0), ("2", 10.0), ("3", 10.0))
+        })
+
+    def _warnings(self, h: EngineHarness) -> list[ConfigWarningEvent]:
+        return [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+
+    def test_corrupt_file_keeps_the_policy_and_says_so_once(self, temp_home):
+        h = self._running(temp_home)
+        path = settings_path(h.switcher.backup_dir)
+        path.write_text('{"autoswitch": {"model": "Fable",}}', encoding="utf-8")
+        self._quiet_tick(h)
+        self._assert_policy_intact(h)
+        warnings = self._warnings(h)
+        assert len(warnings) == 1
+        assert str(path) in warnings[0].message
+        # ...and it stays one line, not one per tick for as long as it is broken.
+        self._quiet_tick(h)
+        self._assert_policy_intact(h)
+        assert len(self._warnings(h)) == 1
+
+    def test_deleted_file_keeps_the_policy_and_says_so_once(self, temp_home):
+        h = self._running(temp_home)
+        path = settings_path(h.switcher.backup_dir)
+        path.unlink()
+        self._quiet_tick(h)
+        self._assert_policy_intact(h)
+        assert len(self._warnings(h)) == 1
+
+    def test_a_file_that_never_existed_warns_about_nothing(self, harness):
+        # Running with no settings.json is the default install, not a fault.
+        assert not settings_path(harness.switcher.backup_dir).exists()
+        harness.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert self._warnings(harness) == []
+
+    def test_a_repaired_file_is_adopted_again(self, temp_home):
+        h = self._running(temp_home)
+        path = settings_path(h.switcher.backup_dir)
+        good = json.loads(path.read_text(encoding="utf-8"))
+        path.write_text('{"autoswitch": {"model": "Fable",}}', encoding="utf-8")
+        self._quiet_tick(h)
+        good["autoswitch"].pop("model", None)
+        path.write_text(json.dumps(good), encoding="utf-8")
+        self._quiet_tick(h)
+        assert h.engine._models == ()
+        assert h.engine.settings.strategy == "consume-first"  # untouched key
+        assert h.switcher._poll_inputs_override == (80.0, ())
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"
 
