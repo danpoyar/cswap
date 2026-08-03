@@ -3225,13 +3225,6 @@ class ClaudeAccountSwitcher:
             and entries[num].token_dead()
             and self._parole_eligible(entries[num], info[5])
         }
-        if paroled:
-            self._logger.info(
-                "Dead-token parole for account(s) %s: a new credential "
-                "generation appeared; probing it (failure backoff still "
-                "paces retries).",
-                ", ".join(sorted(paroled, key=int)),
-            )
         requested = [
             num
             for num in info_by_num
@@ -3257,6 +3250,18 @@ class ClaudeAccountSwitcher:
                 respect_plans=False,
                 repair_overslept=scheduled,
                 parole=paroled,
+            )
+        # Log a parole only when its probe actually won a claim: eligibility
+        # alone recurs on every pass while a transiently-failing candidate
+        # waits out its backoff (live #2: one line per pass, thousands a day),
+        # but a probe that runs is a bounded, meaningful event.
+        probing = paroled & set(claims)
+        if probing:
+            self._logger.info(
+                "Dead-token parole for account(s) %s: a new credential "
+                "generation appeared; probing it (failure backoff still "
+                "paces retries).",
+                ", ".join(sorted(probing, key=int)),
             )
         # Every dead row that got no probe this pass — refused by reserve's
         # strikes gate, paroled but outside the engine's fetch set, or beaten
