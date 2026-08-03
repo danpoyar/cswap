@@ -520,6 +520,7 @@ class UsageStore:
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
+            dead_fp = row.get("deadTokenFingerprint")
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
@@ -565,9 +566,7 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 dead_token_fingerprint=(
-                    row.get("deadTokenFingerprint")
-                    if isinstance(row.get("deadTokenFingerprint"), str)
-                    else None
+                    dead_fp if isinstance(dead_fp, str) else None
                 ),
             )
         return out
@@ -618,7 +617,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
-        parole: "set[str] | frozenset[str] | None" = None,
+        parole: set[str] | None = None,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -642,21 +641,17 @@ class UsageStore:
           due plans and stale impossible plans win, but valid future plans do
           not.
 
-        ``parole`` names quarantined slots the collector grants a probe (a
-        candidate credential of a generation the quarantine has not
-        condemned): for them the dead-strikes gate is skipped — the row
-        itself (strikes, condemned fingerprint) stays untouched, because the
-        probe's guard needs the condemned lineage and only the probe's
-        OUTCOME may move the row. The failure backoff is NOT skipped: a
-        permanent outcome re-stamps and ends the parole, while a transient
-        one (network) moves nothing — without the backoff gate a flaky
-        network would re-POST the same new-generation grant on every
-        collector pass. Claim fencing still applies: two collectors can
-        never double-probe.
+        ``parole`` names quarantined slots granted a probe: only the
+        dead-strikes gate is skipped for them — the failure backoff still
+        paces retries, and the row itself stays untouched (only the probe's
+        outcome may move it; rationale at the collector,
+        ``_collect_usage_entries``). Claim fencing still applies: two
+        collectors can never double-probe.
         """
         nums = list(nums)
         if not nums:
             return {}
+        parole = parole or set()
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
@@ -670,7 +665,7 @@ class UsageStore:
                     assert isinstance(row, dict)
                     if not _row_eligible(
                         row, now, respect_plans, repair_overslept,
-                        parole=bool(parole and num in parole),
+                        parole=num in parole,
                     ):
                         continue
                 claim_id = uuid.uuid4().hex

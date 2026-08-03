@@ -635,9 +635,6 @@ def try_fetch_usage_for_account(
                 None,
                 error="invalid_grant" if dead else "refresh-failed",
                 consumed_fingerprint=(
-                    # The grant POSTed here belongs to working_credentials —
-                    # possibly the successor a pre-fetch refresh persisted,
-                    # not the caller's original bytes.
                     credential_fingerprint(working_credentials) if dead else None
                 ),
             )

@@ -14,7 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -3420,7 +3420,6 @@ class TestDeadTokenQuarantine:
         ``_dead_creds()`` — the steady state, where every strike names the
         generation it condemned; pass None for a legacy pre-fingerprint row."""
         store = switcher._usage_store
-        from claude_swap import oauth
         from claude_swap.usage_store import FetchRecord
         if fingerprint == "default":
             fingerprint = oauth.credential_fingerprint(self._dead_creds())
@@ -3437,7 +3436,6 @@ class TestDeadTokenQuarantine:
         switcher._usage_store.clock = lambda: time.time() + offset
 
     def test_collector_surfaces_relogin_sentinel_and_skips_fetch(self, temp_home):
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher)
@@ -3454,7 +3452,6 @@ class TestDeadTokenQuarantine:
         # A re-login rewrites the credential: the collector must notice the
         # changed lineage, lift the quarantine, and prove the new token with a
         # live fetch — no manual `cswap add` required.
-        from claude_swap import oauth
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(
@@ -3484,8 +3481,6 @@ class TestDeadTokenQuarantine:
         # A new generation earns exactly ONE probe. When it dies too, the
         # strike stamps ITS fingerprint, and the next pass is quiet again —
         # bounded, never the endless-retry loop.
-        from claude_swap import oauth
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(
@@ -3513,7 +3508,6 @@ class TestDeadTokenQuarantine:
         # Rows quarantined before fingerprints existed name no condemned
         # lineage: grant the single probe (its outcome stamps the fingerprint
         # and the row converges either way).
-        from claude_swap import oauth
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher, fingerprint=None)
@@ -3530,7 +3524,6 @@ class TestDeadTokenQuarantine:
         with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch2:
             entries = switcher._collect_usage_entries(info)
         fetch2.assert_not_called()  # converged: the probe stamped the lineage
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
     def test_condemned_backup_grant_is_never_reposted(self, temp_home):
@@ -3541,8 +3534,6 @@ class TestDeadTokenQuarantine:
         # condemned backup grant forever. The probe must refuse a condemned
         # grant (no POST) and condemn the CANDIDATE that justified the
         # parole, so the flow converges: exactly ONE POST total.
-        from claude_swap import oauth
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         (temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "test@example.com",
                              "accountUuid": "test-uuid-1234"},
@@ -3590,7 +3581,6 @@ class TestDeadTokenQuarantine:
         # dying (pre-refresh success → 401 → retry-refresh invalid_grant), the
         # condemned lineage is the SUCCESSOR the chain consumed, not the bytes
         # the collector read. The outcome names it; the stamp must use it.
-        from claude_swap import oauth
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         info = (2, "test@example.com", "Org", "", False, self._dead_creds(), "")
@@ -3611,8 +3601,6 @@ class TestDeadTokenQuarantine:
         # The probe must still respect the failure backoff its own outcome
         # wrote: back-to-back collector passes may POST the new generation's
         # grant exactly once, not on every pass of a flaky network.
-        from claude_swap import oauth
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(
@@ -3662,7 +3650,6 @@ class TestDeadTokenQuarantine:
         # A fetch that returns invalid_grant crosses the dead threshold this pass;
         # the pre-fetch quarantine scan couldn't see it, so the collector must
         # still render "re-login needed" now, not only on the next refresh.
-        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
         from claude_swap.usage_store import FetchRecord
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()

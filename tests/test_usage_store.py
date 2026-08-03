@@ -788,37 +788,33 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
+    @staticmethod
+    def _strike(store, fingerprint="sha256:aaa"):
+        store.record(
+            {"1": FetchRecord(error="invalid_grant",
+                              credential_fingerprint=fingerprint)},
+            IDENT,
+        )
+
     def test_strike_stamps_dead_fingerprint(self, store):
         # The quarantine condemns a credential GENERATION, not the slot: the
         # strike records which lineage the server rejected so a later, different
         # generation (re-login) can earn a parole fetch.
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         assert store.entries(IDENT)["1"].dead_token_fingerprint == "sha256:aaa"
 
     def test_success_clears_dead_fingerprint(self, store):
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.entries(IDENT)["1"].dead_token_fingerprint is None
 
     def test_clear_dead_token_clears_fingerprint(self, store):
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         store.clear_dead_token(["1"], IDENT)
         assert store.entries(IDENT)["1"].dead_token_fingerprint is None
 
     def test_reserve_refuses_quarantined_without_parole(self, store, clock):
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         clock.advance(10_000)  # past any backoff: the strikes gate must refuse
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
 
@@ -829,10 +825,7 @@ class TestDeadTokenQuarantine:
         # paces probes — a transient probe outcome writes a normal backoff,
         # and without this gate a flaky network would re-POST the same
         # new-generation grant on every collector pass.
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         assert store.reserve(["1"], IDENT, respect_plans=True, parole={"1"}) == {}
         clock.advance(10_000)  # past the strike's backoff: the probe is due
         won = store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})
@@ -845,10 +838,7 @@ class TestDeadTokenQuarantine:
         # keep the old one: a stale fingerprint of an older generation would
         # grant the current (unknown) dead generation a parole on every pass —
         # the endless-retry loop the quarantine exists to prevent.
-        store.record(
-            {"1": FetchRecord(error="invalid_grant", credential_fingerprint="sha256:aaa")},
-            IDENT,
-        )
+        self._strike(store)
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         assert store.entries(IDENT)["1"].dead_token_fingerprint is None
 
