@@ -1972,9 +1972,17 @@ class TestSettingsReload:
             ):
                 return h.engine.tick()
 
-        assert tick() is TickOutcome.NO_ACTION
+        # Warm every slot into the store first. A baseline pass polls the
+        # active slot plus ONE due candidate, so after a single tick the third
+        # account still has no row — and its first-ever fetch on the next tick
+        # would be miscounted as the reload forcing a refetch.
+        for _ in range(5):
+            assert tick() is TickOutcome.NO_ACTION
+            if set(counts) == {"1", "2", "3"}:
+                break
+            h.clock.advance(1)
         fetched = dict(counts)
-        assert fetched  # the store now holds real rows with their plans
+        assert set(fetched) == {"1", "2", "3"}  # real rows, with their plans
 
         h.clock.advance(60)  # well inside every plan written a moment ago
         set_setting(h.switcher.backup_dir, "autoswitch.model", "Fable")
