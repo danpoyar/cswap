@@ -1282,6 +1282,7 @@ class _FakeEngine:
     instances: list["_FakeEngine"] = []
 
     def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+        self.switcher = switcher
         self.settings = settings
         self.on_event = on_event
         self.dry_run = dry_run
@@ -1290,6 +1291,14 @@ class _FakeEngine:
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """Live, like the real engine's: it re-reads autoswitch.model every
+        tick (TestSettingsReload in test_autoswitch.py holds that contract)."""
+        from claude_swap.settings import load_settings, parse_model_names
+
+        return parse_model_names(load_settings(self.switcher.backup_dir).model)
 
     def run_loop(self) -> int:
         self.on_event(NoSwitchEvent(reason="cooldown"))
@@ -1520,6 +1529,53 @@ class TestAutoScreen:
             plain = app.screen.query_one("#candidates", Static).render().plain
             # On 5h alone #2 (10% used) would rank first; Fable 95% binds it
             # below #3 (50% binding).
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+
+    async def test_candidates_ranking_follows_a_live_model_edit(
+        self, tmp_path, fake_engine
+    ):
+        """The ranking must track the axes the engine is deciding on *now*.
+
+        The engine re-reads ``autoswitch.model`` every tick, so a screen
+        ranking on a mount-time copy of the settings names one account as
+        "next best" while the engine switches to another.
+        """
+        import json as _json
+
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(50.0, 5.0, scoped=[("Fable", 20.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            candidates = app.screen.query_one("#candidates", Static)
+            plain = candidates.render().plain
+            # No model configured at mount: 5h alone puts #2 on top.
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+
+            (tmp_path / "settings.json").write_text(_json.dumps({
+                "schemaVersion": 1, "autoswitch": {"model": "Fable"},
+            }))
+            app.request_refresh()
+            await settle(pilot)
+            plain = candidates.render().plain
+            # Same screen, no remount: the Fable window now binds #2 last.
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )

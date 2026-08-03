@@ -737,6 +737,19 @@ class AutoSwitchEngine:
 
     # -- live settings --------------------------------------------------------
 
+    @property
+    def models(self) -> tuple[str, ...]:
+        """The model axes the decision binds on right now (empty = 5h/7d only).
+
+        The one place a frontend may read them from. They move with
+        settings.json under a running engine, so a display that parses the
+        file itself and keeps the result goes stale the moment the user
+        toggles the key — and then names a "next best" account the engine
+        will not pick. Reading a tuple attribute is atomic, so the UI thread
+        can ask while the engine thread is mid-tick.
+        """
+        return self._models
+
     def _settings_stamp(self) -> tuple[int, int] | None:
         """Cheap change token for settings.json (one stat), None when absent.
 

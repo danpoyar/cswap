@@ -1918,6 +1918,18 @@ class TestSettingsReload:
         assert list(poll.windows["1"]) == ["5h", "7d", "Fable"]
         assert h.switcher._poll_inputs_override == (75.0, ("Fable",))
 
+    def test_public_models_accessor_tracks_the_file(self, harness):
+        # The one axis source a frontend may read: the auto screen ranks its
+        # "Next best" list on it, so it has to be the same tuple the decision
+        # binds on — after a reload as much as at construction.
+        assert harness.engine.models == () == harness.engine._models
+        set_setting(harness.switcher.backup_dir, "autoswitch.model", "Fable")
+        harness.tick_with_usage({
+            n: _scoped_usage(pct, 20.0)
+            for n, pct in (("1", 50.0), ("2", 10.0), ("3", 10.0))
+        })
+        assert harness.engine.models == ("Fable",) == harness.engine._models
+
     def test_session_threshold_survives_a_reload(self, harness):
         # The TUI's session-only override is a pin too: a reload triggered by
         # an unrelated edit must not silently restore the file value.

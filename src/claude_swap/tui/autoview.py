@@ -291,14 +291,27 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
+    def _decision_models(self) -> tuple[str, ...]:
+        """The window set the running engine is deciding on.
+
+        Asked of the engine, not parsed from this screen's settings copy: the
+        engine re-reads ``autoswitch.model`` every tick, so a mount-time copy
+        goes stale the moment the user toggles the key, and the panel would
+        then rank on windows the engine no longer binds — showing one "next
+        best" while the switch goes to another account. The fallback only
+        covers the first paint, before ``on_mount`` has started an engine.
+        """
+        engine = self._engine
+        if engine is not None:
+            return engine.models
+        return parse_model_names(self._settings.model) if self._settings else ()
+
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked by remaining headroom (best first)."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
+        models = self._decision_models()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
