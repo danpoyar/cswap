@@ -15,15 +15,16 @@ from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
     UiSettings,
+    cli_overrides,
     effective_settings,
     load_settings,
     load_ui_settings,
-    merged_with_cli,
     read_settings,
     save_settings,
     set_setting,
     settings_path,
     unset_setting,
+    with_overrides,
 )
 
 
@@ -269,32 +270,48 @@ class TestEffectiveSettings:
         assert by_key["autoswitch.intervalSeconds"] is False
 
 
-class TestMergedWithCli:
+class TestCliOverrides:
+    """``cli_overrides`` + ``with_overrides`` — the pair ``cswap auto`` uses.
+
+    The flags are kept as a dict and applied separately (rather than merged
+    once) because the engine needs them again on every settings reload: a flag
+    the user typed outranks the file for the whole run, not just at startup.
+    """
+
+    @staticmethod
+    def _merged(base: AutoSwitchSettings, args) -> AutoSwitchSettings:
+        return with_overrides(base, cli_overrides(args))
+
     def test_no_flags_returns_settings_unchanged(self):
         base = AutoSwitchSettings(threshold=80.0)
-        assert merged_with_cli(base, _args()) is base
+        assert cli_overrides(_args()) == {}
+        assert self._merged(base, _args()) is base
 
     def test_cli_beats_settings(self):
         base = AutoSwitchSettings(threshold=80.0, cooldown_seconds=10.0)
-        merged = merged_with_cli(base, _args(threshold=60.0, interval=30.0))
+        args = _args(threshold=60.0, interval=30.0)
+        assert cli_overrides(args) == {
+            "threshold": 60.0, "interval_seconds": 30.0,
+        }
+        merged = self._merged(base, args)
         assert merged.threshold == 60.0
         assert merged.interval_seconds == 30.0
         assert merged.cooldown_seconds == 10.0  # untouched
 
     def test_cli_values_are_clamped(self):
-        merged = merged_with_cli(AutoSwitchSettings(), _args(interval=1.0))
+        merged = self._merged(AutoSwitchSettings(), _args(interval=1.0))
         assert merged.interval_seconds == 15.0
 
     def test_boolean_override(self):
-        merged = merged_with_cli(
+        merged = self._merged(
             AutoSwitchSettings(), _args(include_api_key_accounts=True)
         )
         assert merged.include_api_key_accounts is True
 
     def test_model_override(self):
-        merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
+        merged = self._merged(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
 
     def test_strategy_override(self):
-        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
+        merged = self._merged(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"

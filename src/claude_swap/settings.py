@@ -495,11 +495,6 @@ def with_overrides(
     return _clamped(dataclasses.replace(settings, **overrides))
 
 
-def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
-    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
-    return with_overrides(settings, cli_overrides(args))
-
-
 def atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
