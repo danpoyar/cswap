@@ -2124,6 +2124,9 @@ class TestSettingsReloadUnreadable:
         assert h.engine._models == ()
         assert h.engine.settings.strategy == "consume-first"  # untouched key
         assert h.switcher._poll_inputs_override == (80.0, ())
+
+
+class TestPctLabel:
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"
 
