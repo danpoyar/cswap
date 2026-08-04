@@ -1282,6 +1282,7 @@ class _FakeEngine:
     instances: list["_FakeEngine"] = []
 
     def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+        self.switcher = switcher
         self.settings = settings
         self.on_event = on_event
         self.dry_run = dry_run
@@ -1290,6 +1291,14 @@ class _FakeEngine:
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """Live, like the real engine's: it re-reads autoswitch.model every
+        tick (TestSettingsReload in test_autoswitch.py holds that contract)."""
+        from claude_swap.settings import load_settings, parse_model_names
+
+        return parse_model_names(load_settings(self.switcher.backup_dir).model)
 
     def run_loop(self) -> int:
         self.on_event(NoSwitchEvent(reason="cooldown"))
@@ -1523,6 +1532,211 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    async def test_candidates_ranking_follows_a_live_model_edit(
+        self, tmp_path, fake_engine
+    ):
+        """The ranking must track the axes the engine is deciding on *now*.
+
+        The engine re-reads ``autoswitch.model`` every tick, so a screen
+        ranking on a mount-time copy of the settings names one account as
+        "next best" while the engine switches to another.
+        """
+        import json as _json
+
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(50.0, 5.0, scoped=[("Fable", 20.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            candidates = app.screen.query_one("#candidates", Static)
+            plain = candidates.render().plain
+            # No model configured at mount: 5h alone puts #2 on top.
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+
+            (tmp_path / "settings.json").write_text(_json.dumps({
+                "schemaVersion": 1, "autoswitch": {"model": "Fable"},
+            }))
+            app.request_refresh()
+            await settle(pilot)
+            plain = candidates.render().plain
+            # Same screen, no remount: the Fable window now binds #2 last.
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+
+
+@pytest.fixture
+def quiet_real_engine(monkeypatch):
+    """The real ``AutoSwitchEngine``, with only its thread body stubbed out.
+
+    What these tests exercise is the engine's *construction* bookkeeping —
+    which settings snapshot a restarted engine is built from, and what it
+    replays on later reloads. ``_FakeEngine`` cannot show any of it: its
+    ``models`` property reads settings.json live, so it looks right no matter
+    what it was handed. Only ``run_loop`` is replaced, so no polling, no
+    network and no state writes happen inside a Pilot test.
+    """
+    from claude_swap.autoswitch import AutoSwitchEngine
+
+    def quiet_loop(self) -> int:
+        self._stop.wait(30)
+        return 0
+
+    monkeypatch.setattr(AutoSwitchEngine, "run_loop", quiet_loop)
+    return AutoSwitchEngine
+
+
+@pytest.mark.asyncio
+class TestAutoScreenEngineRestart:
+    """Going live (or back to dry-run) builds a *new* engine — from the
+    settings in force at that moment, not from the mount-time snapshot.
+
+    An engine only replays the file fields that moved since its own
+    construction, so an edit made while this screen was up is invisible to it
+    forever unless the screen re-reads. The Fable-quota key is exactly such an
+    edit: the user ticks it in the Quota panel with the auto screen open.
+    """
+
+    def _settings(self, tmp_path: Path, autoswitch: dict) -> None:
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": autoswitch})
+        )
+
+    def _app(self, tmp_path: Path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        return fake, make_app(fake)
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    async def _go_live(self, pilot):
+        await pilot.press("l")
+        await pilot.pause()
+        await pilot.press("y")
+        await settle(pilot)
+
+    async def test_go_live_adopts_a_model_key_set_since_mount(
+        self, tmp_path, quiet_real_engine
+    ):
+        fake, app = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._engine.models == ()
+            # The user ticks "count the Fable week" while this screen is up.
+            self._settings(tmp_path, {"model": "Fable"})
+            await self._go_live(pilot)
+            engine = screen._engine
+            assert engine.dry_run is False
+            assert engine.models == ("Fable",)
+            # Not just at construction: the axis has to survive the engine's
+            # own reload, which replays only fields that moved after it.
+            engine._refresh_settings()
+            assert engine.models == ("Fable",)
+            assert fake._poll_inputs_override == (90.0, ("Fable",))
+
+    async def test_back_to_dry_run_adopts_a_model_key_cleared_since_mount(
+        self, tmp_path, quiet_real_engine
+    ):
+        self._settings(tmp_path, {"model": "Fable"})
+        fake, app = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._engine.models == ("Fable",)
+            await self._go_live(pilot)
+            self._settings(tmp_path, {})  # the box unticked, engine running
+            await pilot.press("l")  # live → dry-run needs no confirmation
+            await settle(pilot)
+            engine = screen._engine
+            assert engine.dry_run is True
+            assert engine.models == ()
+            engine._refresh_settings()
+            assert engine.models == ()
+            assert fake._poll_inputs_override == (90.0, ())
+
+    async def test_session_threshold_survives_the_restart_as_a_pin(
+        self, tmp_path, quiet_real_engine
+    ):
+        self._settings(tmp_path, {"threshold": 90.0})
+        fake, app = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "right", "right", "enter")
+            await pilot.pause()
+            assert screen._settings.threshold == 93.0
+            await self._go_live(pilot)
+            engine = screen._engine
+            assert engine.settings.threshold == 93.0
+            assert fake._poll_inputs_override == (93.0, ())
+            # A pin, not a starting value: the file must not take the session
+            # threshold back on the next reload.
+            self._settings(tmp_path, {"threshold": 70.0})
+            engine._refresh_settings()
+            assert engine.settings.threshold == 93.0
+
+    async def test_a_file_edit_reaches_a_restart_under_a_session_threshold(
+        self, tmp_path, quiet_real_engine
+    ):
+        """The pin covers the threshold only — the rest of the file still
+        lands on the new engine."""
+        self._settings(tmp_path, {"threshold": 90.0})
+        fake, app = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            self._settings(
+                tmp_path,
+                {"threshold": 90.0, "model": "Fable", "strategy": "consume-first"},
+            )
+            await self._go_live(pilot)
+            engine = screen._engine
+            assert engine.models == ("Fable",)
+            assert engine.settings.strategy == "consume-first"
+            assert engine.settings.threshold == 91.0
+            assert fake._poll_inputs_override == (91.0, ("Fable",))
+
+    async def test_an_unreadable_file_at_restart_keeps_the_policy(
+        self, tmp_path, quiet_real_engine
+    ):
+        """Same rule the engine's own reload follows: a file that did not
+        answer is not an edit, so the restart must not fall back to defaults.
+        """
+        self._settings(tmp_path, {"model": "Fable", "threshold": 80.0})
+        fake, app = self._app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            (tmp_path / "settings.json").write_text(
+                '{"autoswitch": {"model": "Fable",}}'
+            )
+            await self._go_live(pilot)
+            engine = app.screen._engine
+            assert engine.models == ("Fable",)
+            assert engine.settings.threshold == 80.0
+            assert fake._poll_inputs_override == (80.0, ("Fable",))
 
 
 class TestEventText:

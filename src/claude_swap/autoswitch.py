@@ -43,7 +43,7 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -57,7 +57,14 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    read_settings,
+    settings_path,
+    with_overrides,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -94,6 +101,13 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # expired. Voluntary (proactive/consume-first) switches wait for that silence;
 # at-limit and failover switches are forced and skip the gate.
 QUIET_WINDOW_S = 5 * 60.0
+
+# How often a sleeping loop re-stats settings.json. Every tick re-reads the
+# file, but a BLOCKED/all-exhausted tick then sleeps up to MAX_SLEEP_S — and a
+# settings change (say, folding a per-model weekly quota into the decision)
+# honored ten minutes later is indistinguishable to a user from "you must
+# restart the daemon". One stat per slice; the loop wakes on the first change.
+SETTINGS_WATCH_S = 5.0
 
 
 def latest_session_activity_ts(projects_dir: Path) -> float | None:
@@ -363,9 +377,10 @@ class ErrorEvent(AutoSwitchEvent):
 
 @dataclass(frozen=True)
 class ConfigWarningEvent(AutoSwitchEvent):
-    """A configuration value is syntactically fine but provably inert (e.g.
-    an ``autoswitch.model`` name no account reports). Not an error: the
-    engine keeps running on the axes that do exist."""
+    """The configuration could not be taken as read: a value that is
+    syntactically fine but provably inert (an ``autoswitch.model`` name no
+    account reports), or a settings.json that stopped answering mid-run. Not
+    an error — the engine keeps running on what it already has."""
 
     kind: ClassVar[str] = "config-warning"
     message: str
@@ -465,6 +480,12 @@ class AutoSwitchEngine:
     ``on_event`` receives every :class:`AutoSwitchEvent`; exceptions it raises
     are not caught (a broken frontend should fail loudly in tests). ``clock``
     is wall time (persisted cooldown timestamps must survive processes).
+
+    ``overrides`` names the settings fields the user pinned explicitly (a
+    ``cswap auto`` flag; see :func:`settings.cli_overrides`). Every tick
+    re-reads settings.json and replays the fields whose *file* value changed
+    since construction, so an edit lands without a restart — but never over a
+    pin, and never over a value a host passed in that the file never carried.
     """
 
     def __init__(
@@ -477,14 +498,29 @@ class AutoSwitchEngine:
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         claude_projects_dir: Path | None = None,
+        overrides: dict[str, object] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Live settings tracking. ``_settings_base`` is what the engine was
+        # constructed with, ``_settings_file`` the file as it read at that
+        # moment, and ``_settings_pins`` the values named explicitly (a CLI
+        # flag, or the TUI's session threshold). Reloading replays only the
+        # fields whose file value moved, so a pin and a host-supplied value
+        # both survive an unrelated edit.
+        self._settings_base = settings
+        read = read_settings(switcher.backup_dir)
+        self._settings_file = read.settings
+        # Whether the last read got an answer at all. Starting from the
+        # construction read keeps the "no settings.json" install (the default)
+        # silent: only a file that used to answer and stopped is worth a line.
+        self._settings_file_ok = read.ok
+        self._settings_pins = dict(overrides or {})
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
-        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
-        # pass everywhere usage windows are read — decisions, cadence, and
-        # reset scheduling must all see the same axes.
+        # separated list ("Fable", "Opus,Sonnet", "all"); parsed here and on
+        # every settings reload, then passed everywhere usage windows are read
+        # — decisions, cadence, and reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
@@ -699,6 +735,88 @@ class AutoSwitchEngine:
             return False
         return slot_identity["uuid"] != ta_uuid
 
+    # -- live settings --------------------------------------------------------
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """The model axes the decision binds on right now (empty = 5h/7d only).
+
+        The one place a frontend may read them from. They move with
+        settings.json under a running engine, so a display that parses the
+        file itself and keeps the result goes stale the moment the user
+        toggles the key — and then names a "next best" account the engine
+        will not pick. Reading a tuple attribute is atomic, so the UI thread
+        can ask while the engine thread is mid-tick.
+        """
+        return self._models
+
+    def _settings_stamp(self) -> tuple[int, int] | None:
+        """Cheap change token for settings.json (one stat), None when absent.
+
+        Only ever compared with itself: the loop uses it to notice an edit
+        mid-sleep, never to decide what the settings say.
+        """
+        try:
+            st = os.stat(settings_path(self.switcher.backup_dir))
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _refresh_settings(self) -> None:
+        """Adopt settings.json edits mid-run — no restart, no new engine.
+
+        Freezing the settings at construction made every file-backed
+        preference a restart-only preference, ``autoswitch.model`` included:
+        the whole point of that key is to fold a per-model weekly quota into
+        the decision, and a switch policy that needs a daemon restart to
+        change is a switch policy nobody can toggle.
+
+        Only the fields whose *file* value moved since construction are
+        replayed, so a value the host passed in (and the file never carried)
+        stays put, and explicit pins always win. A changed model list rebuilds
+        every axis derived from it: the decision windows, the collector's
+        poll-planning keys, and the one-shot model-name guard — which has
+        never seen the new name and must get its shot at it.
+
+        A read that did not answer (file deleted, half-written, unreadable)
+        is not an edit: ``load_settings`` would hand back plain defaults, and
+        replaying those would revert model axes, strategy, threshold and
+        cooldown under a running daemon with nothing in the log to show for
+        it. The last snapshot that did answer stays in force, and the engine
+        says so once.
+        """
+        read = read_settings(self.switcher.backup_dir)
+        if not read.ok:
+            if self._settings_file_ok:
+                self._settings_file_ok = False
+                path = settings_path(self.switcher.backup_dir)
+                self._emit(
+                    ConfigWarningEvent(
+                        message=(
+                            f"could not read {path} ({read.error}); keeping the "
+                            "settings already in effect"
+                        )
+                    )
+                )
+            return
+        self._settings_file_ok = True
+        file_now = read.settings
+        changed = {
+            f.name: getattr(file_now, f.name)
+            for f in fields(AutoSwitchSettings)
+            if getattr(file_now, f.name) != getattr(self._settings_file, f.name)
+        }
+        base = replace(self._settings_base, **changed) if changed else self._settings_base
+        settings = with_overrides(base, self._settings_pins)
+        if settings == self.settings:
+            return
+        self.settings = settings
+        models = parse_model_names(settings.model)
+        if models != self._models:
+            self._models = models
+            self._model_check_done = not models
+        self.switcher.set_poll_policy_inputs(settings.threshold, self._models)
+
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
@@ -718,6 +836,10 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        # Once per tick, before anything reads them: the tick then decides on
+        # one coherent snapshot of the settings, exactly as it already does
+        # for the threshold.
+        self._refresh_settings()
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1547,9 +1669,10 @@ class AutoSwitchEngine:
 
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
-        cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
+        cadence mid-run. Pinned like a CLI flag, so the per-tick settings
+        reload cannot quietly take it back. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
+        self._settings_pins["threshold"] = threshold
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
@@ -1572,6 +1695,22 @@ class AutoSwitchEngine:
             return max(interval, NO_RESET_FALLBACK_S)
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return interval * (0.9 + 0.2 * random.random())
+
+    def _wait_between_ticks(self, delay: float) -> None:
+        """Sleep until the next tick — cut short by stop()/wake(), and by an
+        edit to settings.json so a config change never waits out a long
+        blocked/exhausted sleep. Sliced by ``SETTINGS_WATCH_S``: one stat per
+        slice, and the nominal slice budget bounds the loop even when the
+        wait itself returns early."""
+        stamp = self._settings_stamp()
+        remaining = delay
+        while remaining > 0:
+            chunk = min(remaining, SETTINGS_WATCH_S)
+            if self._wake.wait(chunk):
+                return
+            remaining -= chunk
+            if self._settings_stamp() != stamp:
+                return
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
@@ -1600,4 +1739,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._wake.wait(delay)
+            self._wait_between_ticks(delay)

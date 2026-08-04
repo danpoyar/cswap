@@ -31,7 +31,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import SETTING_SPECS, parse_model_names, read_settings
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -86,6 +86,9 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # The session threshold as an explicit pin, carried across engine
+        # restarts (the engine's own copy dies with it).
+        self._threshold_pin: float | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -101,13 +104,7 @@ class AutoScreen(Screen):
 
     def on_mount(self) -> None:
         self.app.set_store_only(True)
-        self._settings = load_settings(self.app.switcher.backup_dir)
-        # The bar tick everywhere reads app.threshold_pct, loaded once at app
-        # startup — sync it to the fresh file value so bars and engine agree,
-        # and remember that value: unmount restores it (only the session
-        # adjustment reverts, not this correction).
-        self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self._adopt_settings()
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -183,6 +180,7 @@ class AutoScreen(Screen):
         if value == self._settings.threshold:
             return
         self._settings = replace(self._settings, threshold=value)
+        self._threshold_pin = value
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = value
@@ -206,12 +204,49 @@ class AutoScreen(Screen):
 
     # -- engine -------------------------------------------------------------
 
+    def _adopt_settings(self) -> None:
+        """Read settings.json as the base the next engine is built from.
+
+        Read again on every start, never reused from ``on_mount``: each start
+        builds a *new* engine, and an engine only replays the file fields that
+        moved after its own construction. An edit made while this screen was
+        up (ticking ``autoswitch.model`` in the Quota panel, say) is already in
+        the file the new engine reads at construction, so it would never show
+        up as "moved" — and a mount-time snapshot handed in as the base would
+        win over it for the rest of the run.
+
+        A read that did not answer is not an edit — the same rule the engine's
+        own reload follows: the settings already in force stay in force rather
+        than collapsing to defaults under a half-written file.
+
+        The bar tick everywhere reads app.threshold_pct, loaded once at app
+        startup — sync it so bars and engine agree, and remember the file's own
+        threshold: unmount restores that (only the session adjustment reverts).
+        """
+        read = read_settings(self.app.switcher.backup_dir)
+        if not read.ok and self._settings is not None:
+            return
+        settings = read.settings
+        self._configured_threshold = settings.threshold
+        if self._threshold_pin is not None:
+            settings = replace(settings, threshold=self._threshold_pin)
+        self._settings = settings
+        self.app.threshold_pct = settings.threshold
+
     def _start_engine(self, *, dry_run: bool) -> None:
         engine = AutoSwitchEngine(
             self.app.switcher,
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            # A session threshold outranks the file for the whole run, exactly
+            # like a `cswap auto` flag — pass it as one, or the first reload
+            # under a fresh engine would quietly take it back.
+            overrides=(
+                None
+                if self._threshold_pin is None
+                else {"threshold": self._threshold_pin}
+            ),
         )
         self._engine = engine
         self.run_worker(
@@ -271,7 +306,12 @@ class AutoScreen(Screen):
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
             self._engine.stop()
+        self._adopt_settings()
         self._start_engine(dry_run=dry_run)
+        # The file may have moved under the screen while it was up; the header
+        # and the bar tick must not keep showing the old numbers.
+        self._update_summary()
+        self.query_one("#auto-active-panel", AccountsPanel).refresh()
 
     def _update_badge(self) -> None:
         badge = self.query_one("#mode-badge", Static)
@@ -291,14 +331,27 @@ class AutoScreen(Screen):
             self._candidates_text(snap, active_number=snap.active_number)
         )
 
+    def _decision_models(self) -> tuple[str, ...]:
+        """The window set the running engine is deciding on.
+
+        Asked of the engine, not parsed from this screen's settings copy: the
+        engine re-reads ``autoswitch.model`` every tick, so a mount-time copy
+        goes stale the moment the user toggles the key, and the panel would
+        then rank on windows the engine no longer binds — showing one "next
+        best" while the switch goes to another account. The fallback only
+        covers the first paint, before ``on_mount`` has started an engine.
+        """
+        engine = self._engine
+        if engine is not None:
+            return engine.models
+        return parse_model_names(self._settings.model) if self._settings else ()
+
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked by remaining headroom (best first)."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
+        models = self._decision_models()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
