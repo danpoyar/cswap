@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from claude_swap import process_detection
 from claude_swap.process_detection import (
     ClaudeSession,
     IdeInstance,
@@ -18,6 +22,7 @@ from claude_swap.process_detection import (
     is_pid_alive,
     list_ide_instances,
     list_sessions,
+    pids_with_config_dir,
 )
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -354,3 +359,65 @@ class TestFormatAge:
     def test_days(self):
         ms = int((time.time() - 172800) * 1000)  # 2 days ago
         assert format_age(ms) == "2d ago"
+
+
+# --- pids_with_config_dir (CON-340) ---
+
+
+class TestPidsWithConfigDir:
+    def test_empty_input(self, tmp_path):
+        assert pids_with_config_dir([], tmp_path) == set()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX env probes")
+    def test_live_child_pointing_at_the_dir_is_detected(self, tmp_path):
+        """Real end-to-end probe: only the process whose environment points
+        CLAUDE_CONFIG_DIR at the directory is a member — the test's own
+        process (no such variable) is not."""
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        env["CLAUDE_CONFIG_DIR"] = str(tmp_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], env=env
+        )
+        try:
+            owned = pids_with_config_dir([proc.pid, os.getpid()], tmp_path)
+            assert owned == {proc.pid}
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_ps_parser_extracts_value_up_to_next_env_token(self, monkeypatch):
+        canned = (
+            "  111 claude --bg HOME=/u CLAUDE_CONFIG_DIR=/x/prof TERM=xterm\n"
+            "  222 claude HOME=/u TERM=xterm\n"
+            "garbage line\n"
+        )
+        monkeypatch.setattr(
+            process_detection.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout=canned),
+        )
+        owned = process_detection._pids_with_config_dir_ps(
+            [111, 222], lambda v: v == "/x/prof"
+        )
+        assert owned == {111}
+
+    def test_ps_all_pids_gone_is_an_empty_answer(self, monkeypatch):
+        monkeypatch.setattr(
+            process_detection.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=1, stdout=""),
+        )
+        assert (
+            process_detection._pids_with_config_dir_ps([1], lambda v: True)
+            == set()
+        )
+
+    def test_ps_failure_means_unknown(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise OSError("no ps binary")
+
+        monkeypatch.setattr(process_detection.subprocess, "run", boom)
+        assert (
+            process_detection._pids_with_config_dir_ps([1], lambda v: True)
+            is None
+        )

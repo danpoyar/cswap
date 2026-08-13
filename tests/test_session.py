@@ -16,6 +16,7 @@ from claude_swap import oauth
 from claude_swap import session as session_mod
 from claude_swap.exceptions import AccountNotFoundError, SessionError
 from claude_swap.models import Platform
+from claude_swap.process_detection import list_sessions
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
@@ -160,6 +161,21 @@ def make_live(session_dir: Path, pid: int | None = None) -> None:
     pid_dir = session_dir / "sessions"
     pid_dir.mkdir(parents=True, exist_ok=True)
     (pid_dir / f"{pid}.json").write_text(json.dumps({"pid": pid}))
+
+
+@pytest.fixture(autouse=True)
+def _probe_owns_every_pid(monkeypatch):
+    """Hermetic default for the CLAUDE_CONFIG_DIR membership probe (CON-340).
+
+    Tests simulate live claudes with bare PID files (``make_live``) whose
+    process is the test runner itself, so a real environment probe would
+    disown them — and shell out to ``ps``. Treat every registered PID as the
+    profile's own, which is exactly the pre-sharing worldview these tests
+    encode. Scoping tests override this locally.
+    """
+    monkeypatch.setattr(
+        session_mod, "pids_with_config_dir", lambda pids, config_dir: set(pids)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +695,245 @@ class TestSharingWindowsMode:
 
         assert not (session_dir / "settings.json").exists()
         assert not (session_dir / "skills").exists()
+
+    def test_registry_stays_private_on_windows(self, windows_mgr):
+        # A copied registry would fork the roster, not share it (CON-340).
+        source, session_dir, mgr = windows_mgr
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert not (session_dir / "sessions").exists()
+
+
+# ---------------------------------------------------------------------------
+# session registry sharing (CON-340)
+# ---------------------------------------------------------------------------
+
+
+def _register_session(
+    claude_dir: Path, session_id: str, pid: int | None = None
+) -> None:
+    """Drop a live registration into a registry the way claude itself does."""
+    registry = claude_dir / "sessions"
+    registry.mkdir(parents=True, exist_ok=True)
+    (registry / f"{session_id}.json").write_text(
+        json.dumps({"pid": pid or os.getpid(), "sessionId": session_id})
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="registry sharing is POSIX-only")
+class TestSessionRegistrySharing:
+    """CON-340: one machine, one session roster.
+
+    A per-terminal profile must read the same ``sessions/`` registry as the
+    default ``~/.claude`` — otherwise ``claude agents`` inside the profile
+    sees only itself, and sessions elsewhere on the machine can't discover
+    (or message) the profile's sessions.
+    """
+
+    def test_fresh_profile_sees_default_registrations(
+        self, manager, temp_home, auth_status_tracks_seed, refresh_rotates
+    ):
+        _register_session(temp_home / ".claude", "registered-from-default")
+
+        session_dir, _, _ = manager.setup_session("2", share=True)
+
+        seen = {s.session_id for s in list_sessions(claude_dir=session_dir)}
+        assert "registered-from-default" in seen
+
+    def test_profile_registrations_visible_from_default(
+        self, manager, temp_home, auth_status_tracks_seed, refresh_rotates
+    ):
+        session_dir, _, _ = manager.setup_session("2", share=True)
+
+        _register_session(session_dir, "registered-from-profile")
+
+        seen = {
+            s.session_id
+            for s in list_sessions(claude_dir=temp_home / ".claude")
+        }
+        assert "registered-from-profile" in seen
+
+    def test_profile_registry_is_a_shared_symlink(self, share_setup):
+        source, session_dir, mgr = share_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        registry = session_dir / "sessions"
+        assert registry.is_symlink()
+        assert registry.readlink() == source / "sessions"
+        assert (source / "sessions").is_dir()
+        # Not manifest-managed: the roster is not a customization.
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "sessions" not in manifest["items"]
+
+        mgr._sync_sharing(session_dir, share=True)  # idempotent
+        assert registry.readlink() == source / "sessions"
+
+    def test_no_share_keeps_registry_shared(self, share_setup):
+        source, session_dir, mgr = share_setup
+        mgr._sync_sharing(session_dir, share=True)
+        mgr._sync_sharing(session_dir, share=False)
+
+        assert (session_dir / "sessions").is_symlink()
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+
+    def test_migration_preserves_live_registrations(self, share_setup):
+        source, session_dir, mgr = share_setup
+        registry = session_dir / "sessions"
+        registry.mkdir()
+        live_pid = os.getpid()
+        (registry / f"{live_pid}.json").write_text(
+            json.dumps({"pid": live_pid, "sessionId": "live-one"})
+        )
+        (registry / f"{live_pid}.deadbeef.key").write_text("token")
+        dead_pid = 2**30  # far beyond any real PID space
+        (registry / f"{dead_pid}.json").write_text(json.dumps({"pid": dead_pid}))
+        # Same-named stale leftover on the shared side: the live (fresher)
+        # profile entry wins the pid-reuse tiebreak.
+        (source / "sessions").mkdir()
+        stale = source / "sessions" / f"{live_pid}.json"
+        stale.write_text(
+            json.dumps({"pid": live_pid, "sessionId": "stale-leftover"})
+        )
+        os.utime(stale, (1, 1))
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert registry.is_symlink()
+        shared = source / "sessions"
+        moved = json.loads((shared / f"{live_pid}.json").read_text())
+        assert moved["sessionId"] == "live-one"
+        assert (shared / f"{live_pid}.deadbeef.key").read_text() == "token"
+        assert not (shared / f"{dead_pid}.json").exists()  # leftover dropped
+        # The old path still resolves through the symlink for a live claude.
+        through_link = json.loads((registry / f"{live_pid}.json").read_text())
+        assert through_link["sessionId"] == "live-one"
+
+    def test_existing_correct_symlink_left_alone(self, share_setup):
+        source, session_dir, mgr = share_setup
+        (source / "sessions").mkdir()
+        (session_dir / "sessions").symlink_to(source / "sessions")
+        before = (session_dir / "sessions").lstat()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "sessions").is_symlink()
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+        assert (session_dir / "sessions").lstat().st_ino == before.st_ino
+
+    def test_unmovable_entry_keeps_registry_private(self, share_setup):
+        """An unknown name colliding with the shared side is never clobbered:
+        the migration aborts BEFORE anything moves, so the profile keeps its
+        whole registry — live registrations included — not just the
+        conflicting file (a partial move would blind every profile-liveness
+        guard while the profile stays a real directory)."""
+        source, session_dir, mgr = share_setup
+        registry = session_dir / "sessions"
+        registry.mkdir()
+        (registry / "mystery.bin").write_text("profile-side")
+        live_pid = os.getpid()
+        (registry / f"{live_pid}.json").write_text(
+            json.dumps({"pid": live_pid, "sessionId": "live-one"})
+        )
+        (source / "sessions").mkdir()
+        (source / "sessions" / "mystery.bin").write_text("shared-side")
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert not (session_dir / "sessions").is_symlink()
+        assert (registry / "mystery.bin").read_text() == "profile-side"
+        assert (source / "sessions" / "mystery.bin").read_text() == "shared-side"
+        # The live registration did NOT leak into the shared registry.
+        assert not (source / "sessions" / f"{live_pid}.json").exists()
+        live = json.loads((registry / f"{live_pid}.json").read_text())
+        assert live["sessionId"] == "live-one"
+
+    def test_pid_reuse_prefers_fresher_registration(self, share_setup):
+        """PID reuse across profiles: the profile holds a stale leftover
+        whose PID a live claude (registered in the shared registry) now
+        owns. The fresher shared file survives; the leftover is dropped."""
+        source, session_dir, mgr = share_setup
+        registry = session_dir / "sessions"
+        registry.mkdir()
+        pid = os.getpid()
+        leftover = registry / f"{pid}.json"
+        leftover.write_text(json.dumps({"pid": pid, "sessionId": "stale"}))
+        os.utime(leftover, (1, 1))
+        (source / "sessions").mkdir()
+        (source / "sessions" / f"{pid}.json").write_text(
+            json.dumps({"pid": pid, "sessionId": "live-elsewhere"})
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "sessions").is_symlink()
+        kept = json.loads((source / "sessions" / f"{pid}.json").read_text())
+        assert kept["sessionId"] == "live-elsewhere"
+
+    def test_deleted_shared_registry_is_recreated(self, share_setup):
+        source, session_dir, mgr = share_setup
+        mgr._sync_sharing(session_dir, share=True)
+        assert (session_dir / "sessions").is_symlink()
+        (source / "sessions").rmdir()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (source / "sessions").is_dir()
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="registry sharing is POSIX-only")
+class TestScopedLiveSessions:
+    """With a shared registry, live_sessions_for filters to the profile's own
+    sessions by process environment (CLAUDE_CONFIG_DIR) — and falls back to
+    the full roster when the probe can't answer."""
+
+    @pytest.fixture
+    def shared_profile(self, share_setup, monkeypatch):
+        from claude_swap import process_detection
+
+        source, session_dir, mgr = share_setup
+        mgr._sync_sharing(session_dir, share=True)
+        _register_session(session_dir, "mine", pid=111)
+        _register_session(source, "foreign", pid=222)
+        monkeypatch.setattr(
+            process_detection, "is_pid_alive", lambda pid: pid in (111, 222)
+        )
+        return session_dir
+
+    def test_filters_to_profile_owned_pids(self, shared_profile, monkeypatch):
+        session_dir = shared_profile
+        monkeypatch.setattr(
+            session_mod,
+            "pids_with_config_dir",
+            lambda pids, config_dir: {111} if config_dir == session_dir else set(),
+        )
+
+        assert [s.session_id for s in live_sessions_for(session_dir)] == ["mine"]
+
+    def test_probe_unavailable_falls_back_to_full_roster(
+        self, shared_profile, monkeypatch
+    ):
+        session_dir = shared_profile
+        monkeypatch.setattr(
+            session_mod, "pids_with_config_dir", lambda pids, config_dir: None
+        )
+
+        seen = {s.session_id for s in live_sessions_for(session_dir)}
+        assert seen == {"mine", "foreign"}
+
+    def test_private_registry_skips_the_probe(self, share_setup, monkeypatch):
+        from claude_swap import process_detection
+
+        source, session_dir, mgr = share_setup
+        _register_session(session_dir, "mine", pid=111)  # real dir, no symlink
+        monkeypatch.setattr(process_detection, "is_pid_alive", lambda pid: True)
+
+        def probe_must_not_run(pids, config_dir):
+            raise AssertionError("environment probe must not run unshared")
+
+        monkeypatch.setattr(session_mod, "pids_with_config_dir", probe_must_not_run)
+
+        assert [s.session_id for s in live_sessions_for(session_dir)] == ["mine"]
 
 
 # ---------------------------------------------------------------------------

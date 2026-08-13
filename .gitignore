@@ -11,3 +11,6 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# Claude Code worktrees (session isolation)
+.claude/

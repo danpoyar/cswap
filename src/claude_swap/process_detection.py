@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -144,3 +147,117 @@ def get_running_instances(
     """Return all running Claude Code sessions and IDE instances."""
     resolved = claude_dir or get_claude_dir()
     return list_sessions(resolved), list_ide_instances(resolved)
+
+
+# Splits a `ps -wwE` command+environment blob at " VAR=" boundaries. The env
+# section follows the argv; a value containing " word=" text is truncated at
+# that word, which can only under-match (see pids_with_config_dir on why the
+# caller treats a non-member conservatively).
+_ENV_TOKEN_BOUNDARY = re.compile(r" (?=[A-Za-z_][A-Za-z0-9_]*=)")
+
+_PS_TIMEOUT = 10.0
+
+
+def pids_with_config_dir(
+    pids: Iterable[int], config_dir: Path
+) -> set[int] | None:
+    """Which of ``pids`` run with ``CLAUDE_CONFIG_DIR`` set to ``config_dir``.
+
+    With the session registry shared across profiles (CON-340), the registry
+    no longer says which profile a session runs against — but the process's
+    own environment does, and ``CLAUDE_CONFIG_DIR`` is the documented
+    contract that *defines* "runs against this profile". Environment access
+    is same-user only, which covers every session cswap manages.
+
+    Returns the member subset, or ``None`` when the environment can't be
+    inspected at all (probe missing/failed) so the caller picks the safe
+    direction. A single PID whose environment is gone or unreadable is
+    treated as not a member: it either exited or isn't ours.
+
+    Paths are compared literally and resolved, so a profile reached through
+    a symlinked spelling still matches. Linux reads ``/proc``; macOS/BSD one
+    batched ``ps -wwE`` (verified live on macOS: same-user processes expose
+    their environment; a value containing both a space and a ``word=`` token
+    is truncated by the parser and would under-match — default profile
+    locations never contain spaces).
+    """
+    unique = sorted({int(p) for p in pids if int(p) > 0})
+    if not unique:
+        return set()
+    if sys.platform == "win32":
+        # No shared registry on Windows (profiles keep private registries),
+        # so membership never needs the environment there.
+        return None
+
+    wanted_raw = str(config_dir)
+    try:
+        wanted_resolved = str(config_dir.resolve())
+    except OSError:
+        wanted_resolved = wanted_raw
+
+    def matches(value: str) -> bool:
+        if value in (wanted_raw, wanted_resolved):
+            return True
+        try:
+            return str(Path(value).resolve()) == wanted_resolved
+        except OSError:
+            return False
+
+    if os.path.isdir("/proc/self"):
+        return _pids_with_config_dir_proc(unique, matches)
+    return _pids_with_config_dir_ps(unique, matches)
+
+
+def _pids_with_config_dir_proc(
+    pids: list[int], matches: Callable[[str], bool]
+) -> set[int]:
+    """Linux: read each candidate's ``/proc/<pid>/environ`` (NUL-separated)."""
+    owned: set[int] = set()
+    for pid in pids:
+        try:
+            environ = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            continue  # exited, or not our process — not a member
+        for chunk in environ.split(b"\0"):
+            if chunk.startswith(b"CLAUDE_CONFIG_DIR="):
+                value = chunk.split(b"=", 1)[1].decode("utf-8", "replace")
+                if matches(value):
+                    owned.add(pid)
+                break
+    return owned
+
+
+def _pids_with_config_dir_ps(
+    pids: list[int], matches: Callable[[str], bool]
+) -> set[int] | None:
+    """macOS/BSD: one batched ``ps -wwE`` pass over all candidate PIDs."""
+    cmd = [
+        "ps",
+        "-wwE",
+        "-o",
+        "pid=,command=",
+        "-p",
+        ",".join(map(str, pids)),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_PS_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None  # probe unavailable — let the caller stay conservative
+    # ps exits non-zero when some requested PIDs are already gone; the ones
+    # it did find are still on stdout, so judge by output, not return code.
+    if not result.stdout.strip():
+        return set() if result.returncode != 0 else None
+    owned: set[int] = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        for token in _ENV_TOKEN_BOUNDARY.split(parts[1]):
+            if token.startswith("CLAUDE_CONFIG_DIR="):
+                if matches(token.split("=", 1)[1]):
+                    owned.add(pid)
+                break
+    return owned
