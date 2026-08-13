@@ -81,6 +81,22 @@ read in one sitting.
   config-warning explaining why) instead of being silently ignored. Worth
   sending upstream.
 
+- Session profiles share claude's session registry: `<profile>/sessions/`
+  is a symlink to `~/.claude/sessions` (POSIX only; a pre-existing private
+  registry is migrated with live registrations preserved, dead-PID leftovers
+  dropped). `CLAUDE_CONFIG_DIR` relocates the registry together with the
+  credentials and no documented mechanism splits them (checked against the
+  full env-var list, claude 2.1.231), so an isolated profile is invisible
+  to `claude agents`/ListAgents everywhere else and blind to the machine.
+  Live incident on this fleet, 2026-08-13: the orchestrator session ran in
+  a profile and reported "the park is empty" off its one-entry roster while
+  12 sessions were live (CON-340). Profile-scoped liveness guards (stale
+  invalidation, history migration, remove/purge refusal) keep their meaning
+  by asking the process environment (`ps -wwE` / `/proc`) which sessions
+  actually run with `CLAUDE_CONFIG_DIR` pointing at the profile, falling
+  back to the whole roster when the probe can't answer. Worth sending
+  upstream.
+
 ## Syncing with upstream
 
 ```
