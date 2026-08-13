@@ -799,6 +799,10 @@ class SessionManager:
         src = Path.home() / ".claude" / REGISTRY_DIR
         dest = session_dir / REGISTRY_DIR
         try:
+            # Target first, even when the link already exists: a deleted
+            # ~/.claude/sessions would otherwise leave every shared profile
+            # dangling until a default-profile claude recreates it.
+            _mkdir_private(src)
             if dest.is_symlink():
                 # Repoint only if it aims elsewhere (e.g. profile moved
                 # between homes); a hand-made link to the right target is
@@ -807,7 +811,6 @@ class SessionManager:
                     dest.unlink()
                     dest.symlink_to(src)
                 return
-            _mkdir_private(src)
             if dest.is_dir():
                 self._migrate_registry(dest, src)
             elif dest.exists():
@@ -827,23 +830,50 @@ class SessionManager:
 
         Live registrations must survive the migration (they are the roster
         entries the sharing exists for); a dead PID's files are dropped the
-        same way claude's own crash cleanup drops them. A same-named entry
-        already in the shared registry can only be a stale leftover — two
-        live processes never share a PID — so a live entry overwrites it.
-        Anything unrecognized is preserved without overwriting; if that
-        leaves the directory non-empty, the final rmdir raises and the
-        caller keeps the profile's registry private for this launch.
+        same way claude's own crash cleanup drops them. All-or-nothing on
+        what can be known up front: an unrecognized entry that would
+        collide with the shared side aborts BEFORE anything moves — a
+        partial migration would strand the profile's live registrations in
+        the shared registry while the profile keeps a private (now blind)
+        directory, and every profile-liveness guard would pass under a
+        live session. The remaining race (a registration created between
+        the scan and the final rmdir) fails the rmdir the same way but
+        self-heals on the next launch, when the new entry is a movable
+        live PID file.
+
+        A same-PID collision with the shared side is decided by file
+        freshness: a live claude keeps rewriting its registration
+        (status/updatedAt), a crash leftover never does — so with PID
+        reuse across profiles the newer file is the live one, whichever
+        side it is on.
         """
-        for entry in sorted(dest.iterdir()):
+        entries = sorted(dest.iterdir())
+        for entry in entries:
             head = entry.name.split(".", 1)[0]
-            if head.isdigit():
-                if is_pid_alive(int(head)):
-                    os.replace(entry, src / entry.name)
-                else:
-                    entry.unlink()
-                continue
-            if not (src / entry.name).exists():
+            if not head.isdigit() and (src / entry.name).exists():
+                raise OSError(
+                    f"cannot migrate {entry.name!r}: an unrelated entry with "
+                    f"that name already exists in {src}"
+                )
+        for entry in entries:
+            head = entry.name.split(".", 1)[0]
+            if not head.isdigit():
                 os.replace(entry, src / entry.name)
+                continue
+            if not is_pid_alive(int(head)):
+                entry.unlink()
+                continue
+            target = src / entry.name
+            try:
+                if (
+                    target.exists()
+                    and target.stat().st_mtime > entry.stat().st_mtime
+                ):
+                    entry.unlink()  # shared side is fresher — it is the live one
+                    continue
+            except OSError:
+                pass  # racing writer/remover: fall through to the move
+            os.replace(entry, target)
         dest.rmdir()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:

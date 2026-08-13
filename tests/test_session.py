@@ -787,11 +787,14 @@ class TestSessionRegistrySharing:
         (registry / f"{live_pid}.deadbeef.key").write_text("token")
         dead_pid = 2**30  # far beyond any real PID space
         (registry / f"{dead_pid}.json").write_text(json.dumps({"pid": dead_pid}))
-        # Same-named stale leftover on the shared side: the live entry wins.
+        # Same-named stale leftover on the shared side: the live (fresher)
+        # profile entry wins the pid-reuse tiebreak.
         (source / "sessions").mkdir()
-        (source / "sessions" / f"{live_pid}.json").write_text(
+        stale = source / "sessions" / f"{live_pid}.json"
+        stale.write_text(
             json.dumps({"pid": live_pid, "sessionId": "stale-leftover"})
         )
+        os.utime(stale, (1, 1))
 
         mgr._sync_sharing(session_dir, share=True)
 
@@ -819,11 +822,18 @@ class TestSessionRegistrySharing:
 
     def test_unmovable_entry_keeps_registry_private(self, share_setup):
         """An unknown name colliding with the shared side is never clobbered:
-        the migration aborts fail-open and the profile stays private."""
+        the migration aborts BEFORE anything moves, so the profile keeps its
+        whole registry — live registrations included — not just the
+        conflicting file (a partial move would blind every profile-liveness
+        guard while the profile stays a real directory)."""
         source, session_dir, mgr = share_setup
         registry = session_dir / "sessions"
         registry.mkdir()
         (registry / "mystery.bin").write_text("profile-side")
+        live_pid = os.getpid()
+        (registry / f"{live_pid}.json").write_text(
+            json.dumps({"pid": live_pid, "sessionId": "live-one"})
+        )
         (source / "sessions").mkdir()
         (source / "sessions" / "mystery.bin").write_text("shared-side")
 
@@ -832,6 +842,43 @@ class TestSessionRegistrySharing:
         assert not (session_dir / "sessions").is_symlink()
         assert (registry / "mystery.bin").read_text() == "profile-side"
         assert (source / "sessions" / "mystery.bin").read_text() == "shared-side"
+        # The live registration did NOT leak into the shared registry.
+        assert not (source / "sessions" / f"{live_pid}.json").exists()
+        live = json.loads((registry / f"{live_pid}.json").read_text())
+        assert live["sessionId"] == "live-one"
+
+    def test_pid_reuse_prefers_fresher_registration(self, share_setup):
+        """PID reuse across profiles: the profile holds a stale leftover
+        whose PID a live claude (registered in the shared registry) now
+        owns. The fresher shared file survives; the leftover is dropped."""
+        source, session_dir, mgr = share_setup
+        registry = session_dir / "sessions"
+        registry.mkdir()
+        pid = os.getpid()
+        leftover = registry / f"{pid}.json"
+        leftover.write_text(json.dumps({"pid": pid, "sessionId": "stale"}))
+        os.utime(leftover, (1, 1))
+        (source / "sessions").mkdir()
+        (source / "sessions" / f"{pid}.json").write_text(
+            json.dumps({"pid": pid, "sessionId": "live-elsewhere"})
+        )
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "sessions").is_symlink()
+        kept = json.loads((source / "sessions" / f"{pid}.json").read_text())
+        assert kept["sessionId"] == "live-elsewhere"
+
+    def test_deleted_shared_registry_is_recreated(self, share_setup):
+        source, session_dir, mgr = share_setup
+        mgr._sync_sharing(session_dir, share=True)
+        assert (session_dir / "sessions").is_symlink()
+        (source / "sessions").rmdir()
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (source / "sessions").is_dir()
+        assert (session_dir / "sessions").readlink() == source / "sessions"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="registry sharing is POSIX-only")
