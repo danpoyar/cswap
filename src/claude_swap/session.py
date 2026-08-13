@@ -56,7 +56,12 @@ from claude_swap.models import Platform
 from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, list_sessions
+from claude_swap.process_detection import (
+    ClaudeSession,
+    is_pid_alive,
+    list_sessions,
+    pids_with_config_dir,
+)
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -64,11 +69,13 @@ if TYPE_CHECKING:
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
-# sessions/, ide/, .claude.json, .credentials.json, statsig/ and other
-# telemetry. projects/ and history.jsonl are per-account by default and move
-# to HISTORY_ITEMS sharing only with the opt-in --share-history flag.
+# ide/, .claude.json, .credentials.json, statsig/ and other telemetry.
+# projects/ and history.jsonl are per-account by default and move to
+# HISTORY_ITEMS sharing only with the opt-in --share-history flag.
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
+# sessions/ (the machine's session roster) is not an item either: it is
+# shared unconditionally on POSIX via _sync_session_registry (CON-340).
 SHARED_ITEMS = (
     "settings.json",
     "keybindings.json",
@@ -84,6 +91,16 @@ HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
 )
+
+# Claude's session registry: one <pid>.json (+ <pid>.<token>.key) per running
+# session — what `claude agents --json` and ListAgents/SendMessage discovery
+# read ("each session registers itself in files on disk … two sessions can
+# reach each other only when they can see the same files" — Claude Code docs,
+# cross-session messaging). The machine has ONE roster, so every profile
+# shares it (CON-340); an isolated profile can neither see the fleet nor be
+# seen by it. Deliberately NOT a SHARED_ITEMS/manifest entry: --no-share
+# governs customizations, not addressing.
+REGISTRY_DIR = "sessions"
 
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
@@ -281,10 +298,26 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
 
 
 def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:
-    """Live Claude instances running against a session profile."""
+    """Live Claude instances running against a session profile.
+
+    With the registry shared (CON-340) the profile's ``sessions/`` lists
+    every session on the machine, so profile membership comes from the one
+    thing that defines "runs against this profile": the process's own
+    ``CLAUDE_CONFIG_DIR``. When that probe is unavailable, fall back to the
+    whole roster — every caller treats the result as a "safe to modify the
+    profile?" gate, so over-reporting defers destructive work instead of
+    doing it under a live session. An unshared profile (Windows, or a
+    launch before sharing succeeded) keeps the original registry-only view.
+    """
     if not session_dir.exists():
         return []
-    return list_sessions(claude_dir=session_dir)
+    sessions = list_sessions(claude_dir=session_dir)
+    if not sessions or not (session_dir / REGISTRY_DIR).is_symlink():
+        return sessions
+    owned = pids_with_config_dir((s.pid for s in sessions), session_dir)
+    if owned is None:
+        return sessions
+    return [s for s in sessions if s.pid in owned]
 
 
 def _mkdir_private(path: Path) -> None:
@@ -644,6 +677,7 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
+        self._sync_session_registry(session_dir)
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).
@@ -734,6 +768,83 @@ class SessionManager:
         # write the manifest atomically so a concurrent reader never sees a
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
+
+    def _sync_session_registry(self, session_dir: Path) -> None:
+        """Share claude's session registry (``sessions/``) with ``~/.claude``.
+
+        ``CLAUDE_CONFIG_DIR`` relocates the registry together with the
+        credentials ("all settings, session history, and plugins are stored
+        under this path" — Claude Code docs, env-vars), and no separate
+        mechanism exists to split them (verified against the full documented
+        variable list, claude 2.1.231). So a profile with a private registry
+        is invisible to `claude agents` / ListAgents everywhere else and
+        blind to the rest of the machine (CON-340). Symlinking the directory
+        restores the single machine-wide roster while credentials and
+        history stay profile-scoped.
+
+        Runs on create and on every re-launch (same idempotent shape as the
+        other shared entries), unconditionally on POSIX: --no-share governs
+        customizations, while an unshared registry silently breaks fleet
+        addressing. Windows keeps its private registry — a re-synced copy
+        would fork the roster, not share it. Fail-open: any error leaves
+        the profile isolated for this launch and is retried on the next.
+
+        A profile that accumulated a real ``sessions/`` before this feature
+        is migrated first. That is safe under a live session: once the
+        symlink is in place the old path resolves to the same moved file,
+        and claude keeps writing/removing its registration through it.
+        """
+        if self.switcher.platform == Platform.WINDOWS:
+            return
+        src = Path.home() / ".claude" / REGISTRY_DIR
+        dest = session_dir / REGISTRY_DIR
+        try:
+            if dest.is_symlink():
+                # Repoint only if it aims elsewhere (e.g. profile moved
+                # between homes); a hand-made link to the right target is
+                # left exactly as it is.
+                if dest.readlink() != src:
+                    dest.unlink()
+                    dest.symlink_to(src)
+                return
+            _mkdir_private(src)
+            if dest.is_dir():
+                self._migrate_registry(dest, src)
+            elif dest.exists():
+                self._logger.warning(
+                    f"Not sharing {REGISTRY_DIR}: {dest} is not a directory."
+                )
+                return
+            dest.symlink_to(src)
+        except OSError as e:
+            self._logger.warning(
+                f"Could not share the session registry into {session_dir}: {e}"
+            )
+
+    @staticmethod
+    def _migrate_registry(dest: Path, src: Path) -> None:
+        """Move a profile's private registry entries into the shared one.
+
+        Live registrations must survive the migration (they are the roster
+        entries the sharing exists for); a dead PID's files are dropped the
+        same way claude's own crash cleanup drops them. A same-named entry
+        already in the shared registry can only be a stale leftover — two
+        live processes never share a PID — so a live entry overwrites it.
+        Anything unrecognized is preserved without overwriting; if that
+        leaves the directory non-empty, the final rmdir raises and the
+        caller keeps the profile's registry private for this launch.
+        """
+        for entry in sorted(dest.iterdir()):
+            head = entry.name.split(".", 1)[0]
+            if head.isdigit():
+                if is_pid_alive(int(head)):
+                    os.replace(entry, src / entry.name)
+                else:
+                    entry.unlink()
+                continue
+            if not (src / entry.name).exists():
+                os.replace(entry, src / entry.name)
+        dest.rmdir()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:
         """Mirror the default profile's user-scope ``mcpServers`` (issue #139).
