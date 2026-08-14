@@ -3815,3 +3815,91 @@ class TestDrainV2:
         assert spec.lo == 0.0
         assert spec.hi == 3600.0
         assert AutoSwitchSettings().drain2_wait_seconds == 0.0
+
+    # -- review r1: an abandoned signaled episode must still resume the park
+
+    def test_foreign_switch_closes_the_episode_with_a_resume(self, temp_home):
+        # Review r1 finding 2 (scenario A): the interactive sessions the wave
+        # never signals can burn the account to its hard limit while the park
+        # is frozen; the at-limit escape then swaps through the v1 path with
+        # no drain2 label. The engine KNOWS the episode is dead (a switch
+        # landed past it) — the frozen sessions must be woken by machine,
+        # not by the STOP text's self-rescue prose.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=400.0)  # transcript-quiet: v1 gate opens
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert "drain2" not in switch.to_json()
+        # Next tick: the engine reconciles the orphaned episode — resume
+        # wave to the frozen sessions, episode closed.
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(100), "2": _usage(40)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        assert park.waves[-1] == (resume.targets, DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_stale_signaled_episode_resumes_before_it_rots(self, temp_home):
+        # Review r1 finding 2 (scenario B): the forcing condition went away
+        # (weekly reset dropped utilization below the threshold) and the gate
+        # stopped observing the episode. The stale episode must be closed
+        # with a machine resume, not abandoned to the self-rescue prose.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(DRAIN_STALE_GAP_S + 30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        below = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_dead_episode_never_resurrects_into_a_new_swap(self, temp_home):
+        # Review r1 finding 3: a rotten signaled record must not be adopted
+        # by a later episode's mark-swapped (fake verify/resume for sessions
+        # long gone). The reconcile closes it first — and with its sessions
+        # absent from the roster there is nobody to wake.
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "signaled",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 5000.0,
+                "updatedAt": h.clock.now - DRAIN_STALE_GAP_S - 1.0,
+                "signaled": {"long-gone": {"sessionId": "sid-old"}},
+                "frozen": ["long-gone"],
+            },
+        }))
+        park.roster_value = []  # nobody mid-turn, old sessions exited
+        _write_transcript(h, age_s=1.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == [] and resume.skipped != ""
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 0,
+            "fixed": 0,
+            "forced": 0,
+        }
+        # No wave ever targeted the dead episode's session.
+        assert all("long-gone" not in names for names, _ in park.waves)
+        assert not [e for e in h.events if isinstance(e, Drain2VerifyEvent) and e.number != "3"]
+        assert "drain2" not in h.state()

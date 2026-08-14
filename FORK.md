@@ -77,8 +77,16 @@ read in one sitting.
   keep the passive drain — calls are already failing there, minutes of
   orderly pause is time the park doesn't have. `0` (the default) keeps v2
   off and v1 behavior bit-for-bit. Fleet enablement:
-  `cswap config set autoswitch.drain2WaitSeconds 180`. Claude-Code-specific
-  by construction (roster + messaging surfaces); not upstream material.
+  `cswap config set autoswitch.drain2WaitSeconds 180`. Delivery
+  precondition (cross-session-messaging inbound rules): the herald and the
+  receiving sessions must sit in the same permission class — this machine
+  pins `permissions.defaultMode: bypassPermissions` in ~/.claude/settings.json,
+  so the plain `claude -p` herald inherits bypass and bypass→bypass
+  delivers; in a mixed-class fleet the waves are held unread and every
+  episode ends in `timeout` with all-`forced` counts. Before enabling,
+  prove the channel with one live wave (herald → a busy bypass background
+  session: message delivered, not held). Claude-Code-specific by
+  construction (roster + messaging surfaces); not upstream material.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a

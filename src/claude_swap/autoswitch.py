@@ -504,29 +504,45 @@ class Drain2VerifyEvent(AutoSwitchEvent):
 
 @dataclass(frozen=True)
 class Drain2ResumeEvent(AutoSwitchEvent):
-    """The resume wave after a swap (or the reason it was skipped)."""
+    """The resume wave after a swap (or the reason none went out)."""
 
     kind: ClassVar[str] = "drain2-resume"
     targets: list[str] = field(default_factory=list)
     delivered: list[str] | None = None
-    skipped: str = ""  # non-empty = no wave went out, and why
+    skipped: str = ""  # non-empty with no targets = no wave went out, and why
+    # Why this resume happened outside the happy path (e.g. the episode was
+    # abandoned by a switch of another trigger). Additive.
+    reason: str = ""
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "targets": self.targets,
             "delivered": self.delivered,
             "skipped": self.skipped,
         }
+        if self.reason:
+            fields["reason"] = self.reason
+        return fields
 
     def human(self) -> str:
+        tail = f" [{self.reason}]" if self.reason else ""
+        if self.skipped and self.targets:
+            # The wave was attempted and failed — not the same as skipped.
+            return (
+                f"drain2: resume wave to {len(self.targets)} session(s) "
+                f"failed ({self.skipped}){tail}"
+            )
         if self.skipped:
-            return f"drain2: resume wave skipped ({self.skipped})"
+            return f"drain2: resume wave skipped ({self.skipped}){tail}"
         confirmed = (
             f"{len(self.delivered)} confirmed"
             if self.delivered is not None
             else "delivery unconfirmed"
         )
-        return f"drain2: resume signal to {len(self.targets)} session(s) ({confirmed})"
+        return (
+            f"drain2: resume signal to {len(self.targets)} session(s) "
+            f"({confirmed}){tail}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1107,8 +1123,12 @@ class AutoSwitchEngine:
         # A drain-v2 episode swapped but hasn't resumed its frozen sessions
         # yet (daemon restart, cron handover, or a pending verify retry):
         # finish it before anything else — a NO_ACTION tick must not leave
-        # the park frozen.
+        # the park frozen. Then reconcile a signaled episode the gate can no
+        # longer own (a switch of another trigger landed past it, or the
+        # forcing condition went away): same law, the park must never stay
+        # frozen on an episode the engine knows is dead.
         self._drain2_finish()
+        self._drain2_reconcile()
 
         current = self.switcher.current_account_number()
         if current is None:
@@ -2213,7 +2233,9 @@ class AutoSwitchEngine:
                 Drain2SignalEvent(
                     trigger=trigger,
                     targets=fresh,
-                    delivered=wave.delivered if wave.ok else [],
+                    # None = unconfirmed (the wave failed or its report was
+                    # unparseable) — never a confirmed zero.
+                    delivered=wave.delivered if wave.ok else None,
                     skipped_interactive=skipped_interactive,
                     top_up=True,
                     dry_run=self.dry_run,
@@ -2292,11 +2314,24 @@ class AutoSwitchEngine:
 
     def _drain2_mark_swapped(self, number: str) -> None:
         """A switch just landed inside a drain-v2 episode: record the phase
-        flip so the resume wave survives a crash between swap and resume."""
+        flip so the resume wave survives a crash between swap and resume.
+
+        Only a live episode flips: a rotten signaled record (another
+        episode's leftovers a concurrent ``--once`` may have raced past the
+        tick-top reconcile) must not be adopted — its verify/resume would
+        narrate sessions long gone. It is dropped instead.
+        """
         record = self._read_drain2()
         if record is None or record.get("phase") != "signaled":
             return
         now = self.clock()
+        updated = record.get("updatedAt")
+        if (
+            not isinstance(updated, (int, float))
+            or now - updated > DRAIN_STALE_GAP_S
+        ):
+            self._write_drain2(None)
+            return
         self._write_drain2({
             **record,
             "phase": "swapped",
@@ -2305,6 +2340,102 @@ class AutoSwitchEngine:
             "to": str(number),
             "verifyAttempts": 0,
         })
+
+    def _drain2_reconcile(self) -> None:
+        """Close a signaled episode the gate can no longer own.
+
+        Two machine-detectable ways an episode dies without its own swap:
+        a switch of another trigger lands past it (an unsignaled interactive
+        session rides the account into the at-limit escape), or the forcing
+        condition goes away (a window reset drops utilization below the
+        threshold) and the gate stops observing, so the record goes stale.
+        In both, sessions frozen by the STOP wave would otherwise hang on
+        the wave text's self-rescue prose alone — this is the machine
+        guarantee behind that promise: the engine knows the episode is dead
+        and wakes them itself. Runs each tick top, after ``_drain2_finish``.
+        """
+        record = self._read_drain2()
+        if record is None or record.get("phase") != "signaled":
+            return
+        now = self.clock()
+        state = self._read_state() if not self.dry_run else {}
+        last_switch = state.get("lastSwitchAt")
+        started = record.get("startedAt")
+        updated = record.get("updatedAt")
+        switched_past = (
+            isinstance(last_switch, (int, float))
+            and isinstance(started, (int, float))
+            and last_switch > started
+        )
+        stale = (
+            not isinstance(updated, (int, float))
+            or now - updated > DRAIN_STALE_GAP_S
+        )
+        if not switched_past and not stale:
+            return
+        reason = (
+            "abandoned: a switch landed past the episode"
+            if switched_past
+            else "abandoned: episode went stale (forcing condition gone)"
+        )
+        self._drain2_resume_wave(record, reason=reason, prefer_roster=True)
+        self._write_drain2(None)
+
+    def _drain2_resume_wave(
+        self, record: dict, *, reason: str = "", prefer_roster: bool = False
+    ) -> None:
+        """Send the resume wave for an episode and emit the event.
+
+        Targets are the episode's recorded ``frozen`` list; with
+        ``prefer_roster`` (the reconcile path, where the record can predate
+        the freeze) the live roster re-derives who is actually parked
+        mid-task right now — and when the roster can't answer, every
+        signaled session is woken rather than none (a message to a busy
+        session just queues; a frozen one left behind stays frozen).
+        """
+        frozen = [n for n in (record.get("frozen") or []) if isinstance(n, str)]
+        targets = frozen
+        if prefer_roster:
+            signaled = sorted(
+                n for n in (record.get("signaled") or {}) if isinstance(n, str)
+            )
+            roster = self._park_roster()
+            if roster is not None:
+                by_name = {s.name: s for s in roster}
+                targets = sorted(
+                    n
+                    for n in signaled
+                    if (row := by_name.get(n)) is not None
+                    and row.status == "idle"
+                    and row.state == "working"
+                )
+            elif not targets:
+                targets = signaled
+        if self.dry_run:
+            self._emit(
+                Drain2ResumeEvent(
+                    targets=targets, delivered=[], skipped="dry-run",
+                    reason=reason,
+                )
+            )
+            return
+        if not targets:
+            self._emit(
+                Drain2ResumeEvent(
+                    targets=[], delivered=[], skipped="no frozen sessions",
+                    reason=reason,
+                )
+            )
+            return
+        wave = self._drain2_wave(targets, DRAIN2_RESUME_MESSAGE)
+        self._emit(
+            Drain2ResumeEvent(
+                targets=targets,
+                delivered=wave.delivered if wave.ok else None,
+                skipped="" if wave.ok else f"resume wave failed: {wave.detail}",
+                reason=reason,
+            )
+        )
 
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
@@ -2341,7 +2472,7 @@ class AutoSwitchEngine:
             return
         number = str(record.get("to") or "")
         attempt = int(record.get("verifyAttempts") or 0) + 1
-        ok, detail = self._drain2_verify(number)
+        ok, detail = self._drain2_verify(number, swapped_at)
         self._emit(
             Drain2VerifyEvent(number=number, ok=ok, attempt=attempt, detail=detail)
         )
@@ -2352,31 +2483,23 @@ class AutoSwitchEngine:
                 "updatedAt": now,
             })
             return
-        frozen = [n for n in (record.get("frozen") or []) if isinstance(n, str)]
-        if self.dry_run:
-            self._emit(
-                Drain2ResumeEvent(targets=frozen, delivered=[], skipped="dry-run")
-            )
-        elif not frozen:
-            self._emit(
-                Drain2ResumeEvent(
-                    targets=[], delivered=[], skipped="no frozen sessions"
-                )
-            )
-        else:
-            wave = self._drain2_wave(frozen, DRAIN2_RESUME_MESSAGE)
-            self._emit(
-                Drain2ResumeEvent(
-                    targets=frozen,
-                    delivered=wave.delivered if wave.ok else None,
-                    skipped="" if wave.ok else f"resume wave failed: {wave.detail}",
-                )
-            )
+        self._drain2_resume_wave(record)
         self._write_drain2(None)
 
-    def _drain2_verify(self, number: str) -> tuple[bool, str]:
-        """The post-swap "new account answers" check: its usage is readable
-        through a live fetch. Never raises."""
+    def _drain2_verify(
+        self, number: str, swapped_at: float | None = None
+    ) -> tuple[bool, str]:
+        """The post-swap "new account answers" check. Never raises.
+
+        "Answers" = the account's usage is provably readable. The collector
+        serves within its TTL, so right after the swap this can be the very
+        snapshot the target was chosen on (seconds old, fetched pre-swap) —
+        that snapshot already proved the account alive, the token itself was
+        refreshed by the pre-swap freshen, and ``switch_to`` confirmed the
+        activation, so it counts; the detail says so honestly rather than
+        claiming a live round-trip. The first post-swap poll is the network
+        confirmation.
+        """
         if not number:
             return False, "no target recorded"
         try:
@@ -2385,9 +2508,18 @@ class AutoSwitchEngine:
             return False, f"usage fetch failed: {type(e).__name__}: {e}"
         entry = entries.get(number)
         value = entry.decision_value() if entry is not None else None
-        if isinstance(value, dict):
-            return True, ""
-        return False, "usage not readable"
+        if not isinstance(value, dict):
+            return False, "usage not readable"
+        fetched_at = entry.fetched_at if entry is not None else None
+        if (
+            isinstance(swapped_at, (int, float))
+            and isinstance(fetched_at, (int, float))
+            and fetched_at < swapped_at
+        ):
+            return True, (
+                "usage readable (pre-swap snapshot; next poll confirms live)"
+            )
+        return True, ""
 
     def _session_quiet(self) -> tuple[bool, str]:
         """Whether session traffic has been silent for ``QUIET_WINDOW_S``.
