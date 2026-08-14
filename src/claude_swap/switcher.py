@@ -1989,16 +1989,33 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, data)
 
     def _restore_live_after_add(
-        self, prior_num: str, prior_email: str, added_email: str, added_org_uuid: str
+        self,
+        prior_num: str,
+        prior_email: str,
+        added_num: str,
+        added_email: str,
+        added_org_uuid: str,
     ) -> str:
         """Put the recorded active account's stored login back as the live one.
 
         ``add_account`` runs right after a fresh ``claude /login`` replaced the
-        live login; by the time this runs the just-added account's credential
-        is already snapshotted in its slot, so the live copy may be overwritten
-        without a stash. Deliberately never touches ``activeAccountNumber``:
-        add must not move the active account (CON-438) — a real swap goes
-        through the auto-switch drain path or an explicit ``--activate``.
+        live login. Deliberately never touches ``activeAccountNumber``: add
+        must not move the active account (CON-438) — a real swap goes through
+        the auto-switch drain path or an explicit ``--activate``.
+
+        Everything mutable is read AND written under the same lock set
+        ``_perform_switch`` holds, because both credential stores have live
+        concurrent writers that commit under these locks: the prior slot's
+        backup gains a rotated generation from the poller's persist
+        (``persist_backup_credentials``), and the live credential rotates
+        under Claude Code's own refresh. A pre-lock read of either could send
+        a consumed token generation live (its next refresh is an
+        invalid_grant → Claude Code wipes the login) or destroy a fresh
+        rotation. For the same reason the displaced live login is
+        re-snapshotted into the added slot here, under the locks — the copy
+        taken earlier in add ran outside ``claude_credentials_lock`` and may
+        already be a rotated-out generation; with that authoritative backup
+        in place the live copy may be overwritten without a stash.
 
         Returns ``"restored"`` when the active account owns the live login
         again, ``"unreadable"`` when the active slot's backup cannot be
@@ -2007,29 +2024,27 @@ class ClaudeAccountSwitcher:
         just-added account (a concurrent switch owns the live state — nothing
         here is ours to move).
         """
-        try:
-            prior_creds = self._read_account_credentials(prior_num, prior_email)
-            prior_config = self._read_account_config(prior_num, prior_email)
-        except Exception as e:
-            self._logger.warning(
-                f"Could not read account {prior_num} backup for restore: {e}"
-            )
-            return "unreadable"
-        if not prior_creds or not prior_config:
-            return "unreadable"
-        try:
-            prior_config_data = json.loads(prior_config)
-        except json.JSONDecodeError:
-            return "unreadable"
-        prior_oauth = prior_config_data.get("oauthAccount")
-        if not prior_oauth:
-            return "unreadable"
-
-        # Same lock set as ``_perform_switch``: Claude Code's token refresh
-        # and config writes must not interleave with ours.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             if not self._live_identity_matches(added_email, added_org_uuid):
                 return "drift"
+            try:
+                prior_creds = self._read_account_credentials(prior_num, prior_email)
+                prior_config = self._read_account_config(prior_num, prior_email)
+            except Exception as e:
+                self._logger.warning(
+                    f"Could not read account {prior_num} backup for restore: {e}"
+                )
+                return "unreadable"
+            if not prior_creds or not prior_config:
+                return "unreadable"
+            try:
+                prior_config_data = json.loads(prior_config)
+            except json.JSONDecodeError:
+                return "unreadable"
+            prior_oauth = prior_config_data.get("oauthAccount")
+            if not prior_oauth:
+                return "unreadable"
+
             rollback_creds = self._read_credentials()
             if rollback_creds is None:
                 raise CredentialReadError(
@@ -2044,6 +2059,18 @@ class ClaudeAccountSwitcher:
                     raise ConfigError(
                         f"Cannot snapshot live config before restoring the active account: {e}"
                     )
+
+            # Authoritative re-snapshot of the displaced login into its slot:
+            # these live bytes are the current generation by definition and
+            # must be what survives in the slot backup.
+            if rollback_creds:
+                self._write_account_credentials(
+                    added_num, added_email, rollback_creds
+                )
+            if rollback_config_text is not None:
+                self._write_account_config(
+                    added_num, added_email, rollback_config_text
+                )
 
             creds_written = False
             config_written = False
@@ -2120,7 +2147,8 @@ class ClaudeAccountSwitcher:
         ):
             prior_email = prior_rec.get("email", "")
             outcome = self._restore_live_after_add(
-                prior_num, prior_email, current_email, current_org_uuid
+                prior_num, prior_email, account_num, current_email,
+                current_org_uuid,
             )
             if outcome == "restored":
                 self._logger.info(
@@ -2147,21 +2175,42 @@ class ClaudeAccountSwitcher:
                     "leaving it as is."
                 ))
                 return
+            fell_back_from = prior_num
+        else:
+            fell_back_from = None
+
+        # Recording the fresh login as active claims it owns the live login —
+        # re-verify that under the account lock (a concurrent switch may have
+        # moved the live state since; the unreadable-backup fallback in
+        # particular arrives here after time spent inside the restore path).
+        with FileLock(self.lock_file):
+            if not self._live_identity_matches(current_email, current_org_uuid):
+                self._logger.info(
+                    f"Registered account {account_num}; live login changed "
+                    "mid-add (concurrent switch) — active pointer left "
+                    "untouched"
+                )
+                print(dimmed(
+                    "Live login changed while adding (another switch ran) — "
+                    "leaving it as is."
+                ))
+                return
+            data = self._get_sequence_data()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+        if fell_back_from is not None:
             warning(
-                f"Active account {prior_num} has no readable backup to restore "
-                f"— Account {account_num} stays the live login and becomes "
-                "the recorded active account."
+                f"Active account {fell_back_from} has no readable backup to "
+                f"restore — Account {account_num} stays the live login and "
+                "becomes the recorded active account."
             )
             self._logger.warning(
-                f"Restore of active account {prior_num} failed (backup "
+                f"Restore of active account {fell_back_from} failed (backup "
                 f"unreadable); activated freshly added account {account_num} "
                 "instead"
             )
-
-        data = self._get_sequence_data()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
         if activate:
             self._logger.info(
                 f"Activated account {account_num} via --activate (manual "
@@ -4254,8 +4303,13 @@ class ClaudeAccountSwitcher:
                 )
             print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
+            # Resolve the slot by the unmanaged login's identity: add no
+            # longer records the fresh account as active (CON-438), so
+            # activeAccountNumber may still name the prior active slot here.
             data = self._get_sequence_data()
-            account_num = data.get("activeAccountNumber")
+            account_num = self._find_account_slot(
+                data, current_email, current_org_uuid
+            )
             print(f"It has been automatically added as Account-{account_num}.")
             print(dimmed("Please run the switch command again to switch to the next account."))
             return None

@@ -194,3 +194,98 @@ class TestAddRestoreFallback:
         assert switcher._get_current_account() == (FRESH_EMAIL, "")
         out = capsys.readouterr().out
         assert "Added" in out
+
+
+class TestAddConcurrencyGuards:
+    """The restore and the active-pointer write both re-verify the live state
+    under the locks: concurrent daemon switches and Claude Code's own token
+    rotation must not be clobbered by stale pre-lock reads."""
+
+    def test_drift_leaves_live_and_pointer_untouched(
+        self, temp_home, switcher_with_active, capsys
+    ):
+        """A concurrent switch mid-add owns the live state — add must not
+        restore over it, and must not move the active pointer."""
+        switcher = switcher_with_active
+        _seed_live_login(temp_home, switcher, FRESH_EMAIL, "fresh-token")
+
+        with patch.object(switcher, "_live_identity_matches", return_value=False):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert "2" in data["accounts"]  # registration still happened
+        assert data["activeAccountNumber"] == 1  # pointer untouched
+        # The live login was not overwritten by a restore.
+        assert _live_access_token(switcher) == "fresh-token"
+        assert "leaving it as is" in capsys.readouterr().out
+
+    def test_restore_resnapshots_rotated_live_into_added_slot(
+        self, temp_home, switcher_with_active
+    ):
+        """The live credential may rotate between add's pre-lock snapshot and
+        the restore; the slot backup must carry the current generation, or the
+        rotation is destroyed and the slot dies on its next switch."""
+        switcher = switcher_with_active
+        _seed_live_login(temp_home, switcher, FRESH_EMAIL, "fresh-token")
+
+        real_matches = switcher._live_identity_matches
+
+        def rotate_then_match(email, org_uuid):
+            # Simulates Claude Code's refresh committing a rotated credential
+            # just before the restore takes its under-lock snapshot.
+            switcher._write_credentials(json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "fresh-token-rotated",
+                    "refreshToken": "r-fresh-token-rotated",
+                }
+            }))
+            return real_matches(email, org_uuid)
+
+        with patch.object(
+            switcher, "_live_identity_matches", side_effect=rotate_then_match
+        ):
+            switcher.add_account()
+
+        # The rotated generation survived in the slot backup…
+        stored = switcher._read_account_credentials("2", FRESH_EMAIL)
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "fresh-token-rotated"
+        # …and the restore itself still landed on the active account.
+        assert _live_access_token(switcher) == "prior-token"
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_activation_fallback_skips_pointer_on_drift(
+        self, temp_home, switcher_with_active, capsys
+    ):
+        """Unreadable backup normally activates the fresh login — but not when
+        a concurrent switch moved the live state in the meantime."""
+        switcher = switcher_with_active
+        _seed_live_login(temp_home, switcher, FRESH_EMAIL, "fresh-token")
+
+        with patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_live_identity_matches", side_effect=[True, False]
+             ):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1  # not hijacked
+        assert "leaving it as is" in capsys.readouterr().out
+
+
+class TestSwitchAutoAddMessage:
+    """switch()'s auto-add of an unmanaged live login must name the slot the
+    login actually landed in — the active pointer no longer follows an add."""
+
+    def test_switch_auto_add_names_the_added_slot(
+        self, temp_home, switcher_with_active, capsys
+    ):
+        switcher = switcher_with_active
+        _seed_live_login(temp_home, switcher, FRESH_EMAIL, "fresh-token")
+
+        switcher.switch()
+
+        out = capsys.readouterr().out
+        assert "automatically added as Account-2" in out
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == FRESH_EMAIL
+        assert data["activeAccountNumber"] == 1
