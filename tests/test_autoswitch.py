@@ -13,6 +13,9 @@ import pytest
 
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
+    DRAIN2_RESUME_MESSAGE,
+    DRAIN2_SELF_RESCUE_S,
+    DRAIN2_STOP_MESSAGE,
     DRAIN_STALE_GAP_S,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -20,6 +23,11 @@ from claude_swap.autoswitch import (
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
+    Drain2ResumeEvent,
+    Drain2SignalEvent,
+    Drain2TimeoutEvent,
+    Drain2UnavailableEvent,
+    Drain2VerifyEvent,
     DrainTimeoutEvent,
     ErrorEvent,
     NoSwitchEvent,
@@ -31,6 +39,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.park import ParkSession, WaveResult
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import (
@@ -3379,3 +3388,518 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+def _park_row(
+    name: str,
+    status: str = "busy",
+    state: str | None = "working",
+    kind: str = "background",
+    pid: int = 100,
+) -> ParkSession:
+    return ParkSession(
+        name=name,
+        session_id=f"sid-{name}",
+        kind=kind,
+        status=status,
+        state=state,
+        pid=pid,
+    )
+
+
+class FakePark:
+    """Scripted stand-in for park.ParkChannel: canned roster, recorded waves.
+
+    ``roster_value`` is returned as-is (None = channel failure); tests mutate
+    it between ticks. ``wave_results`` is a FIFO of scripted outcomes; when
+    empty, a wave succeeds with every target confirmed.
+    """
+
+    def __init__(self, roster: list[ParkSession] | None = None):
+        self.roster_value = roster
+        self.waves: list[tuple[list[str], str]] = []
+        self.wave_results: list[WaveResult] = []
+        self.roster_calls = 0
+
+    def roster(self) -> list[ParkSession] | None:
+        self.roster_calls += 1
+        return self.roster_value
+
+    def send_wave(self, targets: list[str], message: str) -> WaveResult:
+        self.waves.append((list(targets), message))
+        if self.wave_results:
+            return self.wave_results.pop(0)
+        return WaveResult(ok=True, delivered=list(targets))
+
+
+class TestDrainV2:
+    """Drain v2 (CON-433): the engine CREATES the park pause instead of
+    waiting for one — checkpoint signal to every mid-turn session, machine
+    confirmation of fixation from the roster (status != busy), swap, verify
+    the new account answers, resume signal. Passive transcript silence (v1)
+    stays the path for at-limit/failover and for every failure of the
+    channel; ``drain2WaitSeconds=0`` (default) keeps v1 behavior bit-for-bit.
+    """
+
+    _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+    _AT_LIMIT = {"1": _usage(100), "2": _usage(40), "3": _usage(20)}
+
+    def _harness(self, temp_home: Path, **kwargs) -> tuple[EngineHarness, FakePark]:
+        kwargs.setdefault("drain2_wait_seconds", 180.0)
+        kwargs.setdefault("drain_timeout_seconds", 600.0)
+        kwargs.setdefault("switch_under_load", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        return h, park
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    # -- scenario (а): the park writes constantly, v2 still reaches a clean swap
+
+    def test_busy_park_signals_and_waits(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [
+            _park_row("fix-a", pid=201),
+            _park_row("fix-b", pid=202),
+            _park_row("Yor", kind="interactive", state=None, pid=203),
+            _park_row("parked-c", status="idle", pid=204),
+        ]
+        _write_transcript(h, age_s=1.0)  # v1 would call this busy and wait
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.trigger == "proactive"
+        assert sorted(signal.targets) == ["fix-a", "fix-b"]
+        assert signal.delivered == signal.targets
+        assert signal.skipped_interactive == 1
+        assert self._reasons(h) == ["drain2-wait"]  # never the passive v1 wait
+        assert len(park.waves) == 1
+        names, message = park.waves[0]
+        assert sorted(names) == ["fix-a", "fix-b"]
+        assert message == DRAIN2_STOP_MESSAGE
+        assert "TaskStop" in message and "ЗАМРИ" in message
+        record = h.state()["drain2"]
+        assert record["phase"] == "signaled"
+        assert sorted(record["signaled"]) == ["fix-a", "fix-b"]
+        assert "lastSwitchAt" not in h.state()
+
+    def test_all_fixed_swaps_ready_and_resumes(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)  # transcripts NEVER go quiet
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 60,
+            "fixed": 2,
+            "forced": 0,
+        }
+        assert not [e for e in h.events if isinstance(e, Drain2TimeoutEvent)]
+        verify = next(e for e in h.events if isinstance(e, Drain2VerifyEvent))
+        assert verify.ok is True and verify.number == "3"
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        assert resume.skipped == ""
+        assert park.waves[-1] == (resume.targets, DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()  # episode closed
+        # The resume wave follows the switch in the event stream.
+        kinds = h.kinds()
+        assert kinds.index("switch") < kinds.index("drain2-resume")
+
+    # -- scenario (б): partial fixation at the cap — honest waited/torn count
+
+    def test_partial_fixation_forces_with_honest_count(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(200.0)  # past the 180s fixation cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),  # still mid-turn
+        ]
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        warn = next(e for e in h.events if isinstance(e, Drain2TimeoutEvent))
+        assert warn.human().startswith("WARN")
+        assert warn.fixed == ["fix-a"]
+        assert warn.forced == ["fix-b"]
+        assert warn.waited_seconds == 200
+        assert warn.max_wait_seconds == 180
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "timeout",
+            "waitedSeconds": 200,
+            "fixed": 1,
+            "forced": 1,
+        }
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]  # only the frozen one is woken
+        kinds = h.kinds()
+        assert kinds.index("drain2-timeout") < kinds.index("switch")
+
+    # -- scenario (в): channel failure falls back to passive v1 drain
+
+    def test_unreadable_roster_falls_back_to_v1(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = None  # `claude agents --json` failed
+        _write_transcript(h, age_s=1.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        unavailable = next(
+            e for e in h.events if isinstance(e, Drain2UnavailableEvent)
+        )
+        assert "roster" in unavailable.reason
+        assert self._reasons(h) == ["drain-wait"]  # the passive v1 wait took over
+        assert "drain" in h.state() and "drain2" not in h.state()
+        assert park.waves == []
+
+    def test_failed_stop_wave_falls_back_to_v1_with_backoff(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        park.wave_results = [WaveResult(ok=False, detail="claude CLI not found")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, Drain2UnavailableEvent)]
+        assert self._reasons(h) == ["drain-wait"]
+        # The failure backs the channel off in-process: the next tick goes
+        # straight to v1 without a second herald attempt or a second WARN.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert len(park.waves) == 1
+        assert (
+            len([e for e in h.events if isinstance(e, Drain2UnavailableEvent)]) == 1
+        )
+        assert self._reasons(h) == ["drain-wait", "drain-wait"]
+
+    def test_default_off_keeps_v1_bit_for_bit(self, temp_home):
+        h, park = self._harness(temp_home, drain2_wait_seconds=0.0)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert AutoSwitchSettings().drain2_wait_seconds == 0.0
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait"]
+        assert park.roster_calls == 0 and park.waves == []
+        assert not [
+            e
+            for e in h.events
+            if isinstance(
+                e,
+                (
+                    Drain2SignalEvent,
+                    Drain2TimeoutEvent,
+                    Drain2ResumeEvent,
+                    Drain2UnavailableEvent,
+                ),
+            )
+        ]
+
+    def test_at_limit_keeps_passive_v1_drain(self, temp_home):
+        # The checkpoint pause is for the proactive forewarning only: at the
+        # hard limit calls are already failing, so orchestrating a pause
+        # spends minutes the park doesn't have — passive drain as before.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait"]
+        assert park.waves == [] and park.roster_calls == 0
+
+    # -- mid-episode arrivals, restarts, verify failure, dry-run
+
+    def test_top_up_wave_for_session_appearing_mid_episode(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-c"),  # woke/spawned mid-episode
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        top_up = next(
+            e
+            for e in h.events
+            if isinstance(e, Drain2SignalEvent) and e.top_up
+        )
+        assert top_up.targets == ["fix-c"]
+        assert park.waves[-1] == (["fix-c"], DRAIN2_STOP_MESSAGE)
+        assert sorted(h.state()["drain2"]["signaled"]) == ["fix-a", "fix-c"]
+        h.clock.advance(30.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-c", status="idle"),
+        ]
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"]["fixed"] == 2
+
+    def test_resume_survives_engine_restart(self, temp_home):
+        # Daemon died between the swap and the resume wave: a fresh engine
+        # finds the "swapped" episode in the state file and finishes it.
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 100.0,
+                "updatedAt": h.clock.now - 30.0,
+                "swappedAt": h.clock.now - 30.0,
+                "to": "3",
+                "verifyAttempts": 0,
+                "signaled": {"fix-a": {"sessionId": "sid-fix-a"}},
+                "frozen": ["fix-a"],
+            },
+        }))
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        outcome = h.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION  # normal below-threshold tick
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves == [(["fix-a"], DRAIN2_RESUME_MESSAGE)]
+        assert "drain2" not in h.state()
+
+    def test_stale_swapped_episode_skips_the_resume_wave(self, temp_home):
+        # Past the self-rescue window the frozen sessions already resumed
+        # themselves (the STOP wave says so) — waking them again would only
+        # burn turns.
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - DRAIN2_SELF_RESCUE_S - 200.0,
+                "updatedAt": h.clock.now - DRAIN2_SELF_RESCUE_S - 100.0,
+                "swappedAt": h.clock.now - DRAIN2_SELF_RESCUE_S - 100.0,
+                "to": "3",
+                "signaled": {"fix-a": {"sessionId": "sid-fix-a"}},
+                "frozen": ["fix-a"],
+            },
+        }))
+        outcome = h.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.skipped != "" and resume.targets == []
+        assert park.waves == []
+        assert "drain2" not in h.state()
+
+    def test_verify_failure_never_freezes_the_park(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+
+        def collector(usage):
+            full = {
+                num: _entry_for(value, h.clock.now)
+                for num, value in usage.items()
+            }
+
+            def collect(fetch=frozenset(), scheduled=True):
+                # The verify fetch is the only single-account fetch that can
+                # run with account 3 already active: report it unreadable.
+                if h.active_number() == 3 and set(fetch) == {"3"}:
+                    return {"3": UsageEntry()}
+                return full
+
+            return collect
+
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            side_effect=collector(self._PROACTIVE),
+        ):
+            assert h.engine.tick() is TickOutcome.NO_ACTION  # STOP wave out
+            h.clock.advance(30.0)
+            park.roster_value = [_park_row("fix-a", status="idle")]
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        verify1 = next(e for e in h.events if isinstance(e, Drain2VerifyEvent))
+        assert verify1.ok is False and verify1.attempt == 1
+        assert not [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert h.state()["drain2"]["phase"] == "swapped"
+        # Next tick: the second (final) verify attempt fails too — the park
+        # is resumed anyway, with the failure on the record.
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(50), "2": _usage(10)}
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            side_effect=collector(below),
+        ):
+            h.engine.tick()
+        verifies = [e for e in h.events if isinstance(e, Drain2VerifyEvent)]
+        assert [v.attempt for v in verifies] == [1, 2]
+        assert all(v.ok is False for v in verifies)
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_episode_survives_failed_switch_attempt(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="transient"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.ERROR
+        assert h.state()["drain2"]["phase"] == "signaled"
+        h.clock.advance(30.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"]["outcome"] == "ready"
+        assert switch.to_json()["drain2"]["waitedSeconds"] == 60
+
+    def test_dry_run_sends_no_waves_and_writes_no_state(self, temp_home):
+        h, park = self._harness(temp_home)
+        h.engine = h._make_engine(dry_run=True, park=park)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.dry_run is True
+        assert park.waves == []
+        assert h.state() == {}
+        h.clock.advance(30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.dry_run is True
+        assert switch.to_json()["drain2"]["outcome"] == "ready"
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.skipped == "dry-run"
+        assert park.waves == []
+        assert h.state() == {}
+        assert h.active_number() == 1
+
+    def test_drain2_setting_spec(self):
+        spec = SETTING_SPECS["autoswitch.drain2WaitSeconds"]
+        assert spec.field == "drain2_wait_seconds"
+        assert spec.kind == "float"
+        assert spec.lo == 0.0
+        assert spec.hi == 3600.0
+        assert AutoSwitchSettings().drain2_wait_seconds == 0.0
+
+    # -- review r1: an abandoned signaled episode must still resume the park
+
+    def test_foreign_switch_closes_the_episode_with_a_resume(self, temp_home):
+        # Review r1 finding 2 (scenario A): the interactive sessions the wave
+        # never signals can burn the account to its hard limit while the park
+        # is frozen; the at-limit escape then swaps through the v1 path with
+        # no drain2 label. The engine KNOWS the episode is dead (a switch
+        # landed past it) — the frozen sessions must be woken by machine,
+        # not by the STOP text's self-rescue prose.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=400.0)  # transcript-quiet: v1 gate opens
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert "drain2" not in switch.to_json()
+        # Next tick: the engine reconciles the orphaned episode — resume
+        # wave to the frozen sessions, episode closed.
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(100), "2": _usage(40)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        assert park.waves[-1] == (resume.targets, DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_stale_signaled_episode_resumes_before_it_rots(self, temp_home):
+        # Review r1 finding 2 (scenario B): the forcing condition went away
+        # (weekly reset dropped utilization below the threshold) and the gate
+        # stopped observing the episode. The stale episode must be closed
+        # with a machine resume, not abandoned to the self-rescue prose.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(DRAIN_STALE_GAP_S + 30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        below = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_dead_episode_never_resurrects_into_a_new_swap(self, temp_home):
+        # Review r1 finding 3: a rotten signaled record must not be adopted
+        # by a later episode's mark-swapped (fake verify/resume for sessions
+        # long gone). The reconcile closes it first — and with its sessions
+        # absent from the roster there is nobody to wake.
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "signaled",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 5000.0,
+                "updatedAt": h.clock.now - DRAIN_STALE_GAP_S - 1.0,
+                "signaled": {"long-gone": {"sessionId": "sid-old"}},
+                "frozen": ["long-gone"],
+            },
+        }))
+        park.roster_value = []  # nobody mid-turn, old sessions exited
+        _write_transcript(h, age_s=1.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == [] and resume.skipped != ""
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 0,
+            "fixed": 0,
+            "forced": 0,
+        }
+        # No wave ever targeted the dead episode's session.
+        assert all("long-gone" not in names for names, _ in park.waves)
+        assert not [e for e in h.events if isinstance(e, Drain2VerifyEvent) and e.number != "3"]
+        assert "drain2" not in h.state()

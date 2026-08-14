@@ -64,6 +64,16 @@ class AutoSwitchSettings:
     # with a warning (an account pinned at its limit breaks live agents
     # harder than the cache miss does). 0 = swap immediately (no drain).
     drain_timeout_seconds: float = 0.0
+    # Drain v2 (active checkpoint) for the proactive-under-load switch: the
+    # engine SIGNALS every mid-turn background session to checkpoint and
+    # freeze (via a headless herald session sending SendMessage), waits until
+    # the roster shows each one at a turn boundary — machine confirmation,
+    # not a timer — swaps, verifies the new account answers, then signals
+    # "resume". This many seconds bounds the wait for fixation; sessions
+    # still mid-turn at the cap are swapped under honestly-counted force.
+    # 0 = drain v2 off (forced proactive switches use the passive
+    # drainTimeoutSeconds wait above, exactly as before).
+    drain2_wait_seconds: float = 0.0
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -153,6 +163,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "drainTimeoutSeconds", "drain_timeout_seconds",
             "float", 0.0, 86400.0,
             help="Max seconds a forced switch waits for session silence (0 = don't wait)",
+        ),
+        SettingSpec(
+            "autoswitch", "drain2WaitSeconds", "drain2_wait_seconds",
+            "float", 0.0, 3600.0,
+            help=(
+                "Drain v2: max seconds to wait for signaled sessions to "
+                "checkpoint before a proactive switch (0 = v2 off)"
+            ),
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",

@@ -51,6 +51,42 @@ read in one sitting.
   switchUnderLoad true, drainTimeoutSeconds 600. Upstream may want this too,
   but the transcript-path heuristic is Claude-Code-layout-specific — offer
   upstream after it survives the fleet.
+- Drain v2 — the active checkpoint (CON-433): with
+  `autoswitch.drain2WaitSeconds` set, the forced proactive switch CREATES
+  the park pause instead of waiting for one. The engine signals every
+  mid-turn background session to checkpoint and freeze — the wave is
+  delivered by a one-shot headless `claude -p` *herald* using its
+  SendMessage tool, because a raw daemon write to a session's inbox socket
+  asserts no permission class and bypass-mode receivers hold it unread
+  (cross-session-messaging inbound rules) — then confirms fixation
+  machine-wise from `claude agents --json` (`status` busy→idle = turn
+  boundary; sessions of per-terminal `cswap run` profiles excluded by pid,
+  their credentials don't swap), swaps, verifies the new account answers
+  (usage fetch, ≤2 attempts), and wakes the frozen sessions: a message to
+  an idle session starts its next turn, so each agent pays exactly one cold
+  cache write on the new account. Sessions still mid-turn at the cap are
+  forced and honestly counted in the switch event's additive
+  `drain2: {outcome: "ready"|"timeout", waitedSeconds, fixed, forced}`.
+  Events: `drain2-signal`, `no-switch`/`drain2-wait`, one `drain2-timeout`
+  WARN per episode, `drain2-verify`, `drain2-resume`; any channel failure
+  emits `drain2-unavailable` and falls back to the passive v1 drain above
+  (with a 10-minute in-process backoff). The episode persists in
+  `autoswitch_state.json` (phases signaled→swapped), so the resume wave
+  survives a daemon restart; a frozen session self-rescues after 10 minutes
+  if the resume never arrives (the STOP text says so). At-limit/failover
+  keep the passive drain — calls are already failing there, minutes of
+  orderly pause is time the park doesn't have. `0` (the default) keeps v2
+  off and v1 behavior bit-for-bit. Fleet enablement:
+  `cswap config set autoswitch.drain2WaitSeconds 180`. Delivery
+  precondition (cross-session-messaging inbound rules): the herald and the
+  receiving sessions must sit in the same permission class — this machine
+  pins `permissions.defaultMode: bypassPermissions` in ~/.claude/settings.json,
+  so the plain `claude -p` herald inherits bypass and bypass→bypass
+  delivers; in a mixed-class fleet the waves are held unread and every
+  episode ends in `timeout` with all-`forced` counts. Before enabling,
+  prove the channel with one live wave (herald → a busy bypass background
+  session: message delivered, not held). Claude-Code-specific by
+  construction (roster + messaging surfaces); not upstream material.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a
