@@ -200,7 +200,8 @@ DRAIN2_STOP_MESSAGE = (
     "или кап 12 минут) или сигнал cswap drain-resume — продолжай сам, "
     "второго разрешения не жди. Не смог поставить ожидание — просто заверши "
     "ход: resume придёт, а если тишина дольше 10 минут — продолжай сам.\n"
-    "Отвечать на это сообщение не нужно: герольд одноразовый и уже погас."
+    "Отвечать на это сообщение не нужно: Jerry — одноразовый герольд, он "
+    "уже погас."
 )
 DRAIN2_RESUME_MESSAGE = (
     "cswap drain-resume: аккаунт переключён, пауза кончилась — продолжай "
@@ -2178,6 +2179,10 @@ class AutoSwitchEngine:
     def _park_channel(self) -> ParkChannel:
         if self._park is None:
             self._park = ParkChannel(
+                # Working directory only — the roster name is
+                # park.HERALD_NAME ("Jerry"), set on the herald's argv.
+                # Renaming the dir would orphan the live one under
+                # backup_dir for no visible gain.
                 herald_cwd=self.switcher.backup_dir / "drain2-herald"
             )
         return self._park

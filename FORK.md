@@ -55,7 +55,8 @@ read in one sitting.
   `autoswitch.drain2WaitSeconds` set, the forced proactive switch CREATES
   the park pause instead of waiting for one. The engine signals every
   mid-turn background session to checkpoint and freeze — the wave is
-  delivered by a one-shot headless `claude -p` *herald* using its
+  delivered by a one-shot headless `claude -p` *herald*, listed in the
+  session roster as `Jerry` (explicit `--name`; CON-464), using its
   SendMessage tool, because a raw daemon write to a session's inbox socket
   asserts no permission class and bypass-mode receivers hold it unread
   (cross-session-messaging inbound rules) — then confirms fixation
