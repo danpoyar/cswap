@@ -4379,6 +4379,89 @@ class TestDrainV2:
         drain2 = switch.to_json()["drain2"]
         assert drain2["ackFixed"] == 1 and drain2["softFixed"] == 0
 
+    def test_no_swap_candidate_releases_the_park(self, temp_home):
+        # Live hole 14-08 17:10–17:13Z (found by Yor, CON-461 add-on): the
+        # gate reached its swap decision, but every candidate was exhausted
+        # — and the resume, which only ever followed a swap, went to
+        # NOBODY. The episode stayed open and the park stood parked until a
+        # manual wake. An episode that cannot swap must machine-release the
+        # parked sessions with an honest "no swap is coming" wave and close.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")  # fix-a parks; fix-b keeps working
+        h.clock.advance(200.0)  # past the 180s cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),
+        ]
+        # Every candidate hit 100% during the pause: nobody to switch to.
+        exhausted = {"1": _usage(96), "2": _usage(100), "3": _usage(100)}
+        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        assert h.active_number() == 1  # no switch happened
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]  # the parked one is released
+        assert resume.unacked == ["fix-b"]
+        assert "released without a swap" in resume.reason
+        names, message = park.waves[-1]
+        assert names == ["fix-a"]
+        assert "своп НЕ случился" in message
+        assert "drain2" not in h.state()  # episode closed
+        # And the next ticks do NOT re-signal a fresh pause into the
+        # just-released park while there is still nobody to switch to.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        h.events.clear()
+        waves_before = len(park.waves)
+        h.tick_with_usage(exhausted)
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert len(park.waves) == waves_before
+
+    def test_no_qualifying_candidate_releases_the_park_too(self, temp_home):
+        # Same hole, the exact reason string of the live log: candidates
+        # exist but none qualifies (all above the threshold, none at 100%).
+        # A retryable block still must not keep the park frozen — release
+        # now; if a candidate recovers while the account is still over the
+        # threshold, a fresh episode re-signals after the release backoff.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        reasons = self._reasons(h)
+        assert reasons[-1] == "no-qualifying-candidate"
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1][0] == ["fix-a"]
+        assert "drain2" not in h.state()
+
+    def test_transient_switch_failure_keeps_the_episode(self, temp_home):
+        # The boundary of the release: a transient freshen failure retries
+        # next tick with the episode intact (an orderly pause must not be
+        # thrown away on a network blip) — pinned so the release never
+        # swallows this path.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="transient"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.ERROR
+        assert h.state()["drain2"]["phase"] == "signaled"
+        assert not [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+
     def test_resume_wave_targets_only_the_acked(self, temp_home):
         # Point 3 of CON-461: the resume wave goes to sessions that really
         # parked (receipt on disk, task still open) — not to every signaled

@@ -197,6 +197,15 @@ DRAIN2_RESUME_MESSAGE = (
     "работу с места остановки. Если ты уже продолжил сам — считай это "
     "подтверждением, повторно ничего не делай."
 )
+# The honest wave for an episode released WITHOUT a swap (CON-461, live
+# hole 14-08 17:10–17:13Z): telling a parked agent "аккаунт переключён"
+# when no switch happened would be a lie it might act on.
+DRAIN2_RELEASE_MESSAGE = (
+    "cswap drain-resume: своп НЕ случился (переключаться некуда) — пауза "
+    "отменена, продолжай работу с места остановки на текущем аккаунте. "
+    "Если ты уже продолжил сам — считай это подтверждением, повторно "
+    "ничего не делай."
+)
 
 # How often a sleeping loop re-stats settings.json. Every tick re-reads the
 # file, but a BLOCKED/all-exhausted tick then sleeps up to MAX_SLEEP_S — and a
@@ -899,6 +908,13 @@ class AutoSwitchEngine:
         # Set after a channel failure: until then, drain v2 stands down and
         # forced proactive switches take the passive v1 drain.
         self._park_backoff_until = 0.0
+        # Set after an episode is released without a swap (no candidate to
+        # switch to — CON-461): without it the next tick would re-signal a
+        # fresh pause into the just-released park and thrash STOP/release
+        # every interval for as long as no candidate exists. Like the
+        # channel backoff, in-process only (cron ``--once`` retries are
+        # one-per-minute and harmless).
+        self._drain2_release_until = 0.0
 
     # -- state file ---------------------------------------------------------
 
@@ -1425,6 +1441,7 @@ class AutoSwitchEngine:
             # re-polling at full cadence.
             self._blocked_wait_long = True
             self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._drain2_release(drain2, "no accounts to switch to")
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
@@ -1490,6 +1507,7 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
+                self._drain2_release(drain2, "no candidate has provable headroom")
                 return TickOutcome.BLOCKED
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
@@ -1542,6 +1560,7 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
+                self._drain2_release(drain2, "no qualifying candidate")
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
             earliest = self._earliest_recovery(usage)
@@ -1556,6 +1575,7 @@ class AutoSwitchEngine:
                     )
                 )
             )
+            self._drain2_release(drain2, "every candidate exhausted")
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
@@ -1606,6 +1626,9 @@ class AutoSwitchEngine:
             return self._perform_with_drain2(num, email, trigger, drain, drain2)
 
         if transient_failure:
+            # Deliberately NO release: the episode survives and the next
+            # tick retries the swap — an orderly pause must not be thrown
+            # away on a network blip.
             self._emit(
                 ErrorEvent(
                     message="could not freshen any candidate (network?)",
@@ -1614,6 +1637,7 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
+        self._drain2_release(drain2, "every ranked target failed to freshen")
         return TickOutcome.BLOCKED
 
     def _rank_candidates(
@@ -2104,12 +2128,16 @@ class AutoSwitchEngine:
         couple of minutes of orderly pause. At-limit and failover mean calls
         are already failing (or the account is dead) — orchestrating a pause
         spends time the park doesn't have, so they keep the passive drain.
-        A recent channel failure also stands v2 down (see DRAIN2_BACKOFF_S).
+        A recent channel failure stands v2 down (see DRAIN2_BACKOFF_S), and
+        so does a recent no-swap release (CON-461): pausing the park again
+        while there is still nobody to switch to would thrash it.
         """
+        now = self.clock()
         return (
             trigger == "proactive"
             and self.settings.drain2_wait_seconds > 0
-            and self.clock() >= self._park_backoff_until
+            and now >= self._park_backoff_until
+            and now >= self._drain2_release_until
         )
 
     def _park_channel(self) -> ParkChannel:
@@ -2659,7 +2687,11 @@ class AutoSwitchEngine:
         )
 
     def _drain2_resume_wave(
-        self, record: dict, *, reason: str = ""
+        self,
+        record: dict,
+        *,
+        reason: str = "",
+        message: str = DRAIN2_RESUME_MESSAGE,
     ) -> tuple[list[str], WaveResult | None]:
         """Send the resume wave for an episode and emit the event.
 
@@ -2701,7 +2733,7 @@ class AutoSwitchEngine:
                 )
             )
             return [], None
-        wave = self._drain2_wave(targets, DRAIN2_RESUME_MESSAGE)
+        wave = self._drain2_wave(targets, message)
         self._emit(
             Drain2ResumeEvent(
                 targets=targets,
@@ -2711,6 +2743,38 @@ class AutoSwitchEngine:
             )
         )
         return targets, wave
+
+    def _drain2_release(self, drain2: dict | None, reason: str) -> None:
+        """The gate said "swap now" but the swap cannot happen for a
+        non-transient reason (nobody to switch to): release the park and
+        close the episode instead of holding it open.
+
+        Live hole 14-08 17:10–17:13Z (CON-461, add-on): the episode hit its
+        cap, every candidate was exhausted, and the resume — which only
+        ever followed a swap — went to nobody; the record stayed open and
+        the park stood parked until a manual wake. The wave says honestly
+        that no swap happened (``DRAIN2_RELEASE_MESSAGE``), targets the
+        sessions that provably parked (the same acked-only law as every
+        resume), and the record is dropped regardless of wave health —
+        parked agents keep their bounded self-rescue either way, which is
+        strictly better than today's nothing. A release backoff then keeps
+        v2 from re-signaling a fresh pause while there is still nobody to
+        switch to. Transient freshen failures do NOT release: they retry
+        next tick with the episode intact, so an orderly pause isn't wasted
+        on a network blip.
+        """
+        if drain2 is None:
+            return
+        record = self._read_drain2()
+        if record is None or record.get("phase") != "signaled":
+            return
+        self._drain2_resume_wave(
+            record,
+            reason=f"released without a swap: {reason}",
+            message=DRAIN2_RELEASE_MESSAGE,
+        )
+        self._write_drain2(None)
+        self._drain2_release_until = self.clock() + DRAIN2_BACKOFF_S
 
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
