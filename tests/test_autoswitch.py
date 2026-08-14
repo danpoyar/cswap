@@ -4093,6 +4093,86 @@ class TestDrainV2:
         assert marker.exists()
         assert marker.read_text() == f"{int(h.clock.now)}\n"
 
+    def test_new_episode_waits_for_a_pending_resume(self, temp_home):
+        # Review r1 finding 1: cascading exhaustion (the new account is over
+        # the threshold too) used to start a fresh episode right over a
+        # swapped record whose resume was still pending — destroying the
+        # ``resumed`` bookkeeping without an event, so the pending session
+        # would never be re-waved. The gate must hold until ``_drain2_finish``
+        # closes the old episode (retry success, or the self-rescue cap).
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 100.0,
+                "updatedAt": h.clock.now - 30.0,
+                "swappedAt": h.clock.now - 30.0,
+                "to": "3",
+                "verified": True,
+                "signaled": {
+                    "fix-a": {"sessionId": "sid-fix-a"},
+                    "fix-b": {"sessionId": "sid-fix-b"},
+                },
+                "resumed": ["fix-a"],
+            },
+        }))
+        park.roster_value = [
+            _park_row("fix-b", status="idle"),  # pending from the old episode
+            _park_row("fix-c"),  # new mid-turn session: a fresh episode's target
+        ]
+        park.wave_results = [
+            WaveResult(ok=False, detail="herald down")  # the finish retry fails
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # No STOP wave went out and the old episode survived intact.
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        record = h.state()["drain2"]
+        assert record["phase"] == "swapped"
+        assert record["resumed"] == ["fix-a"]
+        assert self._reasons(h) == ["drain2-wait"]
+        # Next tick the herald recovers: the pending name is re-waved, the
+        # old episode closes, and only then does a new episode signal fix-c.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        resumes = [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert resumes[-1].targets == ["fix-b"]
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.targets == ["fix-c"]
+        assert h.state()["drain2"]["phase"] == "signaled"
+
+    def test_unconfirmed_resume_delivery_closes_the_episode(self, temp_home):
+        # Review r1 nit: ``ok=True, delivered=None`` (the herald ran but its
+        # report was unparseable) counts every target as sent — the fixation
+        # loop's law: never respam on a fuzzy channel.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        park.wave_results = [
+            WaveResult(ok=True, delivered=None, detail="no report object")
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert "drain2" not in h.state()
+        assert (
+            len([e for e in h.events if isinstance(e, Drain2ResumeEvent)]) == 1
+        )
+
+    def test_ack_name_sanitizer_rejects_hostile_names(self):
+        # Review r1 nit: a NUL byte survives ``Path(name).name == name`` and
+        # then raises ValueError (not OSError) from stat/unlink — the
+        # sanitizer must reject it outright.
+        ok = AutoSwitchEngine._drain2_ack_name_ok
+        assert ok("fix-a") is True
+        for hostile in ("", ".", "..", ".hidden", "a/b", "fix\x00a"):
+            assert ok(hostile) is False, hostile
+
     def test_reconcile_wakes_busy_working_sessions_too(self, temp_home):
         # An abandoned episode's reconcile must use the same live filter:
         # a session frozen behind a background task looks busy but still

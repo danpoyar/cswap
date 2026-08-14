@@ -162,12 +162,12 @@ DRAIN2_STOP_MESSAGE = (
     "прогон. Локальные процессы без API-вызовов (тесты, сборки) не трогай.\n"
     "3. Отметь чекпойнт-квитанцию — по ней cswap видит твою готовность "
     "сквозь бегущие фоновые задачи и свопнет раньше: "
-    'mkdir -p {ack_dir} && touch "{ack_dir}/<имя твоей сессии>"\n'
+    'mkdir -p "{ack_dir}" && touch "{ack_dir}/<имя твоей сессии>"\n'
     "4. Поставь ОДНО фоновое ожидание конца свопа инструментом Bash с "
     "run_in_background: true — этот канал сам разбудит тебя (голый nohup/& "
-    "запрещён): timeout 720 bash -c 'until [ \"$(cat {marker} 2>/dev/null "
-    "|| echo 0)\" -ge {signal_epoch} ] 2>/dev/null; do sleep 10; done'; "
-    "echo cswap-swap-done\n"
+    "запрещён): timeout 720 bash -c 'until [ \"$(cat \"{marker}\" "
+    "2>/dev/null || echo 0)\" -ge {signal_epoch} ] 2>/dev/null; do sleep "
+    "10; done'; echo cswap-swap-done\n"
     "   Если оно завершилось сразу — своп уже прошёл: не замирай, просто "
     "продолжай работу.\n"
     "5. Заверши ход и ничего не начинай: разбудит твоё же ожидание (своп "
@@ -2119,8 +2119,15 @@ class AutoSwitchEngine:
     @staticmethod
     def _drain2_ack_name_ok(name: str) -> bool:
         """Session names come from the roster; only plain filenames may
-        touch the ack dir (no separators, no dot-prefixed entries)."""
-        return bool(name) and Path(name).name == name and not name.startswith(".")
+        touch the ack dir (no separators, no dot-prefixed entries, no NUL —
+        a NUL survives the ``Path(name).name`` check and then raises
+        ValueError, not OSError, from stat/unlink)."""
+        return (
+            bool(name)
+            and "\x00" not in name
+            and Path(name).name == name
+            and not name.startswith(".")
+        )
 
     def _drain2_acked(self, name: str, since: float) -> bool:
         """Whether a checkpoint receipt fresh for this episode exists."""
@@ -2128,7 +2135,7 @@ class AutoSwitchEngine:
             return False
         try:
             st = (self._drain2_ack_dir() / name).stat()
-        except OSError:
+        except (OSError, ValueError):
             return False
         return st.st_mtime >= since
 
@@ -2140,7 +2147,7 @@ class AutoSwitchEngine:
                 continue
             try:
                 (self._drain2_ack_dir() / name).unlink()
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
     def _read_drain2(self) -> dict | None:
@@ -2244,9 +2251,27 @@ class AutoSwitchEngine:
         now = self.clock()
         max_wait = self.settings.drain2_wait_seconds
         record = self._read_drain2()
+        if record is not None and record.get("phase") == "swapped":
+            # A swapped episode that still owes its resume survived this
+            # tick's ``_drain2_finish`` (a herald retry is pending). A fresh
+            # episode written over it would destroy the ``resumed``
+            # bookkeeping and orphan the pending sessions (review r1) —
+            # hold until the finish closes it (retry success or the
+            # self-rescue cap). At-limit/failover still escape through the
+            # passive v1 path, so a dying account never waits on this.
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain2-wait",
+                    detail=(
+                        "previous episode's resume still pending; a new "
+                        "episode waits for it to close"
+                    ),
+                )
+            )
+            return "hold", None
         if record is not None:
             if record.get("phase") != "signaled":
-                record = None  # a swapped episode is _drain2_finish's job
+                record = None  # another phase's leftovers are not ours
             else:
                 started = record.get("startedAt")
                 updated = record.get("updatedAt")
