@@ -3483,8 +3483,8 @@ class TestDrainV2:
         assert len(park.waves) == 1
         names, message = park.waves[0]
         assert sorted(names) == ["fix-a", "fix-b"]
-        assert message == DRAIN2_STOP_MESSAGE
-        assert "TaskStop" in message and "ЗАМРИ" in message
+        assert message.startswith("cswap drain")
+        assert "TaskStop" in message and "Заверши ход" in message
         record = h.state()["drain2"]
         assert record["phase"] == "signaled"
         assert sorted(record["signaled"]) == ["fix-a", "fix-b"]
@@ -3552,7 +3552,9 @@ class TestDrainV2:
             "forced": 1,
         }
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
-        assert resume.targets == ["fix-a"]  # only the frozen one is woken
+        # The forced session gets the wave too (CON-451): still mid-task,
+        # the message queues and lands at its next turn boundary.
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
         kinds = h.kinds()
         assert kinds.index("drain2-timeout") < kinds.index("switch")
 
@@ -3645,7 +3647,8 @@ class TestDrainV2:
             if isinstance(e, Drain2SignalEvent) and e.top_up
         )
         assert top_up.targets == ["fix-c"]
-        assert park.waves[-1] == (["fix-c"], DRAIN2_STOP_MESSAGE)
+        names, message = park.waves[-1]
+        assert names == ["fix-c"] and message.startswith("cswap drain")
         assert sorted(h.state()["drain2"]["signaled"]) == ["fix-a", "fix-c"]
         h.clock.advance(30.0)
         park.roster_value = [
@@ -3902,4 +3905,292 @@ class TestDrainV2:
         # No wave ever targeted the dead episode's session.
         assert all("long-gone" not in names for names, _ in park.waves)
         assert not [e for e in h.events if isinstance(e, Drain2VerifyEvent) and e.number != "3"]
+        assert "drain2" not in h.state()
+
+    # -- CON-451: the first live episode (14-08) turned its defect catalog
+    # into machine guarantees — forced sessions get the resume too, the
+    # fixation judge sees through background-task "busy", the wave text
+    # prescribes ONE self-waking wait channel.
+
+    def test_forced_busy_session_is_resumed_after_the_swap(self, temp_home):
+        # Episode 14-08, class 1: all six forced sessions froze AFTER the
+        # swap; the resume wave — built from the pre-swap ``frozen`` snapshot
+        # — never reached them, and Yor woke four of them by hand. The wave
+        # must target every signaled session still holding an open task
+        # (state=working), busy or idle alike: a message to a busy session
+        # queues and lands at its next turn boundary (proved by this very
+        # episode — both STOP waves reached all 8 busy targets).
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(200.0)  # past the 180s fixation cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),  # forced: still busy when the swap lands
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        assert sorted(park.waves[-1][0]) == ["fix-a", "fix-b"]
+        assert "drain2" not in h.state()
+
+    def test_finished_session_is_never_rewoken(self, temp_home):
+        # fix-age-246 finished its whole session mid-episode (state=done).
+        # A resume message to a completed background session would respawn
+        # it just to say "I'm done" — skip done/failed/stopped and missing
+        # rows, wake only open tasks.
+        h, park = self._harness(temp_home)
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("fix-b"),
+            _park_row("fix-c"),
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(200.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle", state="done"),
+            # fix-c exited: no roster row at all
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_resume_retries_names_the_herald_failed(self, temp_home):
+        # A name the herald explicitly failed stays pending: the episode
+        # survives the tick and the next one re-waves exactly that name.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        park.wave_results = [
+            WaveResult(ok=True, delivered=["fix-a"], failed={"fix-b": "boom"})
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert h.state()["drain2"]["phase"] == "swapped"  # fix-b still pending
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(50), "2": _usage(10)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resumes = [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert resumes[-1].targets == ["fix-b"]
+        assert park.waves[-1] == (["fix-b"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_resume_channel_failure_retries_next_tick(self, temp_home):
+        # A failed resume wave used to close the episode anyway, leaving the
+        # park frozen on the self-rescue prose alone. Now the episode
+        # survives (within the self-rescue window) and the next tick retries.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        park.wave_results = [WaveResult(ok=False, detail="herald timeout 120s")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert h.state()["drain2"]["phase"] == "swapped"
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(50), "2": _usage(10)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resumes = [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert resumes[-1].targets == ["fix-a"] and resumes[-1].skipped == ""
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+        # And only one verify ran: retries re-wave, they don't re-verify.
+        assert len([e for e in h.events if isinstance(e, Drain2VerifyEvent)]) == 1
+
+    def test_ack_receipt_counts_a_busy_session_fixed(self, temp_home):
+        # Episode 14-08, the un-named defect: 4 of 6 "forced" sessions had
+        # checkpointed before the cap, but their own background fallback
+        # timers kept them status=busy in the roster — the judge could never
+        # count them fixed. The wave now prescribes an ack receipt file; a
+        # busy session with a fresh receipt is fixed.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        ack = h.switcher.backup_dir / "drain2-ack" / "fix-a"
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        os.utime(ack, (h.clock.now + 5.0, h.clock.now + 5.0))
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        # fix-a holds its background watcher: still busy in the roster.
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 30,
+            "fixed": 1,
+            "forced": 0,
+        }
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]  # busy+working is still woken
+        assert "drain2" not in h.state()
+
+    def test_stale_ack_is_cleared_at_signal_and_ignored_by_mtime(self, temp_home):
+        # A receipt left over from a previous episode must not count: the
+        # signal wave clears receipts for its targets, and the judge ignores
+        # any file older than the episode start.
+        h, park = self._harness(temp_home)
+        ack = h.switcher.backup_dir / "drain2-ack" / "fix-a"
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert not ack.exists()  # cleared when the episode signaled fix-a
+        ack.touch()
+        os.utime(ack, (h.clock.now - 100.0, h.clock.now - 100.0))  # pre-episode
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._reasons(h)[-1] == "drain2-wait"
+
+    def test_stop_message_carries_the_one_channel_protocol(self, temp_home):
+        # Class 2+3: the wave text must name async Task/Agent subagents (the
+        # "лёгкий разовый вызов" loophole chore-ops-340 walked through), and
+        # prescribe ONE self-waking wait — a run_in_background watch on the
+        # swap marker, with the signal epoch baked in so a late freezer sees
+        # "the swap already happened" instead of hanging.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        signal_epoch = int(h.clock.now)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        _, message = park.waves[0]
+        marker = h.switcher.backup_dir / "drain2-last-switch"
+        ack_dir = h.switcher.backup_dir / "drain2-ack"
+        assert str(marker) in message
+        assert str(ack_dir) in message
+        assert str(signal_epoch) in message
+        assert "TaskStop" in message
+        assert "Task/Agent" in message
+        assert "run_in_background" in message
+        for placeholder in ("{marker}", "{ack_dir}", "{signal_epoch}"):
+            assert placeholder in DRAIN2_STOP_MESSAGE  # the template
+            assert placeholder not in message  # the delivered text
+
+    def test_switch_writes_the_swap_marker_for_agent_watchers(self, temp_home):
+        # Every real switch stamps the marker the wave text tells agents to
+        # watch: an integer epoch, comparable with `[ "$(cat ...)" -ge N ]`.
+        h, park = self._harness(temp_home)
+        park.roster_value = []  # nobody mid-turn: ready path, instant swap
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        marker = h.switcher.backup_dir / "drain2-last-switch"
+        assert marker.exists()
+        assert marker.read_text() == f"{int(h.clock.now)}\n"
+
+    def test_new_episode_waits_for_a_pending_resume(self, temp_home):
+        # Review r1 finding 1: cascading exhaustion (the new account is over
+        # the threshold too) used to start a fresh episode right over a
+        # swapped record whose resume was still pending — destroying the
+        # ``resumed`` bookkeeping without an event, so the pending session
+        # would never be re-waved. The gate must hold until ``_drain2_finish``
+        # closes the old episode (retry success, or the self-rescue cap).
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 100.0,
+                "updatedAt": h.clock.now - 30.0,
+                "swappedAt": h.clock.now - 30.0,
+                "to": "3",
+                "verified": True,
+                "signaled": {
+                    "fix-a": {"sessionId": "sid-fix-a"},
+                    "fix-b": {"sessionId": "sid-fix-b"},
+                },
+                "resumed": ["fix-a"],
+            },
+        }))
+        park.roster_value = [
+            _park_row("fix-b", status="idle"),  # pending from the old episode
+            _park_row("fix-c"),  # new mid-turn session: a fresh episode's target
+        ]
+        park.wave_results = [
+            WaveResult(ok=False, detail="herald down")  # the finish retry fails
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # No STOP wave went out and the old episode survived intact.
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        record = h.state()["drain2"]
+        assert record["phase"] == "swapped"
+        assert record["resumed"] == ["fix-a"]
+        assert self._reasons(h) == ["drain2-wait"]
+        # Next tick the herald recovers: the pending name is re-waved, the
+        # old episode closes, and only then does a new episode signal fix-c.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        resumes = [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert resumes[-1].targets == ["fix-b"]
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.targets == ["fix-c"]
+        assert h.state()["drain2"]["phase"] == "signaled"
+
+    def test_unconfirmed_resume_delivery_closes_the_episode(self, temp_home):
+        # Review r1 nit: ``ok=True, delivered=None`` (the herald ran but its
+        # report was unparseable) counts every target as sent — the fixation
+        # loop's law: never respam on a fuzzy channel.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        park.wave_results = [
+            WaveResult(ok=True, delivered=None, detail="no report object")
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert "drain2" not in h.state()
+        assert (
+            len([e for e in h.events if isinstance(e, Drain2ResumeEvent)]) == 1
+        )
+
+    def test_ack_name_sanitizer_rejects_hostile_names(self):
+        # Review r1 nit: a NUL byte survives ``Path(name).name == name`` and
+        # then raises ValueError (not OSError) from stat/unlink — the
+        # sanitizer must reject it outright.
+        ok = AutoSwitchEngine._drain2_ack_name_ok
+        assert ok("fix-a") is True
+        for hostile in ("", ".", "..", ".hidden", "a/b", "fix\x00a"):
+            assert ok(hostile) is False, hostile
+
+    def test_reconcile_wakes_busy_working_sessions_too(self, temp_home):
+        # An abandoned episode's reconcile must use the same live filter:
+        # a session frozen behind a background task looks busy but still
+        # holds its open task — it gets the wave like everyone else.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=400.0)  # transcript-quiet: v1 gate opens
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),  # busy behind its own background watcher
+        ]
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.SWITCHED
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(100), "2": _usage(40)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert sorted(resume.targets) == ["fix-a", "fix-b"]
         assert "drain2" not in h.state()

@@ -115,10 +115,10 @@ QUIET_WINDOW_S = 5 * 60.0
 DRAIN_STALE_GAP_S = 2 * MAX_SLEEP_S
 
 # Drain v2 (active checkpoint) numbers. The STOP wave tells every signaled
-# session to finish its current step, checkpoint, and freeze until a resume
-# signal — and to resume on its own if none arrives within the self-rescue
-# window. A resume wave older than that window would only wake sessions that
-# already resumed themselves, so a "swapped" episode past it is closed
+# session to finish its current step, checkpoint (ack receipt + one
+# self-waking background watch on the swap marker), and end its turn. A
+# resume wave older than the self-rescue window would only wake sessions
+# that already resumed themselves, so a "swapped" episode past it is closed
 # without a wave. Post-swap the engine verifies the new account answers
 # (usage fetch) at most this many attempts before resuming regardless: a
 # park frozen on a dead verify costs more than an optimistic resume.
@@ -129,22 +129,57 @@ DRAIN2_VERIFY_ATTEMPTS = 2
 # ``--once`` processes don't share it — a one-per-minute failing retry is
 # harmless there.
 DRAIN2_BACKOFF_S = 600.0
+# Agent-facing files under the backup dir, absolute paths baked into the
+# wave text. The marker holds the integer epoch of the last real switch —
+# the watch target of the agents' one background wait (and the "swap already
+# happened, don't freeze" guard for late freezers: the wave carries the
+# signal epoch to compare against). The ack dir holds per-session receipt
+# files: a session that checkpointed but keeps a background task running
+# looks ``busy`` in the roster forever (episode 14-08: 4 of 6 "forced" had
+# checkpointed before the cap — CON-451), so the receipt is what lets the
+# fixation judge see through that.
+DRAIN2_SWITCH_MARKER_NAME = "drain2-last-switch"
+DRAIN2_ACK_DIR_NAME = "drain2-ack"
 
-# Wave texts. The park's agents work in Russian; industry terms stay English.
+# Wave texts. The park's agents work in Russian; industry terms stay
+# English. ``DRAIN2_STOP_MESSAGE`` is a template — the engine bakes in the
+# marker/ack paths and the wave's epoch (``_drain2_stop_message``). The
+# protocol is ONE wait channel (the first live episode produced four
+# different ones — CON-451 class 3): checkpoint → receipt → one
+# run_in_background watch on the marker → end the turn. The nested-run stop
+# names async Task/Agent subagents explicitly and judges by "spends tokens",
+# not by type: chore-ops-340 kept its code-reviewer running through the
+# whole episode on the reasoning "лёгкий разовый вызов, не Workflow-прогон".
 DRAIN2_STOP_MESSAGE = (
     "cswap drain: аккаунт парка у порога, готовится переключение — парк "
-    "уходит на короткую паузу. Доведи ТЕКУЩИЙ ШАГ, не кусок целиком. Если "
-    "у тебя бегут Workflow-раны или фоновые задачи — останови их (TaskStop) "
-    "и запиши runId и scriptPath на диск рядом с работой, чтобы возобновить "
-    "с этого места. Закоммить свои файлы по явным путям. Точку остановки — "
-    "одной строкой комментом в свой тикет. После этого ЗАМРИ: заверши ход "
-    "и ничего не начинай — сигнал продолжения придёт отдельным сообщением "
-    "(cswap drain-resume). Если продолжения нет дольше 10 минут — продолжай "
-    "сам."
+    "уходит на короткую паузу.\n"
+    "1. Доведи ТЕКУЩИЙ ШАГ, не кусок целиком. Закоммить свои файлы по "
+    "явным путям; точку остановки — одной строкой комментом в свой тикет.\n"
+    "2. Останови ВСЕ вложенные прогоны, которые тратят токены: Workflow-раны "
+    "И фоновых субагентов (Task/Agent, включая code-reviewer) — TaskStop, а "
+    "runId/scriptPath/agentId запиши на диск рядом с работой, чтобы "
+    "возобновить ТОГО ЖЕ после паузы. «Лёгкий разовый вызов» — тоже такой "
+    "прогон. Локальные процессы без API-вызовов (тесты, сборки) не трогай.\n"
+    "3. Отметь чекпойнт-квитанцию — по ней cswap видит твою готовность "
+    "сквозь бегущие фоновые задачи и свопнет раньше: "
+    'mkdir -p "{ack_dir}" && touch "{ack_dir}/<имя твоей сессии>"\n'
+    "4. Поставь ОДНО фоновое ожидание конца свопа инструментом Bash с "
+    "run_in_background: true — этот канал сам разбудит тебя (голый nohup/& "
+    "запрещён): timeout 720 bash -c 'until [ \"$(cat \"{marker}\" "
+    "2>/dev/null || echo 0)\" -ge {signal_epoch} ] 2>/dev/null; do sleep "
+    "10; done'; echo cswap-swap-done\n"
+    "   Если оно завершилось сразу — своп уже прошёл: не замирай, просто "
+    "продолжай работу.\n"
+    "5. Заверши ход и ничего не начинай: разбудит твоё же ожидание (своп "
+    "или кап 12 минут) или сигнал cswap drain-resume — продолжай сам, "
+    "второго разрешения не жди. Не смог поставить ожидание — просто заверши "
+    "ход: resume придёт, а если тишина дольше 10 минут — продолжай сам.\n"
+    "Отвечать на это сообщение не нужно: герольд одноразовый и уже погас."
 )
 DRAIN2_RESUME_MESSAGE = (
     "cswap drain-resume: аккаунт переключён, пауза кончилась — продолжай "
-    "работу с места остановки."
+    "работу с места остановки. Если ты уже продолжил сам — считай это "
+    "подтверждением, повторно ничего не делай."
 )
 
 # How often a sleeping loop re-stats settings.json. Every tick re-reads the
@@ -1863,6 +1898,16 @@ class AutoSwitchEngine:
             # waiting out belongs to the account we just left.
             state.pop("drain", None)
             atomic_write_json(self.state_path, state)
+            # Stamp the agent-facing swap marker the drain2 STOP text tells
+            # sessions to watch (`[ "$(cat marker)" -ge signal_epoch ]`).
+            # Every real switch counts — a v1 swap ends a pause condition
+            # just the same. Best-effort: never breaks a landed switch.
+            try:
+                self._drain2_marker_path().write_text(
+                    f"{int(self.clock())}\n", encoding="utf-8"
+                )
+            except OSError as e:
+                _logger.debug("drain2 switch marker write failed: %r", e)
 
         self._emit(
             SwitchEvent(
@@ -2051,6 +2096,60 @@ class AutoSwitchEngine:
         except Exception as e:  # the channel must never break a tick
             return WaveResult(ok=False, detail=f"{type(e).__name__}: {e}")
 
+    def _drain2_marker_path(self) -> Path:
+        return self.switcher.backup_dir / DRAIN2_SWITCH_MARKER_NAME
+
+    def _drain2_ack_dir(self) -> Path:
+        return self.switcher.backup_dir / DRAIN2_ACK_DIR_NAME
+
+    def _drain2_stop_message(self) -> str:
+        """The STOP wave text with this wave's paths and epoch baked in.
+
+        The epoch is the guard against the late-freezer trap: an agent that
+        processes the wave after the swap compares the marker (stamped at
+        switch time) against the wave's own epoch and continues instead of
+        freezing into a closed episode.
+        """
+        return DRAIN2_STOP_MESSAGE.format(
+            marker=self._drain2_marker_path(),
+            ack_dir=self._drain2_ack_dir(),
+            signal_epoch=int(self.clock()),
+        )
+
+    @staticmethod
+    def _drain2_ack_name_ok(name: str) -> bool:
+        """Session names come from the roster; only plain filenames may
+        touch the ack dir (no separators, no dot-prefixed entries, no NUL —
+        a NUL survives the ``Path(name).name`` check and then raises
+        ValueError, not OSError, from stat/unlink)."""
+        return (
+            bool(name)
+            and "\x00" not in name
+            and Path(name).name == name
+            and not name.startswith(".")
+        )
+
+    def _drain2_acked(self, name: str, since: float) -> bool:
+        """Whether a checkpoint receipt fresh for this episode exists."""
+        if not self._drain2_ack_name_ok(name):
+            return False
+        try:
+            st = (self._drain2_ack_dir() / name).stat()
+        except (OSError, ValueError):
+            return False
+        return st.st_mtime >= since
+
+    def _drain2_clear_acks(self, names: list[str]) -> None:
+        """Drop receipts left over from previous episodes (best-effort;
+        the mtime-vs-startedAt judge stays correct even when this fails)."""
+        for name in names:
+            if not self._drain2_ack_name_ok(name):
+                continue
+            try:
+                (self._drain2_ack_dir() / name).unlink()
+            except (OSError, ValueError):
+                pass
+
     def _read_drain2(self) -> dict | None:
         if self.dry_run:
             return self._drain2_mem
@@ -2152,9 +2251,27 @@ class AutoSwitchEngine:
         now = self.clock()
         max_wait = self.settings.drain2_wait_seconds
         record = self._read_drain2()
+        if record is not None and record.get("phase") == "swapped":
+            # A swapped episode that still owes its resume survived this
+            # tick's ``_drain2_finish`` (a herald retry is pending). A fresh
+            # episode written over it would destroy the ``resumed``
+            # bookkeeping and orphan the pending sessions (review r1) —
+            # hold until the finish closes it (retry success or the
+            # self-rescue cap). At-limit/failover still escape through the
+            # passive v1 path, so a dying account never waits on this.
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain2-wait",
+                    detail=(
+                        "previous episode's resume still pending; a new "
+                        "episode waits for it to close"
+                    ),
+                )
+            )
+            return "hold", None
         if record is not None:
             if record.get("phase") != "signaled":
-                record = None  # a swapped episode is _drain2_finish's job
+                record = None  # another phase's leftovers are not ours
             else:
                 started = record.get("startedAt")
                 updated = record.get("updatedAt")
@@ -2184,7 +2301,10 @@ class AutoSwitchEngine:
                     "forced": 0,
                 }
             names = sorted(s.name for s in targets)
-            wave = self._drain2_wave(names, DRAIN2_STOP_MESSAGE)
+            if not self.dry_run:
+                # Receipts from previous episodes must not pre-fix anyone.
+                self._drain2_clear_acks(names)
+            wave = self._drain2_wave(names, self._drain2_stop_message())
             if not wave.ok:
                 self._drain2_go_unavailable(f"stop wave failed: {wave.detail}")
                 return "fallback", None
@@ -2222,7 +2342,9 @@ class AutoSwitchEngine:
         targets, skipped_interactive = self._drain2_targets(roster)
         fresh = sorted(s.name for s in targets if s.name not in signaled)
         if fresh:
-            wave = self._drain2_wave(fresh, DRAIN2_STOP_MESSAGE)
+            if not self.dry_run:
+                self._drain2_clear_acks(fresh)
+            wave = self._drain2_wave(fresh, self._drain2_stop_message())
             # Track them regardless of wave health: the count must cover
             # every session the swap can tear; an unsignaled newcomer is
             # simply forced at the cap, honestly counted.
@@ -2242,9 +2364,17 @@ class AutoSwitchEngine:
                 )
             )
 
+        started = record["startedAt"]
+
         def is_fixed(name: str) -> bool:
+            # Roster says not-busy — or the session left a checkpoint
+            # receipt: an agent holding its background swap-watch (the wave
+            # text's own protocol) reads as ``busy`` forever, and without
+            # the receipt it could never be counted (CON-451).
             row = by_name.get(name)
-            return row is None or not row.executing
+            if row is None or not row.executing:
+                return True
+            return self._drain2_acked(name, since=started)
 
         fixed = sorted(n for n in signaled if is_fixed(n))
         unfixed = sorted(n for n in signaled if not is_fixed(n))
@@ -2378,39 +2508,59 @@ class AutoSwitchEngine:
             if switched_past
             else "abandoned: episode went stale (forcing condition gone)"
         )
-        self._drain2_resume_wave(record, reason=reason, prefer_roster=True)
+        self._drain2_resume_wave(record, reason=reason)
         self._write_drain2(None)
 
+    def _drain2_resume_targets(self, record: dict) -> list[str] | None:
+        """Live resume targets: every signaled session still holding an open
+        task (``state=working``) — busy and idle alike.
+
+        The first live episode (CON-451) buried the idle-only filter: a
+        session frozen behind its own background task (the wave text's swap
+        watch, a local test suite) reads ``busy`` in the roster forever, and
+        a genuinely mid-turn session just queues the message until its next
+        turn boundary — both STOP waves of that episode reached all 8 busy
+        targets. Sessions that finished (done/failed/stopped, or gone from
+        the roster) are never re-woken: a message to a completed background
+        session would respawn it. Returns None when the roster is unreadable.
+        """
+        signaled = sorted(
+            n for n in (record.get("signaled") or {}) if isinstance(n, str)
+        )
+        roster = self._park_roster()
+        if roster is None:
+            return None
+        by_name = {s.name: s for s in roster}
+        return [
+            n
+            for n in signaled
+            if (row := by_name.get(n)) is not None
+            and row.state in (None, "working")
+        ]
+
     def _drain2_resume_wave(
-        self, record: dict, *, reason: str = "", prefer_roster: bool = False
-    ) -> None:
+        self, record: dict, *, reason: str = ""
+    ) -> tuple[list[str], WaveResult | None]:
         """Send the resume wave for an episode and emit the event.
 
-        Targets are the episode's recorded ``frozen`` list; with
-        ``prefer_roster`` (the reconcile path, where the record can predate
-        the freeze) the live roster re-derives who is actually parked
-        mid-task right now — and when the roster can't answer, every
-        signaled session is woken rather than none (a message to a busy
-        session just queues; a frozen one left behind stays frozen).
+        Targets are derived live (``_drain2_resume_targets``), minus names a
+        previous wave of this episode already confirmed (``resumed``). When
+        the roster can't answer, every signaled session is woken rather than
+        none (a message to a busy session just queues; a frozen one left
+        behind stays frozen). Returns ``(targets, wave)`` for the caller's
+        retry bookkeeping; ``wave=None`` means nothing was sent (dry-run, or
+        nobody left to wake).
         """
-        frozen = [n for n in (record.get("frozen") or []) if isinstance(n, str)]
-        targets = frozen
-        if prefer_roster:
-            signaled = sorted(
+        already = {n for n in (record.get("resumed") or []) if isinstance(n, str)}
+        targets = self._drain2_resume_targets(record)
+        if targets is None:
+            frozen = [
+                n for n in (record.get("frozen") or []) if isinstance(n, str)
+            ]
+            targets = frozen or sorted(
                 n for n in (record.get("signaled") or {}) if isinstance(n, str)
             )
-            roster = self._park_roster()
-            if roster is not None:
-                by_name = {s.name: s for s in roster}
-                targets = sorted(
-                    n
-                    for n in signaled
-                    if (row := by_name.get(n)) is not None
-                    and row.status == "idle"
-                    and row.state == "working"
-                )
-            elif not targets:
-                targets = signaled
+        targets = [n for n in targets if n not in already]
         if self.dry_run:
             self._emit(
                 Drain2ResumeEvent(
@@ -2418,15 +2568,18 @@ class AutoSwitchEngine:
                     reason=reason,
                 )
             )
-            return
+            return targets, None
         if not targets:
             self._emit(
                 Drain2ResumeEvent(
-                    targets=[], delivered=[], skipped="no frozen sessions",
+                    targets=[], delivered=[],
+                    skipped=(
+                        "already resumed" if already else "no frozen sessions"
+                    ),
                     reason=reason,
                 )
             )
-            return
+            return [], None
         wave = self._drain2_wave(targets, DRAIN2_RESUME_MESSAGE)
         self._emit(
             Drain2ResumeEvent(
@@ -2436,19 +2589,22 @@ class AutoSwitchEngine:
                 reason=reason,
             )
         )
+        return targets, wave
 
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
-        answers, then wake the frozen sessions.
+        answers, then wake every signaled session still mid-task.
 
         Runs right after the swap and again at the top of every tick, so a
         daemon restart or a cron ``--once`` handover finishes the resume
         instead of losing it. Bounded on every branch: the verify retries
         at most DRAIN2_VERIFY_ATTEMPTS times and then resumes anyway (a
         park frozen on a dead verify costs more than an optimistic resume),
-        a failed resume wave is not retried (the STOP wave's self-rescue
-        clause covers it), and an episode past the self-rescue window is
-        closed without a wave — its sessions already resumed themselves.
+        a failed wave or a herald-failed name keeps the episode open so the
+        next tick re-waves exactly what's pending (the first live episode
+        froze four sessions on a one-shot wave — CON-451), and an episode
+        past the self-rescue window is closed without a wave — its sessions
+        already resumed themselves.
         """
         record = self._read_drain2()
         if record is None or record.get("phase") != "swapped":
@@ -2470,21 +2626,48 @@ class AutoSwitchEngine:
             )
             self._write_drain2(None)
             return
-        number = str(record.get("to") or "")
-        attempt = int(record.get("verifyAttempts") or 0) + 1
-        ok, detail = self._drain2_verify(number, swapped_at)
-        self._emit(
-            Drain2VerifyEvent(number=number, ok=ok, attempt=attempt, detail=detail)
-        )
-        if not ok and attempt < DRAIN2_VERIFY_ATTEMPTS:
-            self._write_drain2({
-                **record,
-                "verifyAttempts": attempt,
-                "updatedAt": now,
-            })
+        if not record.get("verified"):
+            number = str(record.get("to") or "")
+            attempt = int(record.get("verifyAttempts") or 0) + 1
+            ok, detail = self._drain2_verify(number, swapped_at)
+            self._emit(
+                Drain2VerifyEvent(
+                    number=number, ok=ok, attempt=attempt, detail=detail
+                )
+            )
+            if not ok and attempt < DRAIN2_VERIFY_ATTEMPTS:
+                self._write_drain2({
+                    **record,
+                    "verifyAttempts": attempt,
+                    "updatedAt": now,
+                })
+                return
+            # Wave retries below must re-wave, not re-verify: the account
+            # was already judged once (answering, or resumed-regardless).
+            record = {**record, "verified": True, "verifyAttempts": attempt}
+        targets, wave = self._drain2_resume_wave(record)
+        if wave is None:
+            # Dry-run, or nobody left to wake — the episode is done.
+            self._write_drain2(None)
             return
-        self._drain2_resume_wave(record)
-        self._write_drain2(None)
+        if wave.ok:
+            # Unconfirmed delivery (unparseable report) counts as sent:
+            # the fixation loop's law — never respam on a fuzzy channel.
+            confirmed = (
+                set(wave.delivered) if wave.delivered is not None else set(targets)
+            )
+            confirmed -= set(wave.failed)
+            resumed = sorted(
+                {*(record.get("resumed") or []), *confirmed}
+            )
+            if not [n for n in targets if n not in resumed]:
+                self._write_drain2(None)
+                return
+            self._write_drain2({**record, "resumed": resumed, "updatedAt": now})
+            return
+        # Channel failure: keep the episode, the next tick retries within
+        # the self-rescue window.
+        self._write_drain2({**record, "updatedAt": now})
 
     def _drain2_verify(
         self, number: str, swapped_at: float | None = None
