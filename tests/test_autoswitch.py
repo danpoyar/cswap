@@ -13,12 +13,14 @@ import pytest
 
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
+    DRAIN_STALE_GAP_S,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     SETTINGS_WATCH_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
+    DrainTimeoutEvent,
     ErrorEvent,
     NoSwitchEvent,
     PollEvent,
@@ -672,6 +674,225 @@ class TestQuietGate:
         assert "sessions-active" in [
             e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
         ]
+
+
+class TestDrainGate:
+    """Forced switches drain: bounded wait for session silence (CON-419).
+
+    A forced swap (at-limit, failover, and proactive under switchUnderLoad)
+    under live traffic burns the prompt cache of every running session on the
+    account being left. With ``autoswitch.drainTimeoutSeconds`` set, the
+    engine holds the forced swap — re-checking every tick — until transcripts
+    have been silent for QUIET_WINDOW_S, and at the ceiling swaps anyway with
+    a warning: an account pinned at its limit breaks live agents harder than
+    a cache miss does. 0 (the default) keeps forced switches immediate.
+    """
+
+    _AT_LIMIT = {"1": _usage(100), "2": _usage(40), "3": _usage(20)}
+    _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+
+    def _drain_harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, drain_timeout_seconds=600.0, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_default_off_swaps_immediately(self, harness):
+        # Upstream behavior is unchanged until the ceiling is configured.
+        assert AutoSwitchSettings().drain_timeout_seconds == 0.0
+        _write_transcript(harness, age_s=10.0)
+        outcome = harness.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.gate == "forced"
+        assert "drain" not in switch.to_json()
+        assert "drain-wait" not in self._reasons(harness)
+
+    def test_busy_forced_switch_waits(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h) == ["drain-wait"]
+        assert h.state()["drain"]["startedAt"] == h.clock.now
+        assert "lastSwitchAt" not in h.state()
+
+    def test_wait_progresses_without_restarting(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        started = h.state()["drain"]["startedAt"]
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=10.0)  # traffic continues
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait", "drain-wait"]
+        assert h.state()["drain"]["startedAt"] == started
+        assert h.state()["drain"]["updatedAt"] == h.clock.now
+
+    def test_quiet_after_wait_switches_with_drain_go(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        h.clock.advance(360.0)  # transcript is now 370s old -> quiet
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert switch.gate == "quiet"
+        assert switch.to_json()["drain"] == {"outcome": "go", "waitedSeconds": 360}
+        assert "drained 360s" in switch.human()
+        assert "drain" not in h.state()
+        assert not [e for e in h.events if isinstance(e, DrainTimeoutEvent)]
+
+    def test_ceiling_swaps_with_warn(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        h.clock.advance(610.0)
+        _write_transcript(h, age_s=10.0)  # still busy at the ceiling
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        warn = next(e for e in h.events if isinstance(e, DrainTimeoutEvent))
+        assert warn.human().startswith("WARN")
+        payload = warn.to_json()
+        assert payload["event"] == "drain-timeout"
+        assert payload["trigger"] == "at-limit"
+        assert payload["waitedSeconds"] == 610
+        assert payload["maxWaitSeconds"] == 600
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.gate == "forced"
+        assert switch.to_json()["drain"] == {
+            "outcome": "timeout",
+            "waitedSeconds": 610,
+        }
+        # The WARN precedes the switch in the log.
+        kinds = h.kinds()
+        assert kinds.index("drain-timeout") < kinds.index("switch")
+        assert "drain" not in h.state()  # a landed switch closes the episode
+
+    def test_immediate_quiet_has_no_drain_field(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=360.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.gate == "quiet"
+        assert "drain" not in switch.to_json()
+        assert "drain-wait" not in self._reasons(h)
+        assert "drain" not in h.state()
+
+    def test_failover_drains_too(self, temp_home):
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        usage = {"1": None, "2": _usage(10), "3": _usage(50)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION  # 1/3 unhealthy
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION  # 2/3 unhealthy
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION  # failover drains
+        assert "drain-wait" in self._reasons(h)
+        h.clock.advance(360.0)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert switch.to_json()["drain"]["outcome"] == "go"
+
+    def test_proactive_under_load_drains(self, temp_home):
+        # switchUnderLoad released proactive from the unbounded gate; with a
+        # drain ceiling it waits for a pause first instead of landing at the
+        # first busy tick.
+        h = self._drain_harness(temp_home, switch_under_load=True)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait"]
+        h.clock.advance(360.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.gate == "quiet"
+        assert switch.to_json()["drain"]["outcome"] == "go"
+
+    def test_voluntary_gate_stays_unbounded(self, temp_home):
+        # The drain ceiling is only for forced switches: the voluntary quiet
+        # gate keeps holding proactive (without switchUnderLoad) forever.
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(700.0)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["sessions-active", "sessions-active"]
+        assert "drain" not in h.state()
+
+    def test_stale_drain_record_restarts_the_episode(self, temp_home):
+        # A leftover record from a previous episode (engine slept, condition
+        # went away and came back) must not count as already-waited time.
+        h = self._drain_harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain": {
+                "startedAt": h.clock.now - 5000.0,
+                "updatedAt": h.clock.now - DRAIN_STALE_GAP_S - 1.0,
+                "trigger": "at-limit",
+            },
+        }))
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait"]
+        assert h.state()["drain"]["startedAt"] == h.clock.now
+
+    def test_timeout_warns_once_across_blocked_attempts(self, temp_home):
+        # Ceiling reached but no viable target: the engine keeps trying every
+        # tick (like today) without re-waiting a full ceiling and without
+        # repeating the WARN.
+        h = self._drain_harness(temp_home)
+        exhausted = {"1": _usage(100), "2": _usage(100), "3": _usage(100)}
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(exhausted) is TickOutcome.NO_ACTION
+        h.clock.advance(610.0)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        warns = [e for e in h.events if isinstance(e, DrainTimeoutEvent)]
+        assert len(warns) == 1
+        assert self._reasons(h) == ["drain-wait"]  # no re-wait after timeout
+        assert h.state()["drain"]["timeoutWarned"] is True
+
+    def test_dry_run_drain_writes_no_state(self, temp_home):
+        h = self._drain_harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain-wait"]
+        assert "drain" not in h.state()  # dry-run keeps the episode in memory
+        h.clock.advance(610.0)
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.dry_run is True
+        assert switch.to_json()["drain"]["outcome"] == "timeout"
+        assert h.state() == {}  # nothing was ever written
+        assert h.active_number() == 1
+
+    def test_drain_setting_spec(self):
+        spec = SETTING_SPECS["autoswitch.drainTimeoutSeconds"]
+        assert spec.field == "drain_timeout_seconds"
+        assert spec.kind == "float"
+        assert spec.lo == 0.0
+        assert spec.hi == 86400.0
+        assert AutoSwitchSettings().drain_timeout_seconds == 0.0
 
 
 class TestVoluntaryMinimumInterval:

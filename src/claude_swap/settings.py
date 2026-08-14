@@ -57,6 +57,13 @@ class AutoSwitchSettings:
     # live sessions on the account being left; leave off for interactive work.
     # The below-threshold consume-first rotation stays gated either way.
     switch_under_load: bool = False
+    # Bounded wait ("drain") before a FORCED switch — at-limit, failover, and
+    # proactive under switchUnderLoad — lands while sessions are running: the
+    # engine holds the swap, re-checking every tick, until transcripts have
+    # been quiet for the cache window, and at this many seconds swaps anyway
+    # with a warning (an account pinned at its limit breaks live agents
+    # harder than the cache miss does). 0 = swap immediately (no drain).
+    drain_timeout_seconds: float = 0.0
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -141,6 +148,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "switchUnderLoad", "switch_under_load", "bool",
             help="Let the at-threshold switch land while sessions are running",
+        ),
+        SettingSpec(
+            "autoswitch", "drainTimeoutSeconds", "drain_timeout_seconds",
+            "float", 0.0, 86400.0,
+            help="Max seconds a forced switch waits for session silence (0 = don't wait)",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
