@@ -34,12 +34,23 @@ read in one sitting.
   been written for 5 minutes (`QUIET_WINDOW_S`), because prompt caches are
   per-organization and a swap under live traffic full-misses the next turn of
   every running session (measured on this fleet: 47/64 FULL-MISS turns within
-  ±2 min of a switch). At-limit/failover bypass the gate. Every `switch` event
-  carries an additive `gate: "quiet"|"forced"` field = traffic state at swap
-  time, so cache damage per switch is measurable from the log. Fleet policy
-  on this machine (settings.json, not code): threshold 95, cooldownSeconds
-  7200. Upstream may want this too, but the transcript-path heuristic is
-  Claude-Code-layout-specific — offer upstream after it survives the fleet.
+  ±2 min of a switch). `autoswitch.switchUnderLoad` releases the at-threshold
+  (proactive) switch from that gate: an unattended fleet never goes quiet, so
+  the gate held the swap until the account hit the wall and in-flight agents
+  died on the limit first. Forced switches (at-limit, failover, and proactive
+  under `switchUnderLoad`) instead *drain* (CON-419): with
+  `autoswitch.drainTimeoutSeconds` set they wait — re-checked each tick — for
+  the same silence, and at the ceiling swap anyway after a one-per-episode
+  `drain-timeout` WARN. Waiting ticks log `no-switch`/`drain-wait`, a drained
+  switch carries an additive `drain: {outcome, waitedSeconds}`, and the
+  episode persists in `autoswitch_state.json` (shared with cron `--once`).
+  Every `switch` event carries an additive `gate: "quiet"|"forced"` field =
+  traffic state at swap time, so cache damage per switch is measurable from
+  the log. Fleet policy on this machine (settings.json, not code): threshold
+  90, cooldownSeconds 7200, strategy consume-first, model Fable,
+  switchUnderLoad true, drainTimeoutSeconds 600. Upstream may want this too,
+  but the transcript-path heuristic is Claude-Code-layout-specific — offer
+  upstream after it survives the fleet.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a

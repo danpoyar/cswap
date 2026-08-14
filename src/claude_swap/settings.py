@@ -49,6 +49,21 @@ class AutoSwitchSettings:
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Let the at-threshold (proactive) switch land while sessions are running,
+    # instead of waiting for the 5-minute transcript-silence gate. An
+    # unattended fleet never goes quiet, so the gate would hold the swap until
+    # the account hit the wall and only the at-limit escape got out — after
+    # in-flight agents already failed on the limit. Costs the prompt caches of
+    # live sessions on the account being left; leave off for interactive work.
+    # The below-threshold consume-first rotation stays gated either way.
+    switch_under_load: bool = False
+    # Bounded wait ("drain") before a FORCED switch — at-limit, failover, and
+    # proactive under switchUnderLoad — lands while sessions are running: the
+    # engine holds the swap, re-checking every tick, until transcripts have
+    # been quiet for the cache window, and at this many seconds swaps anyway
+    # with a warning (an account pinned at its limit breaks live agents
+    # harder than the cache miss does). 0 = swap immediately (no drain).
+    drain_timeout_seconds: float = 0.0
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -129,6 +144,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
+        ),
+        SettingSpec(
+            "autoswitch", "switchUnderLoad", "switch_under_load", "bool",
+            help="Let the at-threshold switch land while sessions are running",
+        ),
+        SettingSpec(
+            "autoswitch", "drainTimeoutSeconds", "drain_timeout_seconds",
+            "float", 0.0, 86400.0,
+            help="Max seconds a forced switch waits for session silence (0 = don't wait)",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",

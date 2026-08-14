@@ -102,6 +102,15 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # at-limit and failover switches are forced and skip the gate.
 QUIET_WINDOW_S = 5 * 60.0
 
+# Drain gate for forced switches (the ones the voluntary gate does not hold).
+# A drain episode lives in the state file so cron `--once` ticks share it; a
+# record whose last busy observation is older than this belongs to an episode
+# that ended without a switch (the forcing condition went away, or the engine
+# was down) and must not count as already-waited time. Two consecutive
+# observations of a live episode are never farther apart than the longest
+# engine sleep (MAX_SLEEP_S), with the same again as slack.
+DRAIN_STALE_GAP_S = 2 * MAX_SLEEP_S
+
 # How often a sleeping loop re-stats settings.json. Every tick re-reads the
 # file, but a BLOCKED/all-exhausted tick then sleeps up to MAX_SLEEP_S — and a
 # settings change (say, folding a per-model weekly quota into the decision)
@@ -263,12 +272,18 @@ class SwitchEvent(AutoSwitchEvent):
     # switch is measurable from the log alone: "quiet" = no transcript write
     # for QUIET_WINDOW_S (live prompt caches already expired — the swap burned
     # nothing); "forced" = live traffic existed but the switch had to happen
-    # anyway (at-limit/failover). Voluntary triggers can only ever log "quiet"
-    # — the quiet gate blocks them otherwise. Additive field.
+    # anyway. Triggers held by the quiet gate (_gated_triggers) can only ever
+    # log "quiet" — the gate blocks them otherwise. Additive field.
     gate: str = "forced"
+    # Set when a drain episode preceded this switch (the forced-switch bounded
+    # wait for silence): {"outcome": "go"|"timeout", "waitedSeconds": int}.
+    # "go" = silence arrived within the ceiling, "timeout" = the ceiling hit
+    # and the swap went through under load. Absent when the swap needed no
+    # wait. Additive field.
+    drain: dict | None = None
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
@@ -276,6 +291,9 @@ class SwitchEvent(AutoSwitchEvent):
             "dryRun": self.dry_run,
             "gate": self.gate,
         }
+        if self.drain is not None:
+            fields["drain"] = self.drain
+        return fields
 
     def human(self) -> str:
         src = (
@@ -287,7 +305,14 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate})"
+        tail = ""
+        if self.drain is not None:
+            waited = self.drain.get("waitedSeconds")
+            if self.drain.get("outcome") == "go":
+                tail = f", drained {waited}s"
+            else:
+                tail = f", drain timed out at {waited}s"
+        return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate}{tail})"
 
 
 @dataclass(frozen=True)
@@ -301,6 +326,33 @@ class NoSwitchEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+
+
+@dataclass(frozen=True)
+class DrainTimeoutEvent(AutoSwitchEvent):
+    """The drain ceiling hit while sessions were still writing: the forced
+    switch proceeds under load, paying the prompt caches of every live
+    session on the account being left. One per drain episode."""
+
+    kind: ClassVar[str] = "drain-timeout"
+    trigger: str
+    waited_seconds: int
+    max_wait_seconds: int
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "waitedSeconds": self.waited_seconds,
+            "maxWaitSeconds": self.max_wait_seconds,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        return (
+            f"WARN: sessions never went quiet in {self.max_wait_seconds}s — "
+            f"{self.trigger} switch proceeds under load ({self.detail})"
+        )
 
 
 @dataclass(frozen=True)
@@ -557,6 +609,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Drain episode under dry-run lives here instead of the state file
+        # (dry-run must not write anything).
+        self._drain_mem: dict | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -1003,10 +1058,18 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
-        if trigger in ("proactive", "consume-first"):
+        drain: dict | None = None
+        if trigger in self._gated_triggers():
             quiet, detail = self._session_quiet()
             if not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
+                return TickOutcome.NO_ACTION
+        else:
+            # Forced switches drain: a bounded wait for the same silence,
+            # instead of landing at the first busy tick (every live session
+            # on the account being left full-misses its prompt cache).
+            proceed, drain = self._drain_gate(trigger)
+            if not proceed:
                 return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
@@ -1210,7 +1273,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger)
+                return self._perform(num, email, trigger, drain=drain)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1227,7 +1290,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger)
+            return self._perform(num, email, trigger, drain=drain)
 
         if transient_failure:
             self._emit(
@@ -1471,7 +1534,13 @@ class AutoSwitchEngine:
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
 
-    def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
+    def _perform(
+        self,
+        number: str,
+        email: str,
+        trigger: str,
+        drain: dict | None = None,
+    ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
@@ -1483,6 +1552,7 @@ class AutoSwitchEngine:
                     to_ref=_ref(number, email),
                     dry_run=True,
                     gate="quiet" if quiet else "forced",
+                    drain=drain,
                 )
             )
             return TickOutcome.SWITCHED
@@ -1508,7 +1578,7 @@ class AutoSwitchEngine:
             # voluntary switch. The same measurement labels the event, so
             # every logged switch carries the traffic state it landed in.
             quiet, detail = self._session_quiet()
-            if trigger in ("proactive", "consume-first") and not quiet:
+            if trigger in self._gated_triggers() and not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
                 return TickOutcome.NO_ACTION
 
@@ -1530,6 +1600,9 @@ class AutoSwitchEngine:
             # no schema bump, readers ignore unknown keys.
             state["lastSwitchTrigger"] = trigger
             state["lastSwitchGate"] = "quiet" if quiet else "forced"
+            # A landed switch closes any drain episode — the traffic it was
+            # waiting out belongs to the account we just left.
+            state.pop("drain", None)
             atomic_write_json(self.state_path, state)
 
         self._emit(
@@ -1539,6 +1612,7 @@ class AutoSwitchEngine:
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
                 gate="quiet" if quiet else "forced",
+                drain=drain,
             )
         )
         return TickOutcome.SWITCHED
@@ -1550,6 +1624,132 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _gated_triggers(self) -> tuple[str, ...]:
+        """Which triggers wait for transcript silence.
+
+        ``autoswitch.switchUnderLoad`` releases only ``proactive`` — the
+        threshold is already crossed there, so the choice is "swap now and
+        lose prompt caches" against "ride into the wall and lose in-flight
+        agents". ``consume-first`` is a below-threshold optimization with
+        nothing to escape, so it stays gated under every setting.
+        """
+        if self.settings.switch_under_load:
+            return ("consume-first",)
+        return ("proactive", "consume-first")
+
+    def _drain_gate(self, trigger: str) -> tuple[bool, dict | None]:
+        """Bounded quiet-wait ("drain") before a forced switch lands.
+
+        Forced triggers — at-limit, failover, and proactive under
+        ``switchUnderLoad`` — bypass the voluntary quiet gate, so without a
+        drain they swap at the first tick and full-miss the prompt cache of
+        every session running on the account being left. With
+        ``drain_timeout_seconds`` set, the engine instead holds the swap and
+        re-checks each tick (the poll step) for QUIET_WINDOW_S of transcript
+        silence. The wait is bounded: an account pinned at its limit breaks
+        live agents harder than a cache miss does, so at the ceiling the
+        switch proceeds anyway, after a one-per-episode DrainTimeoutEvent.
+
+        Returns ``(proceed, drain_info)``. ``proceed=False`` means hold this
+        tick (a ``drain-wait`` line was emitted). ``drain_info`` is the
+        additive SwitchEvent payload when an episode preceded the swap:
+        ``{"outcome": "go"|"timeout", "waitedSeconds": int}``; None when the
+        swap needed no wait. The episode lives in the state file (shared
+        with cron ``--once`` ticks) — in memory under dry-run, which must
+        not write state.
+        """
+        max_wait = self.settings.drain_timeout_seconds
+        if max_wait <= 0:
+            return True, None
+        now = self.clock()
+        latest = latest_session_activity_ts(self.claude_projects_dir)
+        record = self._read_drain()
+        if record is not None:
+            started = record.get("startedAt")
+            updated = record.get("updatedAt")
+            if (
+                not isinstance(started, (int, float))
+                or not isinstance(updated, (int, float))
+                or now - updated > DRAIN_STALE_GAP_S
+            ):
+                record = None  # a previous episode's leftovers
+        if latest is None or now - latest >= QUIET_WINDOW_S:
+            if record is None:
+                return True, None
+            # Keep the record: the swap can still fail past this gate
+            # (freshen hiccup, no viable target), and the episode must not
+            # restart from zero nor lose its drain label on the retry. The
+            # switch that lands clears it (_perform); an episode that ends
+            # without one ages out via DRAIN_STALE_GAP_S.
+            self._write_drain({**record, "updatedAt": now})
+            return True, {
+                "outcome": "go",
+                "waitedSeconds": int(now - record["startedAt"]),
+            }
+        busy = f"last session write {now - latest:.0f}s ago"
+        if record is None:
+            self._write_drain(
+                {"startedAt": now, "updatedAt": now, "trigger": trigger}
+            )
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain-wait",
+                    detail=(
+                        f"{busy}; {trigger} switch drains up to "
+                        f"{max_wait:.0f}s for "
+                        f"{QUIET_WINDOW_S / 60:.0f}m of silence"
+                    ),
+                )
+            )
+            return False, None
+        waited = now - record["startedAt"]
+        if waited < max_wait:
+            self._write_drain({**record, "updatedAt": now, "trigger": trigger})
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain-wait",
+                    detail=f"{busy}; drained {waited:.0f}s of {max_wait:.0f}s",
+                )
+            )
+            return False, None
+        # Ceiling. Warn once per episode — a second engine racing this
+        # check-then-act can double-emit the WARN (benign: an extra log
+        # line; the switch itself is serialized in _perform). The record
+        # survives until a switch lands (_perform clears it), so a blocked
+        # or transiently-failed attempt retries next tick without
+        # re-waiting a full ceiling; an episode that ends without a switch
+        # ages out via DRAIN_STALE_GAP_S.
+        if not record.get("timeoutWarned"):
+            self._emit(
+                DrainTimeoutEvent(
+                    trigger=trigger,
+                    waited_seconds=int(waited),
+                    max_wait_seconds=int(max_wait),
+                    detail=busy,
+                )
+            )
+        self._write_drain({**record, "updatedAt": now, "timeoutWarned": True})
+        return True, {"outcome": "timeout", "waitedSeconds": int(waited)}
+
+    def _read_drain(self) -> dict | None:
+        if self.dry_run:
+            return self._drain_mem
+        value = self._read_state().get("drain")
+        return value if isinstance(value, dict) else None
+
+    def _write_drain(self, record: dict | None) -> None:
+        if self.dry_run:
+            self._drain_mem = record
+            return
+
+        def set_drain(state: dict) -> None:
+            if record is None:
+                state.pop("drain", None)
+            else:
+                state["drain"] = record
+
+        self._mutate_state(set_drain)
 
     def _session_quiet(self) -> tuple[bool, str]:
         """Whether session traffic has been silent for ``QUIET_WINDOW_S``.

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -47,11 +48,14 @@ class TestConfigList:
             "autoswitch.strategy",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
+            "autoswitch.switchUnderLoad",
             "autoswitch.model",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        # Count from the spec table, not a literal: a new key must not need a
+        # test edit to stay honest — it must show up as an unset default.
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +82,8 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == len(SETTING_SPECS)
+        assert by_key["autoswitch.switchUnderLoad"]["value"] is False
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
