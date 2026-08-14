@@ -41,6 +41,11 @@ HERALD_TIMEOUT_S = 120.0
 # The relay is a mechanical one-step job (no decisions, no code): the small
 # model tier is the right spend, and an alias stays current across releases.
 HERALD_MODEL = "sonnet"
+# The park-facing display name (CON-464). Without it the roster shows the
+# cwd-derived "drain2-herald-N" machinery name. A constant bare name is
+# safe: the herald only sends — nothing addresses it by name or matches
+# the name in code, and the wave counter stays in the daemon's events.
+HERALD_NAME = "Jerry"
 
 # Where `claude` lives when the daemon's launchd PATH doesn't carry it.
 _CLAUDE_FALLBACKS = (
@@ -237,6 +242,8 @@ class ParkChannel:
                     "json",
                     "--model",
                     HERALD_MODEL,
+                    "--name",
+                    HERALD_NAME,
                 ],
                 capture_output=True,
                 text=True,

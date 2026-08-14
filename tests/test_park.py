@@ -130,6 +130,11 @@ class TestWave:
             "json",
             "--model",
             HERALD_MODEL,
+            # The park-visible name is pinned literally: Danila's panel
+            # must list the herald as Jerry, not a cwd-derived machinery
+            # name (CON-464).
+            "--name",
+            "Jerry",
         ]
 
     def test_child_env_drops_claude_and_auth_vars(self, monkeypatch):
