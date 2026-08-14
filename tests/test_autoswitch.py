@@ -32,6 +32,7 @@ from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import (
+    SETTING_SPECS,
     AutoSwitchSettings,
     load_settings,
     set_setting,
@@ -605,6 +606,52 @@ class TestQuietGate:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "failover"
         assert switch.gate == "forced"
+
+    def _loaded_harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, switch_under_load=True, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switch_under_load_lets_proactive_through(self, temp_home):
+        """Unattended fleets (mining waves, overnight agents) never go quiet:
+        the gate would hold the proactive swap until the account hit the wall
+        and only an at-limit escape got out — after in-flight agents already
+        died on the limit. With switchUnderLoad the at-threshold swap lands
+        under traffic, paying prompt-cache misses instead of failed agents."""
+        h = self._loaded_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.gate == "forced"
+        assert switch.to_json()["gate"] == "forced"
+
+    def test_switch_under_load_still_holds_consume_first(self, temp_home):
+        """The escape hatch is only for "time to leave". The below-threshold
+        consume-first rotation is pure optimization and keeps waiting for
+        silence, so it never burns a live session's cache for nothing."""
+        h = self._loaded_harness(temp_home, strategy="consume-first")
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "sessions-active" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_switch_under_load_defaults_off(self):
+        assert AutoSwitchSettings().switch_under_load is False
+        assert SETTING_SPECS["autoswitch.switchUnderLoad"].field == "switch_under_load"
+        assert SETTING_SPECS["autoswitch.switchUnderLoad"].kind == "bool"
 
     def test_perform_rechecks_quiet_under_lock(self, harness):
         """Traffic appearing between the tick-top gate and the actual switch

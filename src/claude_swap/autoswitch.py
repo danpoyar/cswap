@@ -1003,7 +1003,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
-        if trigger in ("proactive", "consume-first"):
+        if trigger in self._gated_triggers():
             quiet, detail = self._session_quiet()
             if not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
@@ -1508,7 +1508,7 @@ class AutoSwitchEngine:
             # voluntary switch. The same measurement labels the event, so
             # every logged switch carries the traffic state it landed in.
             quiet, detail = self._session_quiet()
-            if trigger in ("proactive", "consume-first") and not quiet:
+            if trigger in self._gated_triggers() and not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
                 return TickOutcome.NO_ACTION
 
@@ -1550,6 +1550,19 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _gated_triggers(self) -> tuple[str, ...]:
+        """Which triggers wait for transcript silence.
+
+        ``autoswitch.switchUnderLoad`` releases only ``proactive`` — the
+        threshold is already crossed there, so the choice is "swap now and
+        lose prompt caches" against "ride into the wall and lose in-flight
+        agents". ``consume-first`` is a below-threshold optimization with
+        nothing to escape, so it stays gated under every setting.
+        """
+        if self.settings.switch_under_load:
+            return ("consume-first",)
+        return ("proactive", "consume-first")
 
     def _session_quiet(self) -> tuple[bool, str]:
         """Whether session traffic has been silent for ``QUIET_WINDOW_S``.
