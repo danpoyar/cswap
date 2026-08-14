@@ -869,6 +869,29 @@ class TestDrainGate:
         assert self._reasons(h) == ["drain-wait"]  # no re-wait after timeout
         assert h.state()["drain"]["timeoutWarned"] is True
 
+    def test_failed_attempt_keeps_the_episode(self, temp_home):
+        # Silence arrived but the swap failed past the gate (freshen
+        # hiccup): the episode must survive, so the eventual switch still
+        # carries its drain label instead of restarting from zero.
+        h = self._drain_harness(temp_home)
+        _write_transcript(h, age_s=10.0)
+        assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.NO_ACTION
+        h.clock.advance(360.0)  # quiet now
+        with patch.object(
+            h.engine, "_freshen_target", return_value="transient"
+        ):
+            assert h.tick_with_usage(self._AT_LIMIT) is TickOutcome.ERROR
+        assert "drain" in h.state()  # episode survived the failed attempt
+        h.clock.advance(30.0)
+        outcome = h.tick_with_usage(self._AT_LIMIT)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain"] == {
+            "outcome": "go",
+            "waitedSeconds": 390,
+        }
+        assert "drain" not in h.state()
+
     def test_dry_run_drain_writes_no_state(self, temp_home):
         h = self._drain_harness(temp_home)
         h.engine = h._make_engine(dry_run=True)

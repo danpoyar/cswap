@@ -1677,7 +1677,12 @@ class AutoSwitchEngine:
         if latest is None or now - latest >= QUIET_WINDOW_S:
             if record is None:
                 return True, None
-            self._write_drain(None)
+            # Keep the record: the swap can still fail past this gate
+            # (freshen hiccup, no viable target), and the episode must not
+            # restart from zero nor lose its drain label on the retry. The
+            # switch that lands clears it (_perform); an episode that ends
+            # without one ages out via DRAIN_STALE_GAP_S.
+            self._write_drain({**record, "updatedAt": now})
             return True, {
                 "outcome": "go",
                 "waitedSeconds": int(now - record["startedAt"]),
@@ -1708,11 +1713,13 @@ class AutoSwitchEngine:
                 )
             )
             return False, None
-        # Ceiling. Warn once per episode; keep the record so a blocked or
-        # transiently-failed switch attempt retries next tick without
-        # re-waiting a full ceiling (the record is cleared by the switch
-        # that lands, or ages out via DRAIN_STALE_GAP_S when the episode
-        # ends without one).
+        # Ceiling. Warn once per episode — a second engine racing this
+        # check-then-act can double-emit the WARN (benign: an extra log
+        # line; the switch itself is serialized in _perform). The record
+        # survives until a switch lands (_perform clears it), so a blocked
+        # or transiently-failed attempt retries next tick without
+        # re-waiting a full ceiling; an episode that ends without a switch
+        # ages out via DRAIN_STALE_GAP_S.
         if not record.get("timeoutWarned"):
             self._emit(
                 DrainTimeoutEvent(
