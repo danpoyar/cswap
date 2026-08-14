@@ -421,3 +421,32 @@ class TestPidsWithConfigDir:
             process_detection._pids_with_config_dir_ps([1], lambda v: True)
             is None
         )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX env probes")
+    def test_ps_output_with_non_utf8_bytes_still_matches(
+        self, tmp_path, monkeypatch
+    ):
+        """CON-465: ps dumps every candidate's raw argv+env, and a foreign
+        process's line can carry bytes that aren't valid UTF-8 (the kernel
+        truncates a long argv mid-character). One such line must not crash
+        the whole probe — it may only under-match, while other lines keep
+        matching. Uses a fake ``ps`` on PATH so the real subprocess.run
+        decoding is exercised, not a canned str.
+        """
+        fake_ps = tmp_path / "ps"
+        fake_ps.write_bytes(
+            b"#!/bin/sh\n"
+            b"printf '  111 claude --bg HOME=/u"
+            b" CLAUDE_CONFIG_DIR=/x/prof TERM=x\\n'\n"
+            # \377 = 0xFF (never valid in UTF-8), \320 = 0xD0 (a Cyrillic
+            # lead byte with its continuation byte cut off).
+            b"printf '  222 claude -p \\377\\377\\320 HOME=/u TERM=x\\n'\n"
+        )
+        fake_ps.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"
+        )
+        owned = process_detection._pids_with_config_dir_ps(
+            [111, 222], lambda v: v == "/x/prof"
+        )
+        assert owned == {111}

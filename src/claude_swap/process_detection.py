@@ -230,7 +230,14 @@ def _pids_with_config_dir_proc(
 def _pids_with_config_dir_ps(
     pids: list[int], matches: Callable[[str], bool]
 ) -> set[int] | None:
-    """macOS/BSD: one batched ``ps -wwE`` pass over all candidate PIDs."""
+    """macOS/BSD: one batched ``ps -wwE`` pass over all candidate PIDs.
+
+    Decoded as UTF-8 with ``errors="replace"``: the output carries every
+    candidate's raw argv+env, and a foreign process's argv can hold bytes
+    that aren't valid UTF-8 (the kernel truncates a long argv mid-character,
+    CON-465). Locale-independent and never raises; like the ``/proc`` path,
+    a mangled value can only under-match.
+    """
     cmd = [
         "ps",
         "-wwE",
@@ -241,7 +248,11 @@ def _pids_with_config_dir_ps(
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_PS_TIMEOUT
+            cmd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_PS_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         return None  # probe unavailable — let the caller stay conservative
