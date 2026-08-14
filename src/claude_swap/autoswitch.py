@@ -50,6 +50,9 @@ from typing import ClassVar
 
 from claude_swap import oauth, paths, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.park import ParkChannel, ParkSession, WaveResult
+from claude_swap.process_detection import pids_with_config_dir
+from claude_swap.session import session_dir_for
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -110,6 +113,39 @@ QUIET_WINDOW_S = 5 * 60.0
 # observations of a live episode are never farther apart than the longest
 # engine sleep (MAX_SLEEP_S), with the same again as slack.
 DRAIN_STALE_GAP_S = 2 * MAX_SLEEP_S
+
+# Drain v2 (active checkpoint) numbers. The STOP wave tells every signaled
+# session to finish its current step, checkpoint, and freeze until a resume
+# signal — and to resume on its own if none arrives within the self-rescue
+# window. A resume wave older than that window would only wake sessions that
+# already resumed themselves, so a "swapped" episode past it is closed
+# without a wave. Post-swap the engine verifies the new account answers
+# (usage fetch) at most this many attempts before resuming regardless: a
+# park frozen on a dead verify costs more than an optimistic resume.
+DRAIN2_SELF_RESCUE_S = 600.0
+DRAIN2_VERIFY_ATTEMPTS = 2
+# In-process backoff after a channel failure: without it a broken herald
+# (worst case: a 120s spawn timeout) would stall every drain tick. Cron
+# ``--once`` processes don't share it — a one-per-minute failing retry is
+# harmless there.
+DRAIN2_BACKOFF_S = 600.0
+
+# Wave texts. The park's agents work in Russian; industry terms stay English.
+DRAIN2_STOP_MESSAGE = (
+    "cswap drain: аккаунт парка у порога, готовится переключение — парк "
+    "уходит на короткую паузу. Доведи ТЕКУЩИЙ ШАГ, не кусок целиком. Если "
+    "у тебя бегут Workflow-раны или фоновые задачи — останови их (TaskStop) "
+    "и запиши runId и scriptPath на диск рядом с работой, чтобы возобновить "
+    "с этого места. Закоммить свои файлы по явным путям. Точку остановки — "
+    "одной строкой комментом в свой тикет. После этого ЗАМРИ: заверши ход "
+    "и ничего не начинай — сигнал продолжения придёт отдельным сообщением "
+    "(cswap drain-resume). Если продолжения нет дольше 10 минут — продолжай "
+    "сам."
+)
+DRAIN2_RESUME_MESSAGE = (
+    "cswap drain-resume: аккаунт переключён, пауза кончилась — продолжай "
+    "работу с места остановки."
+)
 
 # How often a sleeping loop re-stats settings.json. Every tick re-reads the
 # file, but a BLOCKED/all-exhausted tick then sleeps up to MAX_SLEEP_S — and a
@@ -281,6 +317,12 @@ class SwitchEvent(AutoSwitchEvent):
     # and the swap went through under load. Absent when the swap needed no
     # wait. Additive field.
     drain: dict | None = None
+    # Set when a drain v2 (active checkpoint) episode preceded this switch:
+    # {"outcome": "ready"|"timeout", "waitedSeconds": int, "fixed": int,
+    # "forced": int}. "ready" = every signaled session reached a turn
+    # boundary; "timeout" = the fixation cap hit and ``forced`` sessions were
+    # swapped mid-turn — the honest waited/torn count in one place. Additive.
+    drain2: dict | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -293,6 +335,8 @@ class SwitchEvent(AutoSwitchEvent):
         }
         if self.drain is not None:
             fields["drain"] = self.drain
+        if self.drain2 is not None:
+            fields["drain2"] = self.drain2
         return fields
 
     def human(self) -> str:
@@ -312,6 +356,17 @@ class SwitchEvent(AutoSwitchEvent):
                 tail = f", drained {waited}s"
             else:
                 tail = f", drain timed out at {waited}s"
+        if self.drain2 is not None:
+            waited = self.drain2.get("waitedSeconds")
+            fixed = self.drain2.get("fixed")
+            forced = self.drain2.get("forced")
+            if self.drain2.get("outcome") == "ready":
+                tail += f", checkpointed {fixed} session(s) in {waited}s"
+            else:
+                tail += (
+                    f", checkpoint cap at {waited}s: {fixed} fixed, "
+                    f"{forced} forced"
+                )
         return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate}{tail})"
 
 
@@ -353,6 +408,140 @@ class DrainTimeoutEvent(AutoSwitchEvent):
             f"WARN: sessions never went quiet in {self.max_wait_seconds}s — "
             f"{self.trigger} switch proceeds under load ({self.detail})"
         )
+
+
+@dataclass(frozen=True)
+class Drain2SignalEvent(AutoSwitchEvent):
+    """A checkpoint (STOP) wave went out to mid-turn sessions."""
+
+    kind: ClassVar[str] = "drain2-signal"
+    trigger: str
+    targets: list[str] = field(default_factory=list)
+    # Names the herald confirmed sent; None = wave ran but the per-name
+    # report was unparseable (delivery unconfirmed, not absent).
+    delivered: list[str] | None = None
+    skipped_interactive: int = 0
+    top_up: bool = False  # mid-episode wave to sessions that appeared/woke
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "targets": self.targets,
+            "delivered": self.delivered,
+            "skippedInteractive": self.skipped_interactive,
+            "topUp": self.top_up,
+            "dryRun": self.dry_run,
+        }
+
+    def human(self) -> str:
+        confirmed = (
+            f"{len(self.delivered)} confirmed"
+            if self.delivered is not None
+            else "delivery unconfirmed"
+        )
+        kind = "top-up checkpoint" if self.top_up else "checkpoint"
+        return (
+            f"drain2: {kind} signal to {len(self.targets)} session(s) "
+            f"({confirmed}; {self.trigger})"
+        )
+
+
+@dataclass(frozen=True)
+class Drain2TimeoutEvent(AutoSwitchEvent):
+    """The fixation cap hit while sessions were still mid-turn: the switch
+    proceeds, paying the caches of the ``forced`` sessions. One per episode."""
+
+    kind: ClassVar[str] = "drain2-timeout"
+    trigger: str
+    waited_seconds: int
+    max_wait_seconds: int
+    fixed: list[str] = field(default_factory=list)
+    forced: list[str] = field(default_factory=list)
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "waitedSeconds": self.waited_seconds,
+            "maxWaitSeconds": self.max_wait_seconds,
+            "fixed": self.fixed,
+            "forced": self.forced,
+        }
+
+    def human(self) -> str:
+        return (
+            f"WARN: {len(self.forced)} session(s) never checkpointed in "
+            f"{self.max_wait_seconds}s ({', '.join(self.forced)}) — "
+            f"{self.trigger} switch proceeds, {len(self.fixed)} fixed"
+        )
+
+
+@dataclass(frozen=True)
+class Drain2VerifyEvent(AutoSwitchEvent):
+    """Post-swap check that the new active account answers (usage fetch)."""
+
+    kind: ClassVar[str] = "drain2-verify"
+    number: str
+    ok: bool
+    attempt: int
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "ok": self.ok,
+            "attempt": self.attempt,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        verdict = "answers" if self.ok else "not answering"
+        return (
+            f"drain2: new account {self.number} {verdict} "
+            f"(attempt {self.attempt}{'; ' + self.detail if self.detail else ''})"
+        )
+
+
+@dataclass(frozen=True)
+class Drain2ResumeEvent(AutoSwitchEvent):
+    """The resume wave after a swap (or the reason it was skipped)."""
+
+    kind: ClassVar[str] = "drain2-resume"
+    targets: list[str] = field(default_factory=list)
+    delivered: list[str] | None = None
+    skipped: str = ""  # non-empty = no wave went out, and why
+
+    def _fields(self) -> dict:
+        return {
+            "targets": self.targets,
+            "delivered": self.delivered,
+            "skipped": self.skipped,
+        }
+
+    def human(self) -> str:
+        if self.skipped:
+            return f"drain2: resume wave skipped ({self.skipped})"
+        confirmed = (
+            f"{len(self.delivered)} confirmed"
+            if self.delivered is not None
+            else "delivery unconfirmed"
+        )
+        return f"drain2: resume signal to {len(self.targets)} session(s) ({confirmed})"
+
+
+@dataclass(frozen=True)
+class Drain2UnavailableEvent(AutoSwitchEvent):
+    """The park channel failed — this episode falls back to the passive
+    drain (v1) behavior for the same trigger."""
+
+    kind: ClassVar[str] = "drain2-unavailable"
+    reason: str
+
+    def _fields(self) -> dict:
+        return {"reason": self.reason}
+
+    def human(self) -> str:
+        return f"drain2 unavailable ({self.reason}); falling back to passive drain"
 
 
 @dataclass(frozen=True)
@@ -551,6 +740,7 @@ class AutoSwitchEngine:
         clock: Callable[[], float] = time.time,
         claude_projects_dir: Path | None = None,
         overrides: dict[str, object] | None = None,
+        park: ParkChannel | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -612,6 +802,13 @@ class AutoSwitchEngine:
         # Drain episode under dry-run lives here instead of the state file
         # (dry-run must not write anything).
         self._drain_mem: dict | None = None
+        # Park channel for drain v2 waves/roster; built lazily so an engine
+        # that never drains (or a test that injects a fake) costs nothing.
+        self._park = park
+        self._drain2_mem: dict | None = None
+        # Set after a channel failure: until then, drain v2 stands down and
+        # forced proactive switches take the passive v1 drain.
+        self._park_backoff_until = 0.0
 
     # -- state file ---------------------------------------------------------
 
@@ -907,6 +1104,12 @@ class AutoSwitchEngine:
             else {}
         )
 
+        # A drain-v2 episode swapped but hasn't resumed its frozen sessions
+        # yet (daemon restart, cron handover, or a pending verify retry):
+        # finish it before anything else — a NO_ACTION tick must not leave
+        # the park frozen.
+        self._drain2_finish()
+
         current = self.switcher.current_account_number()
         if current is None:
             self._emit(
@@ -1059,11 +1262,25 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         drain: dict | None = None
+        drain2: dict | None = None
         if trigger in self._gated_triggers():
             quiet, detail = self._session_quiet()
             if not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
                 return TickOutcome.NO_ACTION
+        elif self._drain2_active_for(trigger):
+            # Drain v2: create the park pause instead of waiting for one —
+            # signal every mid-turn session to checkpoint, confirm fixation
+            # from the roster, then swap. Channel failure falls back to the
+            # passive v1 drain below.
+            mode, drain2 = self._drain2_gate(trigger)
+            if mode == "hold":
+                return TickOutcome.NO_ACTION
+            if mode == "fallback":
+                drain2 = None
+                proceed, drain = self._drain_gate(trigger)
+                if not proceed:
+                    return TickOutcome.NO_ACTION
         else:
             # Forced switches drain: a bounded wait for the same silence,
             # instead of landing at the first busy tick (every live session
@@ -1273,7 +1490,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, drain=drain)
+                return self._perform_with_drain2(
+                    num, email, trigger, drain, drain2
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1290,7 +1509,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, drain=drain)
+            return self._perform_with_drain2(num, email, trigger, drain, drain2)
 
         if transient_failure:
             self._emit(
@@ -1534,12 +1753,31 @@ class AutoSwitchEngine:
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
 
+    def _perform_with_drain2(
+        self,
+        number: str,
+        email: str,
+        trigger: str,
+        drain: dict | None,
+        drain2: dict | None,
+    ) -> TickOutcome:
+        """Perform the switch, then complete any drain-v2 episode behind it
+        (mark swapped → verify the new account → resume wave). A failed
+        switch leaves the episode in place, so the retry keeps its label
+        and its frozen list."""
+        outcome = self._perform(number, email, trigger, drain=drain, drain2=drain2)
+        if outcome is TickOutcome.SWITCHED and drain2 is not None:
+            self._drain2_mark_swapped(number)
+            self._drain2_finish()
+        return outcome
+
     def _perform(
         self,
         number: str,
         email: str,
         trigger: str,
         drain: dict | None = None,
+        drain2: dict | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -1553,6 +1791,7 @@ class AutoSwitchEngine:
                     dry_run=True,
                     gate="quiet" if quiet else "forced",
                     drain=drain,
+                    drain2=drain2,
                 )
             )
             return TickOutcome.SWITCHED
@@ -1613,6 +1852,7 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
                 gate="quiet" if quiet else "forced",
                 drain=drain,
+                drain2=drain2,
             )
         )
         return TickOutcome.SWITCHED
@@ -1750,6 +1990,404 @@ class AutoSwitchEngine:
                 state["drain"] = record
 
         self._mutate_state(set_drain)
+
+    # -- drain v2 (active checkpoint) --------------------------------------
+
+    def _drain2_active_for(self, trigger: str) -> bool:
+        """Whether this forced trigger goes through the active checkpoint.
+
+        Proactive only: it is a forewarning below the hard limit, worth a
+        couple of minutes of orderly pause. At-limit and failover mean calls
+        are already failing (or the account is dead) — orchestrating a pause
+        spends time the park doesn't have, so they keep the passive drain.
+        A recent channel failure also stands v2 down (see DRAIN2_BACKOFF_S).
+        """
+        return (
+            trigger == "proactive"
+            and self.settings.drain2_wait_seconds > 0
+            and self.clock() >= self._park_backoff_until
+        )
+
+    def _park_channel(self) -> ParkChannel:
+        if self._park is None:
+            self._park = ParkChannel(
+                herald_cwd=self.switcher.backup_dir / "drain2-herald"
+            )
+        return self._park
+
+    def _park_roster(self) -> list[ParkSession] | None:
+        try:
+            return self._park_channel().roster()
+        except Exception as e:  # the channel must never break a tick
+            _logger.debug("park roster raised: %r", e)
+            return None
+
+    def _drain2_wave(self, targets: list[str], message: str) -> WaveResult:
+        """One herald wave; dry-run pretends success without spawning."""
+        if self.dry_run:
+            return WaveResult(ok=True, delivered=[], detail="dry-run")
+        try:
+            return self._park_channel().send_wave(targets, message)
+        except Exception as e:  # the channel must never break a tick
+            return WaveResult(ok=False, detail=f"{type(e).__name__}: {e}")
+
+    def _read_drain2(self) -> dict | None:
+        if self.dry_run:
+            return self._drain2_mem
+        value = self._read_state().get("drain2")
+        return value if isinstance(value, dict) else None
+
+    def _write_drain2(self, record: dict | None) -> None:
+        if self.dry_run:
+            self._drain2_mem = record
+            return
+
+        def set_record(state: dict) -> None:
+            if record is None:
+                state.pop("drain2", None)
+            else:
+                state["drain2"] = record
+
+        self._mutate_state(set_record)
+
+    def _drain2_go_unavailable(self, reason: str) -> None:
+        """Channel failure: log once, stand v2 down, hand off to v1.
+
+        Any signaled record is dropped — the passive drain owns the episode
+        from here, and already-signaled sessions resume on their own via the
+        wave text's self-rescue clause.
+        """
+        self._emit(Drain2UnavailableEvent(reason=reason))
+        self._park_backoff_until = self.clock() + DRAIN2_BACKOFF_S
+        record = self._read_drain2()
+        if record is not None and record.get("phase") == "signaled":
+            self._write_drain2(None)
+
+    def _drain2_targets(
+        self, roster: list[ParkSession]
+    ) -> tuple[list[ParkSession], int]:
+        """Mid-turn background sessions to signal, plus the count of mid-turn
+        interactive ones skipped (a human's hands: they can't be told to
+        freeze and their fixation can't be confirmed from the roster).
+
+        Sessions running against per-terminal ``cswap run`` profiles are
+        excluded by pid: the global swap doesn't touch their credentials, so
+        freezing them (the orchestrator included) would idle the one part of
+        the park the swap can't hurt. When the profile-membership probe is
+        unavailable the exclusion degrades to "signal them too" — a wasted
+        pause, never a missed one.
+        """
+        busy = [s for s in roster if s.executing]
+        interactive = sum(1 for s in busy if s.kind != "background")
+        background = [s for s in busy if s.kind == "background"]
+        excluded = self._drain2_excluded_pids(
+            [s.pid for s in background if s.pid is not None]
+        )
+        targets = [
+            s for s in background if s.pid is None or s.pid not in excluded
+        ]
+        return targets, interactive
+
+    def _drain2_excluded_pids(self, pids: list[int]) -> set[int]:
+        excluded: set[int] = set()
+        if not pids:
+            return excluded
+        try:
+            numbers = self.switcher.switchable_account_numbers()
+        except Exception:
+            return excluded
+        for num in numbers:
+            email = self.switcher.account_email(num)
+            if not email:
+                continue
+            try:
+                profile = session_dir_for(self.switcher.backup_dir, num, email)
+                if not profile.exists():
+                    continue
+                owned = pids_with_config_dir(pids, profile)
+            except Exception:
+                continue
+            if owned:
+                excluded |= owned
+        return excluded
+
+    def _drain2_gate(self, trigger: str) -> tuple[str, dict | None]:
+        """Active-checkpoint gate for the forced proactive switch.
+
+        Returns ``(mode, drain2_info)``: ``("hold", None)`` — episode in
+        progress, a ``drain2-wait`` line was emitted; ``("proceed", info)``
+        — swap now, ``info`` is the additive SwitchEvent payload with the
+        honest waited/fixed/forced count; ``("fallback", None)`` — the park
+        channel failed (event emitted, channel backed off in-process), the
+        caller runs the passive v1 drain instead.
+
+        The episode lives in the state file under ``drain2`` (in memory for
+        dry-run) so cron ``--once`` ticks and daemon restarts share it.
+        Fixation is machine state, not a timer: a signaled session is fixed
+        when the roster shows it not ``busy`` (turn boundary) or gone.
+        ``frozen`` — fixed sessions parked with their task open (``status
+        idle`` + ``state working``) — is who the post-swap resume wave
+        wakes; sessions that finished outright must not be re-woken.
+        """
+        now = self.clock()
+        max_wait = self.settings.drain2_wait_seconds
+        record = self._read_drain2()
+        if record is not None:
+            if record.get("phase") != "signaled":
+                record = None  # a swapped episode is _drain2_finish's job
+            else:
+                started = record.get("startedAt")
+                updated = record.get("updatedAt")
+                if (
+                    not isinstance(started, (int, float))
+                    or not isinstance(updated, (int, float))
+                    or now - updated > DRAIN_STALE_GAP_S
+                ):
+                    record = None  # a previous episode's leftovers
+
+        roster = self._park_roster()
+        if roster is None:
+            self._drain2_go_unavailable(
+                "park roster unreadable (`claude agents --json`)"
+            )
+            return "fallback", None
+        by_name = {s.name: s for s in roster}
+
+        if record is None:
+            targets, skipped_interactive = self._drain2_targets(roster)
+            if not targets:
+                # Nobody is mid-turn: the pause already exists.
+                return "proceed", {
+                    "outcome": "ready",
+                    "waitedSeconds": 0,
+                    "fixed": 0,
+                    "forced": 0,
+                }
+            names = sorted(s.name for s in targets)
+            wave = self._drain2_wave(names, DRAIN2_STOP_MESSAGE)
+            if not wave.ok:
+                self._drain2_go_unavailable(f"stop wave failed: {wave.detail}")
+                return "fallback", None
+            self._write_drain2({
+                "phase": "signaled",
+                "trigger": trigger,
+                "startedAt": now,
+                "updatedAt": now,
+                "signaled": {
+                    s.name: {"sessionId": s.session_id} for s in targets
+                },
+            })
+            self._emit(
+                Drain2SignalEvent(
+                    trigger=trigger,
+                    targets=names,
+                    delivered=wave.delivered,
+                    skipped_interactive=skipped_interactive,
+                    dry_run=self.dry_run,
+                )
+            )
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain2-wait",
+                    detail=(
+                        f"signaled {len(names)} session(s); waiting for "
+                        f"checkpoint 0s of {max_wait:.0f}s"
+                    ),
+                )
+            )
+            return "hold", None
+
+        # Episode in progress: top up newcomers, then judge fixation.
+        signaled = dict(record.get("signaled") or {})
+        targets, skipped_interactive = self._drain2_targets(roster)
+        fresh = sorted(s.name for s in targets if s.name not in signaled)
+        if fresh:
+            wave = self._drain2_wave(fresh, DRAIN2_STOP_MESSAGE)
+            # Track them regardless of wave health: the count must cover
+            # every session the swap can tear; an unsignaled newcomer is
+            # simply forced at the cap, honestly counted.
+            for s in targets:
+                if s.name in fresh:
+                    signaled[s.name] = {"sessionId": s.session_id}
+            self._emit(
+                Drain2SignalEvent(
+                    trigger=trigger,
+                    targets=fresh,
+                    delivered=wave.delivered if wave.ok else [],
+                    skipped_interactive=skipped_interactive,
+                    top_up=True,
+                    dry_run=self.dry_run,
+                )
+            )
+
+        def is_fixed(name: str) -> bool:
+            row = by_name.get(name)
+            return row is None or not row.executing
+
+        fixed = sorted(n for n in signaled if is_fixed(n))
+        unfixed = sorted(n for n in signaled if not is_fixed(n))
+        frozen = sorted(
+            n
+            for n in fixed
+            if (row := by_name.get(n)) is not None
+            and row.status == "idle"
+            and row.state == "working"
+        )
+        waited = now - record["startedAt"]
+        if not unfixed:
+            self._write_drain2({
+                **record,
+                "signaled": signaled,
+                "updatedAt": now,
+                "frozen": frozen,
+            })
+            return "proceed", {
+                "outcome": "ready",
+                "waitedSeconds": int(waited),
+                "fixed": len(fixed),
+                "forced": 0,
+            }
+        if waited < max_wait:
+            self._write_drain2({
+                **record,
+                "signaled": signaled,
+                "updatedAt": now,
+            })
+            self._emit(
+                NoSwitchEvent(
+                    reason="drain2-wait",
+                    detail=(
+                        f"checkpointed {len(fixed)}/{len(signaled)}; waited "
+                        f"{waited:.0f}s of {max_wait:.0f}s"
+                    ),
+                )
+            )
+            return "hold", None
+        # Fixation cap. Warn once per episode; like v1, the record survives
+        # until a switch lands, so a blocked or failed attempt retries
+        # without re-waiting and without repeating the WARN.
+        if not record.get("timeoutWarned"):
+            self._emit(
+                Drain2TimeoutEvent(
+                    trigger=trigger,
+                    waited_seconds=int(waited),
+                    max_wait_seconds=int(max_wait),
+                    fixed=fixed,
+                    forced=unfixed,
+                )
+            )
+        self._write_drain2({
+            **record,
+            "signaled": signaled,
+            "updatedAt": now,
+            "frozen": frozen,
+            "timeoutWarned": True,
+        })
+        return "proceed", {
+            "outcome": "timeout",
+            "waitedSeconds": int(waited),
+            "fixed": len(fixed),
+            "forced": len(unfixed),
+        }
+
+    def _drain2_mark_swapped(self, number: str) -> None:
+        """A switch just landed inside a drain-v2 episode: record the phase
+        flip so the resume wave survives a crash between swap and resume."""
+        record = self._read_drain2()
+        if record is None or record.get("phase") != "signaled":
+            return
+        now = self.clock()
+        self._write_drain2({
+            **record,
+            "phase": "swapped",
+            "swappedAt": now,
+            "updatedAt": now,
+            "to": str(number),
+            "verifyAttempts": 0,
+        })
+
+    def _drain2_finish(self) -> None:
+        """Complete a swapped drain-v2 episode: verify the new account
+        answers, then wake the frozen sessions.
+
+        Runs right after the swap and again at the top of every tick, so a
+        daemon restart or a cron ``--once`` handover finishes the resume
+        instead of losing it. Bounded on every branch: the verify retries
+        at most DRAIN2_VERIFY_ATTEMPTS times and then resumes anyway (a
+        park frozen on a dead verify costs more than an optimistic resume),
+        a failed resume wave is not retried (the STOP wave's self-rescue
+        clause covers it), and an episode past the self-rescue window is
+        closed without a wave — its sessions already resumed themselves.
+        """
+        record = self._read_drain2()
+        if record is None or record.get("phase") != "swapped":
+            return
+        now = self.clock()
+        swapped_at = record.get("swappedAt")
+        if not isinstance(swapped_at, (int, float)) or (
+            now - swapped_at > DRAIN2_SELF_RESCUE_S
+        ):
+            self._emit(
+                Drain2ResumeEvent(
+                    targets=[],
+                    delivered=None,
+                    skipped=(
+                        "episode is past the self-rescue window; frozen "
+                        "sessions resumed on their own"
+                    ),
+                )
+            )
+            self._write_drain2(None)
+            return
+        number = str(record.get("to") or "")
+        attempt = int(record.get("verifyAttempts") or 0) + 1
+        ok, detail = self._drain2_verify(number)
+        self._emit(
+            Drain2VerifyEvent(number=number, ok=ok, attempt=attempt, detail=detail)
+        )
+        if not ok and attempt < DRAIN2_VERIFY_ATTEMPTS:
+            self._write_drain2({
+                **record,
+                "verifyAttempts": attempt,
+                "updatedAt": now,
+            })
+            return
+        frozen = [n for n in (record.get("frozen") or []) if isinstance(n, str)]
+        if self.dry_run:
+            self._emit(
+                Drain2ResumeEvent(targets=frozen, delivered=[], skipped="dry-run")
+            )
+        elif not frozen:
+            self._emit(
+                Drain2ResumeEvent(
+                    targets=[], delivered=[], skipped="no frozen sessions"
+                )
+            )
+        else:
+            wave = self._drain2_wave(frozen, DRAIN2_RESUME_MESSAGE)
+            self._emit(
+                Drain2ResumeEvent(
+                    targets=frozen,
+                    delivered=wave.delivered if wave.ok else None,
+                    skipped="" if wave.ok else f"resume wave failed: {wave.detail}",
+                )
+            )
+        self._write_drain2(None)
+
+    def _drain2_verify(self, number: str) -> tuple[bool, str]:
+        """The post-swap "new account answers" check: its usage is readable
+        through a live fetch. Never raises."""
+        if not number:
+            return False, "no target recorded"
+        try:
+            entries = self.switcher.usage_entries_by_account(fetch={number})
+        except Exception as e:
+            return False, f"usage fetch failed: {type(e).__name__}: {e}"
+        entry = entries.get(number)
+        value = entry.decision_value() if entry is not None else None
+        if isinstance(value, dict):
+            return True, ""
+        return False, "usage not readable"
 
     def _session_quiet(self) -> tuple[bool, str]:
         """Whether session traffic has been silent for ``QUIET_WINDOW_S``.
