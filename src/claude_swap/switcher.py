@@ -1988,13 +1988,203 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def _restore_live_after_add(
+        self, prior_num: str, prior_email: str, added_email: str, added_org_uuid: str
+    ) -> str:
+        """Put the recorded active account's stored login back as the live one.
+
+        ``add_account`` runs right after a fresh ``claude /login`` replaced the
+        live login; by the time this runs the just-added account's credential
+        is already snapshotted in its slot, so the live copy may be overwritten
+        without a stash. Deliberately never touches ``activeAccountNumber``:
+        add must not move the active account (CON-438) — a real swap goes
+        through the auto-switch drain path or an explicit ``--activate``.
+
+        Returns ``"restored"`` when the active account owns the live login
+        again, ``"unreadable"`` when the active slot's backup cannot be
+        activated (the caller falls back to recording the fresh login as
+        active), and ``"drift"`` when the live login is no longer the
+        just-added account (a concurrent switch owns the live state — nothing
+        here is ours to move).
+        """
+        try:
+            prior_creds = self._read_account_credentials(prior_num, prior_email)
+            prior_config = self._read_account_config(prior_num, prior_email)
+        except Exception as e:
+            self._logger.warning(
+                f"Could not read account {prior_num} backup for restore: {e}"
+            )
+            return "unreadable"
+        if not prior_creds or not prior_config:
+            return "unreadable"
+        try:
+            prior_config_data = json.loads(prior_config)
+        except json.JSONDecodeError:
+            return "unreadable"
+        prior_oauth = prior_config_data.get("oauthAccount")
+        if not prior_oauth:
+            return "unreadable"
+
+        # Same lock set as ``_perform_switch``: Claude Code's token refresh
+        # and config writes must not interleave with ours.
+        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            if not self._live_identity_matches(added_email, added_org_uuid):
+                return "drift"
+            rollback_creds = self._read_credentials()
+            if rollback_creds is None:
+                raise CredentialReadError(
+                    "Cannot snapshot live credentials before restoring the active account"
+                )
+            config_path = self._get_claude_config_path()
+            rollback_config_text: str | None = None
+            if config_path.exists():
+                try:
+                    rollback_config_text = config_path.read_text(encoding="utf-8")
+                except OSError as e:
+                    raise ConfigError(
+                        f"Cannot snapshot live config before restoring the active account: {e}"
+                    )
+
+            creds_written = False
+            config_written = False
+            try:
+                self._write_credentials(
+                    self._prepare_credentials_for_activation(
+                        prior_creds, rollback_creds
+                    )
+                )
+                creds_written = True
+                # Mirror the switch path: keep local settings/projects, only
+                # swap oauthAccount back in.
+                existing_config = (
+                    self._read_json(config_path) if config_path.exists() else None
+                )
+                if existing_config:
+                    existing_config["oauthAccount"] = prior_oauth
+                    self._write_json(config_path, existing_config)
+                else:
+                    self._write_json(config_path, prior_config_data)
+                config_written = True
+            except Exception:
+                if config_written and rollback_config_text is not None:
+                    try:
+                        config_path.write_text(
+                            rollback_config_text, encoding="utf-8"
+                        )
+                        if sys.platform != "win32":
+                            os.chmod(config_path, 0o600)
+                    except Exception as e:
+                        self._logger.error(f"Failed to rollback config: {e}")
+                if creds_written:
+                    try:
+                        self._write_credentials(rollback_creds)
+                    except Exception as e:
+                        self._logger.error(f"Failed to rollback credentials: {e}")
+                raise
+        return "restored"
+
+    def _finish_add_activation(
+        self,
+        account_num: str,
+        current_email: str,
+        current_org_uuid: str,
+        activate: bool,
+    ) -> None:
+        """Settle which account owns the live login after an add (CON-438).
+
+        Default: the recorded active account keeps it — the freshly captured
+        login is put back from the active slot's backup and the slot just
+        registered stays a passive switch candidate; the only sanctioned swap
+        is the auto-switch drain path (or an explicit activation, logged).
+        The fresh login is recorded as active only when there is nothing to
+        protect (first account, re-add of the active account itself) or
+        nothing to restore (unreadable backup — the honest state then is the
+        login that is actually live).
+        """
+        data = self._get_sequence_data()
+        prior = data.get("activeAccountNumber")
+        prior_num = str(prior) if prior is not None else None
+        prior_rec = (
+            data.get("accounts", {}).get(prior_num) if prior_num is not None else None
+        )
+
+        if (
+            not activate
+            and prior_rec
+            and prior_num != account_num
+            and (
+                prior_rec.get("email", ""),
+                prior_rec.get("organizationUuid", "") or "",
+            )
+            != (current_email, current_org_uuid)
+        ):
+            prior_email = prior_rec.get("email", "")
+            outcome = self._restore_live_after_add(
+                prior_num, prior_email, current_email, current_org_uuid
+            )
+            if outcome == "restored":
+                self._logger.info(
+                    f"Registered account {account_num} without activation; "
+                    f"live login restored to active account {prior_num}"
+                )
+                print(
+                    f"{accent('Registered')} without activation — Account "
+                    f"{prior_num} ({prior_email}) stays the live login."
+                )
+                print(dimmed(
+                    "  Swaps go through the auto-switch drain path; to "
+                    f"activate now: cswap switch {account_num}, or add "
+                    "--activate."
+                ))
+                return
+            if outcome == "drift":
+                self._logger.info(
+                    f"Registered account {account_num}; live login changed "
+                    "mid-add (concurrent switch) — leaving it untouched"
+                )
+                print(dimmed(
+                    "Live login changed while adding (another switch ran) — "
+                    "leaving it as is."
+                ))
+                return
+            warning(
+                f"Active account {prior_num} has no readable backup to restore "
+                f"— Account {account_num} stays the live login and becomes "
+                "the recorded active account."
+            )
+            self._logger.warning(
+                f"Restore of active account {prior_num} failed (backup "
+                f"unreadable); activated freshly added account {account_num} "
+                "instead"
+            )
+
+        data = self._get_sequence_data()
+        data["activeAccountNumber"] = int(account_num)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        if activate:
+            self._logger.info(
+                f"Activated account {account_num} via --activate (manual "
+                "activation, bypasses the auto-switch drain path)"
+            )
+            print(
+                f"{accent('Activated')} Account {account_num} "
+                f"({current_email}) — manual --activate, drain path bypassed."
+            )
+
     def add_account(
         self,
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
+        activate: bool = False,
     ) -> None:
         """Add current account to managed accounts.
+
+        Registers the freshly logged-in account as a slot without making it
+        the live login: the recorded active account's credentials are put
+        back, so running sessions keep their account (and its warm prompt
+        cache), and any swap happens on the auto-switch drain path (CON-438).
 
         Args:
             slot: Specify the slot number to store the account in.
@@ -2005,6 +2195,8 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+            activate: Make the added account the live login immediately —
+                  the conscious, logged bypass of the drain path.
         """
         self._setup_directories()
         self._init_sequence_file()
@@ -2058,7 +2250,6 @@ class ClaudeAccountSwitcher:
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
 
@@ -2067,6 +2258,11 @@ class ClaudeAccountSwitcher:
             print(
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
+            )
+            # Re-login to an already-managed account must not hijack the
+            # active pointer either (same CON-438 policy as a fresh add).
+            self._finish_add_activation(
+                account_num, current_email, current_org_uuid, activate
             )
             return
 
@@ -2207,7 +2403,6 @@ class ClaudeAccountSwitcher:
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
@@ -2216,6 +2411,9 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        self._finish_add_activation(
+            account_num, current_email, current_org_uuid, activate
+        )
 
     def add_account_from_token(
         self,

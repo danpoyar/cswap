@@ -1031,6 +1031,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Set a short display alias for the account (use with 'add')",
     )
     parser.add_argument(
+        "--activate",
+        action="store_true",
+        help=(
+            "With 'add': make the added account the live login immediately, "
+            "bypassing the auto-switch drain path (the bypass is logged). "
+            "Without it, add only registers the slot and the active account "
+            "keeps the live login"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -1196,6 +1206,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
+    if args.activate and not args.add_account:
+        parser.error("--activate can only be used with 'add'")
+
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
@@ -1230,7 +1243,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            switcher.add_account(
+                slot=args.slot, alias=args.alias, activate=args.activate
+            )
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
