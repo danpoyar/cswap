@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
@@ -3435,10 +3436,12 @@ class FakePark:
 class TestDrainV2:
     """Drain v2 (CON-433): the engine CREATES the park pause instead of
     waiting for one — checkpoint signal to every mid-turn session, machine
-    confirmation of fixation from the roster (status != busy), swap, verify
-    the new account answers, resume signal. Passive transcript silence (v1)
-    stays the path for at-limit/failover and for every failure of the
-    channel; ``drain2WaitSeconds=0`` (default) keeps v1 behavior bit-for-bit.
+    confirmation of fixation (checkpoint receipt primary; a sustained
+    not-busy roster streak as the soft fallback — CON-461), swap, verify
+    the new account answers, resume signal to the sessions that provably
+    parked. Passive transcript silence (v1) stays the path for
+    at-limit/failover and for every failure of the channel;
+    ``drain2WaitSeconds=0`` (default) keeps v1 behavior bit-for-bit.
     """
 
     _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
@@ -3459,6 +3462,15 @@ class TestDrainV2:
 
     def _reasons(self, h: EngineHarness) -> list[str]:
         return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def _ack(self, h: EngineHarness, name: str, *, at: float | None = None) -> None:
+        """Plant a checkpoint receipt the way the wave text tells agents to
+        (``touch <backup>/drain2-ack/<name>``), dated ``at`` (default: now)."""
+        ack = h.switcher.backup_dir / "drain2-ack" / name
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        ts = h.clock.now if at is None else at
+        os.utime(ack, (ts, ts))
 
     # -- scenario (а): the park writes constantly, v2 still reaches a clean swap
 
@@ -3495,6 +3507,9 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # Both agents follow the wave text: checkpoint receipt, then park.
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
         h.clock.advance(60.0)
         _write_transcript(h, age_s=1.0)  # transcripts NEVER go quiet
         park.roster_value = [
@@ -3510,6 +3525,8 @@ class TestDrainV2:
             "waitedSeconds": 60,
             "fixed": 2,
             "forced": 0,
+            "ackFixed": 2,
+            "softFixed": 0,
         }
         assert not [e for e in h.events if isinstance(e, Drain2TimeoutEvent)]
         verify = next(e for e in h.events if isinstance(e, Drain2VerifyEvent))
@@ -3530,6 +3547,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")  # fix-a checkpoints; fix-b never does
         h.clock.advance(200.0)  # past the 180s fixation cap
         _write_transcript(h, age_s=1.0)
         park.roster_value = [
@@ -3542,6 +3560,7 @@ class TestDrainV2:
         assert warn.human().startswith("WARN")
         assert warn.fixed == ["fix-a"]
         assert warn.forced == ["fix-b"]
+        assert warn.acked == ["fix-a"] and warn.soft == []
         assert warn.waited_seconds == 200
         assert warn.max_wait_seconds == 180
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
@@ -3550,11 +3569,14 @@ class TestDrainV2:
             "waitedSeconds": 200,
             "fixed": 1,
             "forced": 1,
+            "ackFixed": 1,
+            "softFixed": 0,
         }
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
-        # The forced session gets the wave too (CON-451): still mid-task,
-        # the message queues and lands at its next turn boundary.
-        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        # Only the session that provably parked gets the wave (CON-461);
+        # the forced one never stopped — "пауза кончилась" would be noise.
+        assert resume.targets == ["fix-a"]
+        assert resume.unacked == ["fix-b"]
         kinds = h.kinds()
         assert kinds.index("drain2-timeout") < kinds.index("switch")
 
@@ -3635,6 +3657,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(30.0)
         park.roster_value = [
             _park_row("fix-a", status="idle"),
@@ -3650,6 +3673,7 @@ class TestDrainV2:
         names, message = park.waves[-1]
         assert names == ["fix-c"] and message.startswith("cswap drain")
         assert sorted(h.state()["drain2"]["signaled"]) == ["fix-a", "fix-c"]
+        self._ack(h, "fix-c")  # the newcomer checkpoints too
         h.clock.advance(30.0)
         park.roster_value = [
             _park_row("fix-a", status="idle"),
@@ -3659,6 +3683,7 @@ class TestDrainV2:
         assert outcome is TickOutcome.SWITCHED
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.to_json()["drain2"]["fixed"] == 2
+        assert switch.to_json()["drain2"]["ackFixed"] == 2
 
     def test_resume_survives_engine_restart(self, temp_home):
         # Daemon died between the swap and the resume wave: a fresh engine
@@ -3743,6 +3768,7 @@ class TestDrainV2:
             side_effect=collector(self._PROACTIVE),
         ):
             assert h.engine.tick() is TickOutcome.NO_ACTION  # STOP wave out
+            self._ack(h, "fix-a")
             h.clock.advance(30.0)
             park.roster_value = [_park_row("fix-a", status="idle")]
             outcome = h.engine.tick()
@@ -3774,6 +3800,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(30.0)
         park.roster_value = [_park_row("fix-a", status="idle")]
         with patch.object(
@@ -3798,6 +3825,7 @@ class TestDrainV2:
         assert signal.dry_run is True
         assert park.waves == []
         assert h.state() == {}
+        self._ack(h, "fix-a")
         h.clock.advance(30.0)
         park.roster_value = [_park_row("fix-a", status="idle")]
         outcome = h.tick_with_usage(self._PROACTIVE)
@@ -3832,6 +3860,8 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
         h.clock.advance(30.0)
         _write_transcript(h, age_s=400.0)  # transcript-quiet: v1 gate opens
         park.roster_value = [
@@ -3862,6 +3892,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(DRAIN_STALE_GAP_S + 30.0)
         park.roster_value = [_park_row("fix-a", status="idle")]
         below = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
@@ -3901,6 +3932,8 @@ class TestDrainV2:
             "waitedSeconds": 0,
             "fixed": 0,
             "forced": 0,
+            "ackFixed": 0,
+            "softFixed": 0,
         }
         # No wave ever targeted the dead episode's session.
         assert all("long-gone" not in names for names, _ in park.waves)
@@ -3913,26 +3946,38 @@ class TestDrainV2:
     # prescribes ONE self-waking wait channel.
 
     def test_forced_busy_session_is_resumed_after_the_swap(self, temp_home):
-        # Episode 14-08, class 1: all six forced sessions froze AFTER the
-        # swap; the resume wave — built from the pre-swap ``frozen`` snapshot
-        # — never reached them, and Yor woke four of them by hand. The wave
-        # must target every signaled session still holding an open task
-        # (state=working), busy or idle alike: a message to a busy session
-        # queues and lands at its next turn boundary (proved by this very
-        # episode — both STOP waves reached all 8 busy targets).
+        # Episode 14-08, class 1 (CON-451), narrowed by CON-461: sessions
+        # froze AFTER the swap landed — a pre-swap snapshot never reaches
+        # them. The resume targets are re-derived live on every wave, from
+        # the receipts on disk: a late freezer that acks after the swap is
+        # picked up by the retry. (A late freezer that never acks self-wakes
+        # via its marker watch — a wave to it would be guesswork noise.)
         h, park = self._harness(temp_home)
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(200.0)  # past the 180s fixation cap
         _write_transcript(h, age_s=1.0)
         park.roster_value = [
             _park_row("fix-a", status="idle"),
             _park_row("fix-b"),  # forced: still busy when the swap lands
         ]
+        park.wave_results = [
+            WaveResult(ok=False, detail="herald timeout 120s")  # resume fails
+        ]
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
-        assert sorted(resume.targets) == ["fix-a", "fix-b"]
+        assert resume.targets == ["fix-a"]  # the mid-turn worker is not one
+        assert h.state()["drain2"]["phase"] == "swapped"  # retry pending
+        # fix-b checkpoints only now — after the swap, like the episode's
+        # six: the next tick's re-derivation sees the fresh receipt.
+        self._ack(h, "fix-b")
+        h.clock.advance(30.0)
+        below = {"3": _usage(20), "1": _usage(50), "2": _usage(10)}
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        resumes = [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert sorted(resumes[-1].targets) == ["fix-a", "fix-b"]
         assert sorted(park.waves[-1][0]) == ["fix-a", "fix-b"]
         assert "drain2" not in h.state()
 
@@ -3949,6 +3994,10 @@ class TestDrainV2:
         ]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # All three acked — even so, only the open task is ever re-woken.
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
+        self._ack(h, "fix-c")
         h.clock.advance(200.0)
         _write_transcript(h, age_s=1.0)
         park.roster_value = [
@@ -3969,6 +4018,8 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
         h.clock.advance(30.0)
         park.roster_value = [
             _park_row("fix-a", status="idle"),
@@ -3995,6 +4046,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(30.0)
         park.roster_value = [_park_row("fix-a", status="idle")]
         park.wave_results = [WaveResult(ok=False, detail="herald timeout 120s")]
@@ -4034,6 +4086,8 @@ class TestDrainV2:
             "waitedSeconds": 30,
             "fixed": 1,
             "forced": 0,
+            "ackFixed": 1,
+            "softFixed": 0,
         }
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
         assert resume.targets == ["fix-a"]  # busy+working is still woken
@@ -4116,6 +4170,7 @@ class TestDrainV2:
                     "fix-a": {"sessionId": "sid-fix-a"},
                     "fix-b": {"sessionId": "sid-fix-b"},
                 },
+                "acked": ["fix-a", "fix-b"],
                 "resumed": ["fix-a"],
             },
         }))
@@ -4153,6 +4208,7 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
         h.clock.advance(30.0)
         park.roster_value = [_park_row("fix-a", status="idle")]
         park.wave_results = [
@@ -4181,6 +4237,8 @@ class TestDrainV2:
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         _write_transcript(h, age_s=1.0)
         assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
         h.clock.advance(30.0)
         _write_transcript(h, age_s=400.0)  # transcript-quiet: v1 gate opens
         park.roster_value = [
@@ -4194,3 +4252,317 @@ class TestDrainV2:
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
         assert sorted(resume.targets) == ["fix-a", "fix-b"]
         assert "drain2" not in h.state()
+
+    # -- CON-461: fixation is the agent's receipt, not one roster poll.
+    # Episode 14-08 16:41:48–16:44:27Z: fix-age-267 wrote 53 transcript
+    # records without a pause, but one daemon poll landed in the sub-second
+    # turn-boundary gap between two tool calls — the roster answered "not
+    # busy", the judge called it fixed, the account switched under its live
+    # turn, and the resume wave then told the never-paused agent "пауза
+    # кончилась". The receipt (wave step 3) is the fixation proof; the
+    # roster alone fixes only via a sustained not-busy STREAK, marked soft.
+
+    def test_working_session_without_receipt_is_never_fixed_by_one_poll(
+        self, temp_home
+    ):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-age-267")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # The poll lands between two tool calls: not busy for a moment.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-age-267", status="idle")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1  # never switched off a single blip
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        # Next poll it is visibly mid-turn again: the streak resets.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-age-267")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # Two more blips after the reset (streak 2 of 3): still holding.
+        for _ in range(2):
+            h.clock.advance(30.0)
+            _write_transcript(h, age_s=1.0)
+            park.roster_value = [_park_row("fix-age-267", status="idle")]
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        # The cap lands with the agent visibly mid-turn and unproven: it is
+        # FORCED with the proof breakdown saying so — never "fixed" — and
+        # the resume wave has nobody to wake (no receipt = nobody parked).
+        h.clock.advance(60.0)  # 180s: the fixation cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-age-267")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        warn = next(e for e in h.events if isinstance(e, Drain2TimeoutEvent))
+        assert warn.forced == ["fix-age-267"]
+        assert warn.fixed == [] and warn.acked == [] and warn.soft == []
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        drain2 = switch.to_json()["drain2"]
+        assert drain2["fixed"] == 0 and drain2["forced"] == 1
+        assert drain2["ackFixed"] == 0 and drain2["softFixed"] == 0
+        assert not any(
+            msg == DRAIN2_RESUME_MESSAGE and "fix-age-267" in names
+            for names, msg in park.waves
+        )
+
+    def test_roster_streak_soft_fixes_a_silent_session_without_receipt(
+        self, temp_home, caplog
+    ):
+        # No receipt (the agent died, or never ran the wave's step 3): the
+        # roster stays the coarse fallback, but only a STREAK counts — 3
+        # consecutive not-busy polls at the engine's ≥30s cadence is a
+        # ≥60s sustained turn boundary, which no between-tools blip (доли
+        # секунды) can fake. The fixation is marked soft in the event
+        # fields and said out loud in the log.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            for _ in range(2):
+                h.clock.advance(30.0)
+                _write_transcript(h, age_s=1.0)
+                assert (
+                    h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+                )
+            h.clock.advance(30.0)
+            _write_transcript(h, age_s=1.0)
+            outcome = h.tick_with_usage(self._PROACTIVE)
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 90,
+            "fixed": 1,
+            "forced": 0,
+            "ackFixed": 0,
+            "softFixed": 1,
+        }
+        assert "soft" in caplog.text and "fix-a" in caplog.text
+        # A soft fixation is not a parked agent: nobody left a receipt, so
+        # the resume wave has no targets — a genuinely frozen no-receipt
+        # session self-wakes via its marker watch / the self-rescue clause.
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == []
+        assert not any(msg == DRAIN2_RESUME_MESSAGE for _, msg in park.waves)
+
+    def test_stale_receipt_plus_roster_blip_never_fixes(self, temp_home):
+        # The acceptance pair from CON-461: a receipt of a PREVIOUS episode
+        # (mtime before this episode's start) must not count — and with the
+        # receipt path closed, one roster blip must not fix either. On the
+        # pre-fix code the roster branch answered first, so exactly this
+        # combination (stale receipt + momentary idle) sailed through.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # Planted AFTER the signal wave's own cleanup, dated BEFORE the
+        # episode start: a leftover from a past episode.
+        self._ack(h, "fix-a", at=h.clock.now - 100.0)
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]  # the blip
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        # A receipt of THIS episode fixes on the very next poll — even
+        # with the session reading busy behind its own background watch.
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        drain2 = switch.to_json()["drain2"]
+        assert drain2["ackFixed"] == 1 and drain2["softFixed"] == 0
+
+    def test_no_swap_candidate_releases_the_park(self, temp_home):
+        # Live hole 14-08 17:10–17:13Z (found by Yor, CON-461 add-on): the
+        # gate reached its swap decision, but every candidate was exhausted
+        # — and the resume, which only ever followed a swap, went to
+        # NOBODY. The episode stayed open and the park stood parked until a
+        # manual wake. An episode that cannot swap must machine-release the
+        # parked sessions with an honest "no swap is coming" wave and close.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")  # fix-a parks; fix-b keeps working
+        h.clock.advance(200.0)  # past the 180s cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),
+        ]
+        # Every candidate hit 100% during the pause: nobody to switch to.
+        exhausted = {"1": _usage(96), "2": _usage(100), "3": _usage(100)}
+        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        assert h.active_number() == 1  # no switch happened
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]  # the parked one is released
+        assert resume.unacked == ["fix-b"]
+        assert "released without a swap" in resume.reason
+        names, message = park.waves[-1]
+        assert names == ["fix-a"]
+        assert "своп НЕ случился" in message
+        assert "drain2" not in h.state()  # episode closed
+        # And the next ticks do NOT re-signal a fresh pause into the
+        # just-released park while there is still nobody to switch to.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        h.events.clear()
+        waves_before = len(park.waves)
+        h.tick_with_usage(exhausted)
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert len(park.waves) == waves_before
+        # The release backoff survives the process (review r1 finding 1):
+        # the episode record shares the state file across cron ``--once``
+        # ticks and daemon restarts, so the backoff must too — a fresh
+        # engine must not re-signal a pause either.
+        assert h.state()["drain2ReleaseUntil"] > h.clock.now
+        h.engine = h._make_engine(park=park)
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        h.events.clear()
+        h.tick_with_usage(exhausted)
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert len(park.waves) == waves_before
+
+    def test_no_qualifying_candidate_releases_the_park_too(self, temp_home):
+        # Same hole, the exact reason string of the live log: candidates
+        # exist but none qualifies (all above the threshold, none at 100%).
+        # A retryable block still must not keep the park frozen — release
+        # now; if a candidate recovers while the account is still over the
+        # threshold, a fresh episode re-signals after the release backoff.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        reasons = self._reasons(h)
+        assert reasons[-1] == "no-qualifying-candidate"
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert park.waves[-1][0] == ["fix-a"]
+        assert "drain2" not in h.state()
+
+    def test_rapid_ticks_never_soft_fix_within_one_turn_boundary(
+        self, temp_home
+    ):
+        # Review r1 finding 2: wake()/TUI edits and settings.json changes
+        # slice the inter-tick sleep, so ticks can land seconds apart —
+        # three rapid not-busy glances inside ONE stretched turn boundary
+        # must not add up to a soft fixation. Only observations spaced
+        # ≥DRAIN2_SOFT_FIX_MIN_GAP_S from the previous gate poll count;
+        # a properly spaced streak still fixes.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        for _ in range(3):  # rapid ticks, 1s apart: none of them counts
+            h.clock.advance(1.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1  # three rapid glances fixed nothing
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        for _ in range(2):  # properly spaced polls start counting
+            h.clock.advance(30.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"]["softFixed"] == 1
+
+    def test_resume_with_unreadable_roster_wakes_the_acked_set(
+        self, temp_home
+    ):
+        # Roster down at resume time: wake everyone who provably parked
+        # rather than nobody — and report the never-acked honestly (they
+        # are state-file knowledge, no roster needed; review r1 nit).
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 100.0,
+                "updatedAt": h.clock.now - 30.0,
+                "swappedAt": h.clock.now - 30.0,
+                "to": "3",
+                "verified": True,
+                "signaled": {
+                    "fix-a": {"sessionId": "sid-a"},
+                    "fix-b": {"sessionId": "sid-b"},
+                },
+                "acked": ["fix-a"],
+            },
+        }))
+        park.roster_value = None
+        outcome = h.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert resume.unacked == ["fix-b"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+        assert "drain2" not in h.state()
+
+    def test_transient_switch_failure_keeps_the_episode(self, temp_home):
+        # The boundary of the release: a transient freshen failure retries
+        # next tick with the episode intact (an orderly pause must not be
+        # thrown away on a network blip) — pinned so the release never
+        # swallows this path.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="transient"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.ERROR
+        assert h.state()["drain2"]["phase"] == "signaled"
+        assert not [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+
+    def test_resume_wave_targets_only_the_acked(self, temp_home):
+        # Point 3 of CON-461: the resume wave goes to sessions that really
+        # parked (receipt on disk, task still open) — not to every signaled
+        # name. fix-b never acked and hammered through the cap: "пауза
+        # кончилась, продолжай" to an agent that never stopped is the
+        # episode's exact noise.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")  # fix-a checkpoints and parks
+        h.clock.advance(200.0)  # past the 180s cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),  # forced: worked through the whole episode
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        warn = next(e for e in h.events if isinstance(e, Drain2TimeoutEvent))
+        assert warn.acked == ["fix-a"] and warn.soft == []
+        assert warn.forced == ["fix-b"]
+        assert "receipt" in warn.human()
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert resume.unacked == ["fix-b"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)

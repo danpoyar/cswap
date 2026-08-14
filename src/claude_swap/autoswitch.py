@@ -140,6 +140,32 @@ DRAIN2_BACKOFF_S = 600.0
 # fixation judge see through that.
 DRAIN2_SWITCH_MARKER_NAME = "drain2-last-switch"
 DRAIN2_ACK_DIR_NAME = "drain2-ack"
+# Fixation proof (CON-461). The receipt is PRIMARY: the roster's "not busy"
+# can be a sub-second turn-boundary blip between two tool calls, and one
+# poll landing in it reads a hard-working session as checkpointed (episode
+# 14-08 16:41–16:44Z: fix-age-267 wrote 53 transcript records without a
+# pause, one blip poll filed it "fixed", and the account switched under its
+# live turn). A session with no receipt soft-fixes only after this many
+# CONSECUTIVE not-busy polls. At the gate's poll spacing (the ~30s tick
+# interval; 60s for cron --once) 3 polls are a ≥60s sustained turn
+# boundary, which no sub-second blip can fake: at the episode's own cadence
+# (a tool round per ~3s) even a generous 10%-per-poll blip chance compounds
+# to ~0.1%, and 3 — unlike 2 — also breaks the phase-lock of an agent whose
+# ~30s tool rounds could land every poll on a boundary. Cost side: a
+# genuinely parked-but-receiptless session still soft-confirms in ~90s,
+# inside the 180s production cap, and compliant sessions ack and fix
+# instantly — the streak only prices non-compliant or dead ones.
+DRAIN2_SOFT_FIX_POLLS = 3
+# The streak's "consecutive" is a time claim, so it needs a floor (review
+# r1 finding 2): wake()/TUI edits and settings.json changes slice the
+# inter-tick sleep, and three rapid glances seconds apart would collect a
+# "streak" inside ONE stretched turn boundary of a working session. A
+# not-busy observation closer than this to the episode's previous gate
+# poll neither grows nor resets the streak; a busy observation resets at
+# any spacing — work is proof at any distance. 20s sits under the ~30s
+# tick interval (with its −10% jitter) so every normally-cadenced poll
+# still counts.
+DRAIN2_SOFT_FIX_MIN_GAP_S = 20.0
 
 # Wave texts. The park's agents work in Russian; industry terms stay
 # English. ``DRAIN2_STOP_MESSAGE`` is a template — the engine bakes in the
@@ -180,6 +206,15 @@ DRAIN2_RESUME_MESSAGE = (
     "cswap drain-resume: аккаунт переключён, пауза кончилась — продолжай "
     "работу с места остановки. Если ты уже продолжил сам — считай это "
     "подтверждением, повторно ничего не делай."
+)
+# The honest wave for an episode released WITHOUT a swap (CON-461, live
+# hole 14-08 17:10–17:13Z): telling a parked agent "аккаунт переключён"
+# when no switch happened would be a lie it might act on.
+DRAIN2_RELEASE_MESSAGE = (
+    "cswap drain-resume: своп НЕ случился (переключаться некуда) — пауза "
+    "отменена, продолжай работу с места остановки на текущем аккаунте. "
+    "Если ты уже продолжил сам — считай это подтверждением, повторно "
+    "ничего не делай."
 )
 
 # How often a sleeping loop re-stats settings.json. Every tick re-reads the
@@ -395,11 +430,18 @@ class SwitchEvent(AutoSwitchEvent):
             waited = self.drain2.get("waitedSeconds")
             fixed = self.drain2.get("fixed")
             forced = self.drain2.get("forced")
+            ack_n = self.drain2.get("ackFixed")
+            soft_n = self.drain2.get("softFixed")
+            proof = (
+                f" (receipt {ack_n}, soft {soft_n})"
+                if ack_n is not None and soft_n is not None
+                else ""
+            )
             if self.drain2.get("outcome") == "ready":
-                tail += f", checkpointed {fixed} session(s) in {waited}s"
+                tail += f", checkpointed {fixed} session(s){proof} in {waited}s"
             else:
                 tail += (
-                    f", checkpoint cap at {waited}s: {fixed} fixed, "
+                    f", checkpoint cap at {waited}s: {fixed} fixed{proof}, "
                     f"{forced} forced"
                 )
         return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate}{tail})"
@@ -493,6 +535,10 @@ class Drain2TimeoutEvent(AutoSwitchEvent):
     max_wait_seconds: int
     fixed: list[str] = field(default_factory=list)
     forced: list[str] = field(default_factory=list)
+    # Proof breakdown of ``fixed`` (CON-461): who left a checkpoint receipt
+    # vs who was soft-fixed by a sustained not-busy roster streak. Additive.
+    acked: list[str] = field(default_factory=list)
+    soft: list[str] = field(default_factory=list)
 
     def _fields(self) -> dict:
         return {
@@ -501,13 +547,16 @@ class Drain2TimeoutEvent(AutoSwitchEvent):
             "maxWaitSeconds": self.max_wait_seconds,
             "fixed": self.fixed,
             "forced": self.forced,
+            "acked": self.acked,
+            "soft": self.soft,
         }
 
     def human(self) -> str:
         return (
             f"WARN: {len(self.forced)} session(s) never checkpointed in "
             f"{self.max_wait_seconds}s ({', '.join(self.forced)}) — "
-            f"{self.trigger} switch proceeds, {len(self.fixed)} fixed"
+            f"{self.trigger} switch proceeds, {len(self.fixed)} fixed "
+            f"(receipt {len(self.acked)}, soft-by-roster {len(self.soft)})"
         )
 
 
@@ -548,12 +597,17 @@ class Drain2ResumeEvent(AutoSwitchEvent):
     # Why this resume happened outside the happy path (e.g. the episode was
     # abandoned by a switch of another trigger). Additive.
     reason: str = ""
+    # Signaled sessions with an open task but NO checkpoint receipt — left
+    # out of the wave on purpose (CON-461): they either never paused (the
+    # wave would be noise mid-turn) or self-wake via their marker watch.
+    unacked: list[str] = field(default_factory=list)
 
     def _fields(self) -> dict:
         fields = {
             "targets": self.targets,
             "delivered": self.delivered,
             "skipped": self.skipped,
+            "unacked": self.unacked,
         }
         if self.reason:
             fields["reason"] = self.reason
@@ -561,6 +615,10 @@ class Drain2ResumeEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         tail = f" [{self.reason}]" if self.reason else ""
+        if self.unacked:
+            tail += (
+                f"; {len(self.unacked)} without receipt left to self-wake"
+            )
         if self.skipped and self.targets:
             # The wave was attempted and failed — not the same as skipped.
             return (
@@ -860,6 +918,16 @@ class AutoSwitchEngine:
         # Set after a channel failure: until then, drain v2 stands down and
         # forced proactive switches take the passive v1 drain.
         self._park_backoff_until = 0.0
+        # Set after an episode is released without a swap (no candidate to
+        # switch to — CON-461): without it the next tick would re-signal a
+        # fresh pause into the just-released park and thrash STOP/release
+        # every interval for as long as no candidate exists. Unlike the
+        # channel backoff this one guards a HEALTHY channel, so it must
+        # survive the process: the truth lives in the state file
+        # (``drain2ReleaseUntil``, review r1 finding 1) — this field is the
+        # in-process mirror, and the only copy under dry-run (which never
+        # writes state).
+        self._drain2_release_until = 0.0
 
     # -- state file ---------------------------------------------------------
 
@@ -1386,6 +1454,7 @@ class AutoSwitchEngine:
             # re-polling at full cadence.
             self._blocked_wait_long = True
             self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._drain2_release(drain2, "no accounts to switch to")
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
@@ -1451,6 +1520,7 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
+                self._drain2_release(drain2, "no candidate has provable headroom")
                 return TickOutcome.BLOCKED
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
@@ -1503,6 +1573,7 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
+                self._drain2_release(drain2, "no qualifying candidate")
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
             earliest = self._earliest_recovery(usage)
@@ -1517,6 +1588,7 @@ class AutoSwitchEngine:
                     )
                 )
             )
+            self._drain2_release(drain2, "every candidate exhausted")
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
@@ -1567,6 +1639,9 @@ class AutoSwitchEngine:
             return self._perform_with_drain2(num, email, trigger, drain, drain2)
 
         if transient_failure:
+            # Deliberately NO release: the episode survives and the next
+            # tick retries the swap — an orderly pause must not be thrown
+            # away on a network blip.
             self._emit(
                 ErrorEvent(
                     message="could not freshen any candidate (network?)",
@@ -1575,6 +1650,7 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
+        self._drain2_release(drain2, "every ranked target failed to freshen")
         return TickOutcome.BLOCKED
 
     def _rank_candidates(
@@ -1819,7 +1895,7 @@ class AutoSwitchEngine:
         """Perform the switch, then complete any drain-v2 episode behind it
         (mark swapped → verify the new account → resume wave). A failed
         switch leaves the episode in place, so the retry keeps its label
-        and its frozen list."""
+        and its fixation bookkeeping (acked/soft/streaks)."""
         outcome = self._perform(number, email, trigger, drain=drain, drain2=drain2)
         if outcome is TickOutcome.SWITCHED and drain2 is not None:
             self._drain2_mark_swapped(number)
@@ -2065,13 +2141,39 @@ class AutoSwitchEngine:
         couple of minutes of orderly pause. At-limit and failover mean calls
         are already failing (or the account is dead) — orchestrating a pause
         spends time the park doesn't have, so they keep the passive drain.
-        A recent channel failure also stands v2 down (see DRAIN2_BACKOFF_S).
+        A recent channel failure stands v2 down (see DRAIN2_BACKOFF_S), and
+        so does a recent no-swap release (CON-461): pausing the park again
+        while there is still nobody to switch to would thrash it.
         """
+        now = self.clock()
         return (
             trigger == "proactive"
             and self.settings.drain2_wait_seconds > 0
-            and self.clock() >= self._park_backoff_until
+            and now >= self._park_backoff_until
+            and not self._drain2_release_backoff_active(now)
         )
+
+    def _drain2_release_backoff_active(self, now: float) -> bool:
+        """Whether a no-swap release recently stood v2 down.
+
+        The truth is in the state file: the episode record itself lives
+        there precisely so cron ``--once`` ticks and daemon restarts share
+        it — a backoff that died with the process would let every fresh
+        process re-signal a pause into the just-released park and thrash
+        it in 180s-pause cycles for as long as no candidate exists
+        (review r1 finding 1). The in-memory mirror answers for dry-run
+        (which never touches state) and skips the file read once this
+        process has seen the value.
+        """
+        if now < self._drain2_release_until:
+            return True
+        if self.dry_run:
+            return False
+        value = self._read_state().get("drain2ReleaseUntil")
+        if isinstance(value, (int, float)) and now < value:
+            self._drain2_release_until = value
+            return True
+        return False
 
     def _park_channel(self) -> ParkChannel:
         if self._park is None:
@@ -2242,11 +2344,16 @@ class AutoSwitchEngine:
 
         The episode lives in the state file under ``drain2`` (in memory for
         dry-run) so cron ``--once`` ticks and daemon restarts share it.
-        Fixation is machine state, not a timer: a signaled session is fixed
-        when the roster shows it not ``busy`` (turn boundary) or gone.
-        ``frozen`` — fixed sessions parked with their task open (``status
-        idle`` + ``state working``) — is who the post-swap resume wave
-        wakes; sessions that finished outright must not be re-woken.
+        Fixation is proof, not a timer and not one glance (CON-461): a
+        signaled session is fixed when it left a checkpoint receipt for
+        THIS episode (primary — the agent's own word, visible through the
+        ``busy`` its background watch causes), or SOFTLY when the roster
+        shows it not ``busy`` for DRAIN2_SOFT_FIX_POLLS consecutive polls
+        (the fallback for sessions that never acked; a single poll is
+        routinely a turn-boundary blip of a session that never paused).
+        The record's ``acked`` list is who the post-swap resume wave may
+        wake — sessions that provably parked; receiptless sessions are
+        never re-woken.
         """
         now = self.clock()
         max_wait = self.settings.drain2_wait_seconds
@@ -2299,6 +2406,8 @@ class AutoSwitchEngine:
                     "waitedSeconds": 0,
                     "fixed": 0,
                     "forced": 0,
+                    "ackFixed": 0,
+                    "softFixed": 0,
                 }
             names = sorted(s.name for s in targets)
             if not self.dry_run:
@@ -2365,51 +2474,84 @@ class AutoSwitchEngine:
             )
 
         started = record["startedAt"]
-
-        def is_fixed(name: str) -> bool:
-            # Roster says not-busy — or the session left a checkpoint
-            # receipt: an agent holding its background swap-watch (the wave
-            # text's own protocol) reads as ``busy`` forever, and without
-            # the receipt it could never be counted (CON-451).
+        # Fixation proof (CON-461). The receipt is primary: the agent's own
+        # word that it checkpointed, visible through any ``busy`` its
+        # background watch causes (CON-451). The roster alone counts only
+        # as a sustained not-busy STREAK — one poll is routinely the
+        # sub-second gap between two tool calls of a session that never
+        # paused, and the 14-08 episode swapped under fix-age-267's live
+        # turn on exactly that misreading. A busy observation resets the
+        # streak; the counters persist in the record so cron ``--once``
+        # ticks share them.
+        prev_streaks = record.get("notBusy")
+        prev_streaks = prev_streaks if isinstance(prev_streaks, dict) else {}
+        # Only an observation far enough from this episode's previous gate
+        # poll counts toward the streak: rapid ticks (TUI wake, settings
+        # edits slicing the sleep) would otherwise collect 3 "consecutive"
+        # not-busy glances inside ONE stretched turn boundary (review r1
+        # finding 2). Too-soon not-busy keeps the streak as is; busy
+        # resets at any spacing — work is proof at any distance.
+        spaced = now - record["updatedAt"] >= DRAIN2_SOFT_FIX_MIN_GAP_S
+        streaks: dict[str, int] = {}
+        acked: list[str] = []
+        soft: list[str] = []
+        unfixed: list[str] = []
+        for name in sorted(signaled):
+            if self._drain2_acked(name, since=started):
+                acked.append(name)
+                continue
             row = by_name.get(name)
-            if row is None or not row.executing:
-                return True
-            return self._drain2_acked(name, since=started)
-
-        fixed = sorted(n for n in signaled if is_fixed(n))
-        unfixed = sorted(n for n in signaled if not is_fixed(n))
-        frozen = sorted(
-            n
-            for n in fixed
-            if (row := by_name.get(n)) is not None
-            and row.status == "idle"
-            and row.state == "working"
-        )
+            if row is not None and row.executing:
+                streaks[name] = 0
+                unfixed.append(name)
+                continue
+            prev = prev_streaks.get(name)
+            prev = prev if isinstance(prev, int) and prev >= 0 else 0
+            streak = prev + 1 if spaced else prev
+            streaks[name] = streak
+            if streak >= DRAIN2_SOFT_FIX_POLLS:
+                if spaced and streak == DRAIN2_SOFT_FIX_POLLS:
+                    _logger.info(
+                        "drain2: %s fixed softly — no receipt, roster "
+                        "not-busy %d polls in a row",
+                        name,
+                        streak,
+                    )
+                soft.append(name)
+            else:
+                unfixed.append(name)
+        fixed = sorted(acked + soft)
         waited = now - record["startedAt"]
         if not unfixed:
             self._write_drain2({
                 **record,
                 "signaled": signaled,
                 "updatedAt": now,
-                "frozen": frozen,
+                "notBusy": streaks,
+                "acked": acked,
+                "soft": soft,
             })
             return "proceed", {
                 "outcome": "ready",
                 "waitedSeconds": int(waited),
                 "fixed": len(fixed),
                 "forced": 0,
+                "ackFixed": len(acked),
+                "softFixed": len(soft),
             }
         if waited < max_wait:
             self._write_drain2({
                 **record,
                 "signaled": signaled,
                 "updatedAt": now,
+                "notBusy": streaks,
             })
             self._emit(
                 NoSwitchEvent(
                     reason="drain2-wait",
                     detail=(
-                        f"checkpointed {len(fixed)}/{len(signaled)}; waited "
+                        f"checkpointed {len(fixed)}/{len(signaled)} "
+                        f"(receipt {len(acked)}, soft {len(soft)}); waited "
                         f"{waited:.0f}s of {max_wait:.0f}s"
                     ),
                 )
@@ -2426,13 +2568,17 @@ class AutoSwitchEngine:
                     max_wait_seconds=int(max_wait),
                     fixed=fixed,
                     forced=unfixed,
+                    acked=acked,
+                    soft=soft,
                 )
             )
         self._write_drain2({
             **record,
             "signaled": signaled,
             "updatedAt": now,
-            "frozen": frozen,
+            "notBusy": streaks,
+            "acked": acked,
+            "soft": soft,
             "timeoutWarned": True,
         })
         return "proceed", {
@@ -2440,6 +2586,8 @@ class AutoSwitchEngine:
             "waitedSeconds": int(waited),
             "fixed": len(fixed),
             "forced": len(unfixed),
+            "ackFixed": len(acked),
+            "softFixed": len(soft),
         }
 
     def _drain2_mark_swapped(self, number: str) -> None:
@@ -2511,61 +2659,119 @@ class AutoSwitchEngine:
         self._drain2_resume_wave(record, reason=reason)
         self._write_drain2(None)
 
-    def _drain2_resume_targets(self, record: dict) -> list[str] | None:
-        """Live resume targets: every signaled session still holding an open
-        task (``state=working``) — busy and idle alike.
+    def _drain2_acked_set(self, record: dict) -> set[str]:
+        """Names that provably parked for this episode: a live receipt
+        (mtime after the episode start — also catches agents that acked
+        after the swap landed), plus the ``acked`` list judged at proceed
+        time (survives receipt files vanishing afterwards). A record
+        written by a pre-CON-461 engine carries no ``acked`` key; its
+        closest equivalent is the legacy ``frozen`` snapshot, honored so a
+        deploy never strands an episode already in flight."""
+        signaled = {
+            n for n in (record.get("signaled") or {}) if isinstance(n, str)
+        }
+        started = record.get("startedAt")
+        since = started if isinstance(started, (int, float)) else 0.0
+        acked = {n for n in signaled if self._drain2_acked(n, since=since)}
+        acked |= {
+            n
+            for n in (record.get("acked") or [])
+            if isinstance(n, str) and n in signaled
+        }
+        if "acked" not in record:
+            acked |= {
+                n
+                for n in (record.get("frozen") or [])
+                if isinstance(n, str) and n in signaled
+            }
+        return acked
 
-        The first live episode (CON-451) buried the idle-only filter: a
-        session frozen behind its own background task (the wave text's swap
-        watch, a local test suite) reads ``busy`` in the roster forever, and
-        a genuinely mid-turn session just queues the message until its next
-        turn boundary — both STOP waves of that episode reached all 8 busy
-        targets. Sessions that finished (done/failed/stopped, or gone from
-        the roster) are never re-woken: a message to a completed background
-        session would respawn it. Returns None when the roster is unreadable.
+    def _drain2_resume_targets(
+        self, record: dict
+    ) -> tuple[list[str], list[str]] | None:
+        """Live resume targets, and who stays out of the wave on purpose.
+
+        Targets: sessions that provably parked — checkpoint receipt for
+        this episode (``_drain2_acked_set``) — and still hold an open task
+        (``state=working``), busy and idle alike. The first live episode
+        (CON-451) buried the idle-only filter: a session frozen behind its
+        own background task (the wave text's swap watch, a local test
+        suite) reads ``busy`` in the roster forever, and a genuinely
+        mid-turn session just queues the message until its next turn
+        boundary. Sessions that finished (done/failed/stopped, or gone
+        from the roster) are never re-woken: a message to a completed
+        background session would respawn it.
+
+        Signaled sessions WITHOUT a receipt are not woken (CON-461): they
+        either never paused — the 14-08 episode told fix-age-267 «пауза
+        кончилась» while it had worked through the whole episode — or
+        parked without acking, and those self-wake via their marker watch
+        or the wave text's self-rescue clause. The second list returned is
+        exactly those left-out open-task sessions, for the event's
+        honesty. Returns None when the roster is unreadable.
         """
         signaled = sorted(
             n for n in (record.get("signaled") or {}) if isinstance(n, str)
         )
+        acked = self._drain2_acked_set(record)
         roster = self._park_roster()
         if roster is None:
             return None
         by_name = {s.name: s for s in roster}
-        return [
+        open_task = [
             n
             for n in signaled
             if (row := by_name.get(n)) is not None
             and row.state in (None, "working")
         ]
+        return (
+            [n for n in open_task if n in acked],
+            [n for n in open_task if n not in acked],
+        )
 
     def _drain2_resume_wave(
-        self, record: dict, *, reason: str = ""
+        self,
+        record: dict,
+        *,
+        reason: str = "",
+        message: str = DRAIN2_RESUME_MESSAGE,
     ) -> tuple[list[str], WaveResult | None]:
         """Send the resume wave for an episode and emit the event.
 
         Targets are derived live (``_drain2_resume_targets``), minus names a
         previous wave of this episode already confirmed (``resumed``). When
-        the roster can't answer, every signaled session is woken rather than
-        none (a message to a busy session just queues; a frozen one left
-        behind stays frozen). Returns ``(targets, wave)`` for the caller's
-        retry bookkeeping; ``wave=None`` means nothing was sent (dry-run, or
+        the roster can't answer, every session that provably parked (the
+        acked set — readable without a roster) is woken rather than none
+        (a message to a busy session just queues; a frozen one left behind
+        stays frozen). Returns ``(targets, wave)`` for the caller's retry
+        bookkeeping; ``wave=None`` means nothing was sent (dry-run, or
         nobody left to wake).
         """
         already = {n for n in (record.get("resumed") or []) if isinstance(n, str)}
-        targets = self._drain2_resume_targets(record)
-        if targets is None:
-            frozen = [
-                n for n in (record.get("frozen") or []) if isinstance(n, str)
-            ]
-            targets = frozen or sorted(
-                n for n in (record.get("signaled") or {}) if isinstance(n, str)
+        live = self._drain2_resume_targets(record)
+        if live is None:
+            # Roster unreadable: who is still open-task can't be judged,
+            # but "signaled and never acked" is state-file knowledge —
+            # report it rather than a false "nobody left out" (review r1
+            # nit).
+            acked_set = self._drain2_acked_set(record)
+            targets = sorted(acked_set)
+            unacked = sorted(
+                {
+                    n
+                    for n in (record.get("signaled") or {})
+                    if isinstance(n, str)
+                }
+                - acked_set
             )
+        else:
+            targets, unacked = live
         targets = [n for n in targets if n not in already]
         if self.dry_run:
             self._emit(
                 Drain2ResumeEvent(
                     targets=targets, delivered=[], skipped="dry-run",
-                    reason=reason,
+                    reason=reason, unacked=unacked,
                 )
             )
             return targets, None
@@ -2574,26 +2780,72 @@ class AutoSwitchEngine:
                 Drain2ResumeEvent(
                     targets=[], delivered=[],
                     skipped=(
-                        "already resumed" if already else "no frozen sessions"
+                        "already resumed"
+                        if already
+                        else "nobody acked a checkpoint"
                     ),
-                    reason=reason,
+                    reason=reason, unacked=unacked,
                 )
             )
             return [], None
-        wave = self._drain2_wave(targets, DRAIN2_RESUME_MESSAGE)
+        wave = self._drain2_wave(targets, message)
         self._emit(
             Drain2ResumeEvent(
                 targets=targets,
                 delivered=wave.delivered if wave.ok else None,
                 skipped="" if wave.ok else f"resume wave failed: {wave.detail}",
-                reason=reason,
+                reason=reason, unacked=unacked,
             )
         )
         return targets, wave
 
+    def _drain2_release(self, drain2: dict | None, reason: str) -> None:
+        """The gate said "swap now" but the swap cannot happen for a
+        non-transient reason (nobody to switch to): release the park and
+        close the episode instead of holding it open.
+
+        Live hole 14-08 17:10–17:13Z (CON-461, add-on): the episode hit its
+        cap, every candidate was exhausted, and the resume — which only
+        ever followed a swap — went to nobody; the record stayed open and
+        the park stood parked until a manual wake. The wave says honestly
+        that no swap happened (``DRAIN2_RELEASE_MESSAGE``), targets the
+        sessions that provably parked (the same acked-only law as every
+        resume), and the record is dropped regardless of wave health —
+        parked agents keep their bounded self-rescue either way, which is
+        strictly better than today's nothing. A release backoff then keeps
+        v2 from re-signaling a fresh pause while there is still nobody to
+        switch to. Transient freshen failures do NOT release: they retry
+        next tick with the episode intact, so an orderly pause isn't wasted
+        on a network blip.
+        """
+        if drain2 is None:
+            return
+        record = self._read_drain2()
+        if record is None or record.get("phase") != "signaled":
+            return
+        self._drain2_resume_wave(
+            record,
+            reason=f"released without a swap: {reason}",
+            message=DRAIN2_RELEASE_MESSAGE,
+        )
+        until = self.clock() + DRAIN2_BACKOFF_S
+        if self.dry_run:
+            self._drain2_mem = None
+        else:
+            # One atomic state write: close the episode and persist the
+            # backoff together, so a crash between the two can't leave a
+            # released park with no backoff (or vice versa).
+            def close_and_backoff(state: dict) -> None:
+                state.pop("drain2", None)
+                state["drain2ReleaseUntil"] = until
+
+            self._mutate_state(close_and_backoff)
+        self._drain2_release_until = until
+
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
-        answers, then wake every signaled session still mid-task.
+        answers, then wake the sessions that provably parked (checkpoint
+        receipt) and still hold an open task.
 
         Runs right after the swap and again at the top of every tick, so a
         daemon restart or a cron ``--once`` handover finishes the resume
