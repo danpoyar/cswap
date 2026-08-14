@@ -52,6 +52,11 @@ Log in with another account, then:
 cswap add
 ```
 
+`add` only registers the account: the previously active account gets the live
+login back, so running sessions (and their warm prompt cache) are not swapped
+mid-flight — rotation onto the new account happens through `switch`/auto-switch.
+Pass `--activate` to consciously make the new account live right away.
+
 ### Switch accounts
 
 Rotate to the next account:
@@ -197,6 +202,7 @@ cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
+cswap add --activate            # Add and make it the live login immediately (logged bypass)
 cswap remove 2                  # Remove an account
 cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
 cswap enable 2                  # Return a disabled account to rotation

@@ -88,6 +88,24 @@ read in one sitting.
   prove the channel with one live wave (herald → a busy bypass background
   session: message delivered, not held). Claude-Code-specific by
   construction (roster + messaging surfaces); not upstream material.
+- `add` registers without activating (CON-438): upstream's `add` records the
+  freshly captured login as the active account — but `add` runs right after a
+  `claude /login` that already replaced the live credential, so on a fleet it
+  IS an account swap under every running session, outside both drain paths
+  above (live episode 2026-08-14: drain of #27 in progress, `cswap add` made
+  fresh #29 active with no `switch` event; ~10 agents cold-started their
+  prompt cache at once). Now `add` snapshots the new login into its slot and
+  writes the recorded active account's stored login back over the live one
+  (same lock set and oauthAccount splice as a switch; no stash needed — the
+  displaced credential was just backed up into its slot), leaving
+  `activeAccountNumber` untouched; the new slot waits as a rotation
+  candidate. Re-login to an already-managed account keeps the same rule. The
+  fresh login still becomes active when there is nothing to protect (first
+  account, re-add of the active account itself) or nothing to restore
+  (unreadable backup — honest state wins, with a warning), and
+  `cswap add --activate` is the conscious immediate swap, logged as a drain
+  bypass. Upstream-relevant in spirit, but the motivation is fleet-shaped;
+  offer after it survives here.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a
