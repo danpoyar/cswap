@@ -156,6 +156,16 @@ DRAIN2_ACK_DIR_NAME = "drain2-ack"
 # inside the 180s production cap, and compliant sessions ack and fix
 # instantly — the streak only prices non-compliant or dead ones.
 DRAIN2_SOFT_FIX_POLLS = 3
+# The streak's "consecutive" is a time claim, so it needs a floor (review
+# r1 finding 2): wake()/TUI edits and settings.json changes slice the
+# inter-tick sleep, and three rapid glances seconds apart would collect a
+# "streak" inside ONE stretched turn boundary of a working session. A
+# not-busy observation closer than this to the episode's previous gate
+# poll neither grows nor resets the streak; a busy observation resets at
+# any spacing — work is proof at any distance. 20s sits under the ~30s
+# tick interval (with its −10% jitter) so every normally-cadenced poll
+# still counts.
+DRAIN2_SOFT_FIX_MIN_GAP_S = 20.0
 
 # Wave texts. The park's agents work in Russian; industry terms stay
 # English. ``DRAIN2_STOP_MESSAGE`` is a template — the engine bakes in the
@@ -911,9 +921,12 @@ class AutoSwitchEngine:
         # Set after an episode is released without a swap (no candidate to
         # switch to — CON-461): without it the next tick would re-signal a
         # fresh pause into the just-released park and thrash STOP/release
-        # every interval for as long as no candidate exists. Like the
-        # channel backoff, in-process only (cron ``--once`` retries are
-        # one-per-minute and harmless).
+        # every interval for as long as no candidate exists. Unlike the
+        # channel backoff this one guards a HEALTHY channel, so it must
+        # survive the process: the truth lives in the state file
+        # (``drain2ReleaseUntil``, review r1 finding 1) — this field is the
+        # in-process mirror, and the only copy under dry-run (which never
+        # writes state).
         self._drain2_release_until = 0.0
 
     # -- state file ---------------------------------------------------------
@@ -2137,8 +2150,30 @@ class AutoSwitchEngine:
             trigger == "proactive"
             and self.settings.drain2_wait_seconds > 0
             and now >= self._park_backoff_until
-            and now >= self._drain2_release_until
+            and not self._drain2_release_backoff_active(now)
         )
+
+    def _drain2_release_backoff_active(self, now: float) -> bool:
+        """Whether a no-swap release recently stood v2 down.
+
+        The truth is in the state file: the episode record itself lives
+        there precisely so cron ``--once`` ticks and daemon restarts share
+        it — a backoff that died with the process would let every fresh
+        process re-signal a pause into the just-released park and thrash
+        it in 180s-pause cycles for as long as no candidate exists
+        (review r1 finding 1). The in-memory mirror answers for dry-run
+        (which never touches state) and skips the file read once this
+        process has seen the value.
+        """
+        if now < self._drain2_release_until:
+            return True
+        if self.dry_run:
+            return False
+        value = self._read_state().get("drain2ReleaseUntil")
+        if isinstance(value, (int, float)) and now < value:
+            self._drain2_release_until = value
+            return True
+        return False
 
     def _park_channel(self) -> ParkChannel:
         if self._park is None:
@@ -2450,6 +2485,13 @@ class AutoSwitchEngine:
         # ticks share them.
         prev_streaks = record.get("notBusy")
         prev_streaks = prev_streaks if isinstance(prev_streaks, dict) else {}
+        # Only an observation far enough from this episode's previous gate
+        # poll counts toward the streak: rapid ticks (TUI wake, settings
+        # edits slicing the sleep) would otherwise collect 3 "consecutive"
+        # not-busy glances inside ONE stretched turn boundary (review r1
+        # finding 2). Too-soon not-busy keeps the streak as is; busy
+        # resets at any spacing — work is proof at any distance.
+        spaced = now - record["updatedAt"] >= DRAIN2_SOFT_FIX_MIN_GAP_S
         streaks: dict[str, int] = {}
         acked: list[str] = []
         soft: list[str] = []
@@ -2464,10 +2506,11 @@ class AutoSwitchEngine:
                 unfixed.append(name)
                 continue
             prev = prev_streaks.get(name)
-            streak = (prev if isinstance(prev, int) and prev >= 0 else 0) + 1
+            prev = prev if isinstance(prev, int) and prev >= 0 else 0
+            streak = prev + 1 if spaced else prev
             streaks[name] = streak
             if streak >= DRAIN2_SOFT_FIX_POLLS:
-                if streak == DRAIN2_SOFT_FIX_POLLS:
+                if spaced and streak == DRAIN2_SOFT_FIX_POLLS:
                     _logger.info(
                         "drain2: %s fixed softly — no receipt, roster "
                         "not-busy %d polls in a row",
@@ -2707,8 +2750,20 @@ class AutoSwitchEngine:
         already = {n for n in (record.get("resumed") or []) if isinstance(n, str)}
         live = self._drain2_resume_targets(record)
         if live is None:
-            targets = sorted(self._drain2_acked_set(record))
-            unacked: list[str] = []
+            # Roster unreadable: who is still open-task can't be judged,
+            # but "signaled and never acked" is state-file knowledge —
+            # report it rather than a false "nobody left out" (review r1
+            # nit).
+            acked_set = self._drain2_acked_set(record)
+            targets = sorted(acked_set)
+            unacked = sorted(
+                {
+                    n
+                    for n in (record.get("signaled") or {})
+                    if isinstance(n, str)
+                }
+                - acked_set
+            )
         else:
             targets, unacked = live
         targets = [n for n in targets if n not in already]
@@ -2773,12 +2828,24 @@ class AutoSwitchEngine:
             reason=f"released without a swap: {reason}",
             message=DRAIN2_RELEASE_MESSAGE,
         )
-        self._write_drain2(None)
-        self._drain2_release_until = self.clock() + DRAIN2_BACKOFF_S
+        until = self.clock() + DRAIN2_BACKOFF_S
+        if self.dry_run:
+            self._drain2_mem = None
+        else:
+            # One atomic state write: close the episode and persist the
+            # backoff together, so a crash between the two can't leave a
+            # released park with no backoff (or vice versa).
+            def close_and_backoff(state: dict) -> None:
+                state.pop("drain2", None)
+                state["drain2ReleaseUntil"] = until
+
+            self._mutate_state(close_and_backoff)
+        self._drain2_release_until = until
 
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
-        answers, then wake every signaled session still mid-task.
+        answers, then wake the sessions that provably parked (checkpoint
+        receipt) and still hold an open task.
 
         Runs right after the swap and again at the top of every tick, so a
         daemon restart or a cron ``--once`` handover finishes the resume

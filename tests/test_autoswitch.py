@@ -4418,6 +4418,18 @@ class TestDrainV2:
         h.tick_with_usage(exhausted)
         assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
         assert len(park.waves) == waves_before
+        # The release backoff survives the process (review r1 finding 1):
+        # the episode record shares the state file across cron ``--once``
+        # ticks and daemon restarts, so the backoff must too — a fresh
+        # engine must not re-signal a pause either.
+        assert h.state()["drain2ReleaseUntil"] > h.clock.now
+        h.engine = h._make_engine(park=park)
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        h.events.clear()
+        h.tick_with_usage(exhausted)
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert len(park.waves) == waves_before
 
     def test_no_qualifying_candidate_releases_the_park_too(self, temp_home):
         # Same hole, the exact reason string of the live log: candidates
@@ -4440,6 +4452,72 @@ class TestDrainV2:
         resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
         assert resume.targets == ["fix-a"]
         assert park.waves[-1][0] == ["fix-a"]
+        assert "drain2" not in h.state()
+
+    def test_rapid_ticks_never_soft_fix_within_one_turn_boundary(
+        self, temp_home
+    ):
+        # Review r1 finding 2: wake()/TUI edits and settings.json changes
+        # slice the inter-tick sleep, so ticks can land seconds apart —
+        # three rapid not-busy glances inside ONE stretched turn boundary
+        # must not add up to a soft fixation. Only observations spaced
+        # ≥DRAIN2_SOFT_FIX_MIN_GAP_S from the previous gate poll count;
+        # a properly spaced streak still fixes.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        for _ in range(3):  # rapid ticks, 1s apart: none of them counts
+            h.clock.advance(1.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1  # three rapid glances fixed nothing
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        for _ in range(2):  # properly spaced polls start counting
+            h.clock.advance(30.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"]["softFixed"] == 1
+
+    def test_resume_with_unreadable_roster_wakes_the_acked_set(
+        self, temp_home
+    ):
+        # Roster down at resume time: wake everyone who provably parked
+        # rather than nobody — and report the never-acked honestly (they
+        # are state-file knowledge, no roster needed; review r1 nit).
+        h, park = self._harness(temp_home)
+        state_file = h.switcher.backup_dir / "autoswitch_state.json"
+        state_file.write_text(json.dumps({
+            "schemaVersion": 1,
+            "drain2": {
+                "phase": "swapped",
+                "trigger": "proactive",
+                "startedAt": h.clock.now - 100.0,
+                "updatedAt": h.clock.now - 30.0,
+                "swappedAt": h.clock.now - 30.0,
+                "to": "3",
+                "verified": True,
+                "signaled": {
+                    "fix-a": {"sessionId": "sid-a"},
+                    "fix-b": {"sessionId": "sid-b"},
+                },
+                "acked": ["fix-a"],
+            },
+        }))
+        park.roster_value = None
+        outcome = h.tick_with_usage({
+            "1": _usage(50), "2": _usage(10), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]
+        assert resume.unacked == ["fix-b"]
+        assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
         assert "drain2" not in h.state()
 
     def test_transient_switch_failure_keeps_the_episode(self, temp_home):
