@@ -3700,7 +3700,10 @@ class TestDrainV2:
         # start on that very tick, cooldown notwithstanding: past the
         # threshold the swap is an escape, not an optimization.
         h, park = self._harness(
-            temp_home, strategy="consume-first", cooldown_seconds=7200.0
+            temp_home,
+            strategy="consume-first",
+            cooldown_seconds=7200.0,
+            threshold=90.0,
         )
         park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
         # Last swap 30 minutes ago — deep inside the two-hour cooldown.
@@ -3742,6 +3745,7 @@ class TestDrainV2:
         assert h.tick_with_usage(pierced) is TickOutcome.SWITCHED
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "proactive"
+        assert h.active_number() == 2  # soonest weekly reset wins
 
     # -- mid-episode arrivals, restarts, verify failure, dry-run
 
