@@ -5133,6 +5133,31 @@ class TestEarlySwap:
         assert "lastAccountAlertedAt" not in h.state()
         assert park.waves == []
 
+    def test_early_under_consume_first_honors_hysteresis(self, temp_home):
+        # Review r2: the early swap is voluntary under EITHER strategy.
+        # Unlike the at-threshold proactive (must move, any healthy landing
+        # qualifies), it must clear the same hysteresis margin `best`
+        # applies — or accounts hovering together in the early band
+        # ping-pong every cooldown, each cycle at full park price.
+        h, park = self._harness(temp_home, strategy="consume-first")
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        inside_hysteresis = {
+            "1": _usage(75),
+            "2": _usage(74),
+            "3": _usage(73),  # a 2% win must never freeze and move the park
+        }
+        assert h.tick_with_usage(inside_hysteresis) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert park.waves == []
+        assert "drain2" not in h.state()
+        # A candidate that clears the margin still qualifies and lands.
+        h.events.clear()
+        clears = {"1": _usage(75), "2": _usage(74), "3": _usage(40)}
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(clears) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_early_never_takes_the_api_key_last_resort(self, temp_home):
         # Review r1 finding 1: the api-key last resort is for ticks that
         # MUST move. An early tick that took it would freeze the park in a

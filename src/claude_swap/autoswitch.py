@@ -1585,6 +1585,7 @@ class AutoSwitchEngine:
             active_headroom=active_headroom,
             settings=settings,
             now=self.clock(),
+            early=early,
         )
 
         if (trigger == "consume-first" or early) and ordered:
@@ -1615,6 +1616,7 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 now=self.clock(),
+                early=early,
             )
 
         if (
@@ -1858,6 +1860,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        early: bool = False,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1905,6 +1908,18 @@ class AutoSwitchEngine:
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
+                    ):
+                        continue
+                    # The early swap is voluntary under consume-first too:
+                    # unlike the at-threshold proactive it must clear the
+                    # same hysteresis margin `best` applies — a 2% win must
+                    # never freeze and move the park, or accounts hovering
+                    # together in the early band ping-pong every cooldown
+                    # at full park price (review r2).
+                    if (
+                        early
+                        and active_headroom is not None
+                        and h - active_headroom < settings.hysteresis_pct
                     ):
                         continue
                 elif active_headroom is not None:
