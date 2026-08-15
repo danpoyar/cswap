@@ -37,13 +37,18 @@ read in one sitting.
   ±2 min of a switch). `autoswitch.switchUnderLoad` releases the at-threshold
   (proactive) switch from that gate: an unattended fleet never goes quiet, so
   the gate held the swap until the account hit the wall and in-flight agents
-  died on the limit first. Forced switches (at-limit, failover, and proactive
-  under `switchUnderLoad`) instead *drain* (CON-419): with
+  died on the limit first. Forced switches (failover, and proactive under
+  `switchUnderLoad`) instead *drain* (CON-419): with
   `autoswitch.drainTimeoutSeconds` set they wait — re-checked each tick — for
   the same silence, and at the ceiling swap anyway after a one-per-episode
   `drain-timeout` WARN. Waiting ticks log `no-switch`/`drain-wait`, a drained
   switch carries an additive `drain: {outcome, waitedSeconds}`, and the
   episode persists in `autoswitch_state.json` (shared with cron `--once`).
+  An at-limit switch skips the drain outright (CON-486): at-limit means the
+  binding window is at 100%, every call on the account is already failing,
+  so the silence the drain waits for only measures how long the dying takes
+  (live episode 2026-08-14: 417s of drain-wait behind one background
+  reviewer that burned itself to the session limit on a dead account).
   Every `switch` event carries an additive `gate: "quiet"|"forced"` field =
   traffic state at swap time, so cache damage per switch is measurable from
   the log. Fleet policy on this machine (settings.json, not code): threshold
