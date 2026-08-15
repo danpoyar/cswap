@@ -3690,6 +3690,63 @@ class TestDrainV2:
         assert "drain-wait" not in self._reasons(h)
         assert park.waves == [] and park.roster_calls == 0
 
+    def test_threshold_pierced_inside_cooldown_starts_drain2(self, temp_home):
+        # CON-485 live episode (cswap-auto.log 2026-08-14T23:20-23:54Z):
+        # under consume-first with cooldownSeconds=7200 the panel showed
+        # "no-switch cooldown" every tick while the active 5h window climbed
+        # 48%->81% — that hold is the voluntary-rotation debounce and is
+        # correct. The moment the window pierced the 90% threshold (93% at
+        # 23:44:35Z) the trigger became proactive, and the drain2 wave must
+        # start on that very tick, cooldown notwithstanding: past the
+        # threshold the swap is an escape, not an optimization.
+        h, park = self._harness(
+            temp_home,
+            strategy="consume-first",
+            cooldown_seconds=7200.0,
+            threshold=90.0,
+        )
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        # Last swap 30 minutes ago — deep inside the two-hour cooldown.
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=h.clock() - 1800)
+        )
+        _write_transcript(h, age_s=1.0)
+        below = {
+            "1": _usage7(81, 35, _R_LATER),
+            "2": _usage7(20, 16, _R_SOON),
+            "3": _usage7(20, 4, _R_LATEST),
+        }
+        assert h.tick_with_usage(below) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["cooldown"]  # the debounce, by design
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        h.events.clear()
+        h.clock.advance(35.0)
+        _write_transcript(h, age_s=1.0)
+        pierced = {
+            "1": _usage7(93, 37, _R_LATER),
+            "2": _usage7(20, 16, _R_SOON),
+            "3": _usage7(20, 4, _R_LATEST),
+        }
+        assert h.tick_with_usage(pierced) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.trigger == "proactive"
+        assert self._reasons(h) == ["drain2-wait"]  # never "cooldown"
+        # Fixation completes -> the swap itself must also land inside the
+        # cooldown window, labeled proactive.
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        h.events.clear()
+        assert h.tick_with_usage(pierced) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert h.active_number() == 2  # soonest weekly reset wins
+
     # -- mid-episode arrivals, restarts, verify failure, dry-run
 
     def test_top_up_wave_for_session_appearing_mid_episode(self, temp_home):
