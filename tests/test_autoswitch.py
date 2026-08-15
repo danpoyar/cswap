@@ -5133,6 +5133,55 @@ class TestEarlySwap:
         assert "lastAccountAlertedAt" not in h.state()
         assert park.waves == []
 
+    def test_early_never_takes_the_api_key_last_resort(self, temp_home):
+        # Review r1 finding 1: the api-key last resort is for ticks that
+        # MUST move. An early tick that took it would freeze the park in a
+        # signaled episode whose swap can never pass the stale-usage gate
+        # (api-key rows carry no usage) — a below-threshold livelock.
+        h, park = self._harness(temp_home, include_api_key_accounts=True)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        inside_hysteresis = {
+            "1": _usage(75),
+            "2": "api key",
+            "3": _usage(74),  # readable but inside the hysteresis margin
+        }
+        assert h.tick_with_usage(inside_hysteresis) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert park.waves == []  # nobody frozen for an impossible swap
+        assert "drain2" not in h.state()
+        assert h.active_number() == 1
+
+    def test_early_with_no_candidates_never_cries_last_account(
+        self, temp_home
+    ):
+        # Review r1 finding 2: with no candidates at all, the early tick
+        # must stay a quiet below-threshold hold — on main this very tick
+        # was a plain below-threshold NO_ACTION, and a voluntary trigger
+        # must not add the last-account alert or the long blocked wait.
+        h = EngineHarness(
+            temp_home,
+            early_swap_threshold=70.0,
+            early_swap_max_busy=2,
+            drain2_wait_seconds=180.0,
+            drain_timeout_seconds=600.0,
+            switch_under_load=True,
+        )
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage({"1": _usage(75)}) is TickOutcome.NO_ACTION
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert "lastAccountAlertedAt" not in h.state()
+        assert self._reasons(h) == ["no-candidates"]
+        assert park.waves == []
+
 
 class TestDrain2MoveCost:
     """CON-582 directions (б) + (в): the drain wave's composition and its

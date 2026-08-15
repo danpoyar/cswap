@@ -1555,6 +1555,18 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if early:
+                # A voluntary below-threshold tick: on main this very tick
+                # was a plain below-threshold NO_ACTION, so the early
+                # trigger must not add the last-account alert or the long
+                # blocked wait on top of it (review r1 finding 2). Any
+                # signaled early episode still releases — the park must
+                # not stay paused for a swap that cannot happen.
+                self._emit(NoSwitchEvent(reason="no-candidates"))
+                self._abandon_switch_intent(
+                    trigger, "no accounts to switch to", alert=False
+                )
+                return TickOutcome.NO_ACTION
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1605,10 +1617,19 @@ class AutoSwitchEngine:
                 now=self.clock(),
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger != "consume-first"
+            and not early
+        ):
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # (unmeasurable headroom). Never for a below-threshold voluntary
+            # tick — a consume-first nudge has no weekly window to consume
+            # there, and an early swap that took it would freeze the park in
+            # a signaled episode whose swap can never pass the stale-usage
+            # gate (api-key rows carry no usage entry) — a below-threshold
+            # livelock (review r1 finding 1).
             ordered = api_key_candidates
 
         if not ordered:
