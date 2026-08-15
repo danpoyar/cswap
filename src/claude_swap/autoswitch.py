@@ -667,6 +667,29 @@ class Drain2UnavailableEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class LastAccountAlertEvent(AutoSwitchEvent):
+    """The engine had to switch and found nobody to switch to: the park is
+    effectively down to its last working account. One deduped cry for a
+    human (CON-572 class A — this alert replaces the stop wave the engine
+    used to send before judging candidates; repeated every tick it would
+    drown the log it is meant to surface in)."""
+
+    kind: ClassVar[str] = "last-account"
+    trigger: str
+    reason: str
+
+    def _fields(self) -> dict:
+        return {"trigger": self.trigger, "reason": self.reason}
+
+    def human(self) -> str:
+        return (
+            f"ALERT: the park is on its last working account "
+            f"({self.reason}; trigger {self.trigger}) — add or recover an "
+            "account; no switch can happen until a candidate exists"
+        )
+
+
+@dataclass(frozen=True)
 class QuarantineEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "account-quarantined"
     number: str
@@ -931,16 +954,26 @@ class AutoSwitchEngine:
         # Set after a channel failure: until then, drain v2 stands down and
         # forced proactive switches take the passive v1 drain.
         self._park_backoff_until = 0.0
-        # Set after an episode is released without a swap (no candidate to
-        # switch to — CON-461): without it the next tick would re-signal a
-        # fresh pause into the just-released park and thrash STOP/release
-        # every interval for as long as no candidate exists. Unlike the
-        # channel backoff this one guards a HEALTHY channel, so it must
-        # survive the process: the truth lives in the state file
-        # (``drain2ReleaseUntil``, review r1 finding 1) — this field is the
-        # in-process mirror, and the only copy under dry-run (which never
-        # writes state).
+        # Set after an episode is released without a swap because every
+        # ranked target failed to freshen (CON-461, narrowed by CON-572):
+        # without it the next tick would re-signal a fresh pause and thrash
+        # STOP/release every interval for as long as the same broken
+        # candidate keeps qualifying. The no-candidate case no longer needs
+        # it — candidates are judged before any wave, so a pause cannot be
+        # signaled while there is nobody to switch to — and must not arm
+        # it: the backoff would stall the orderly episode a fresh ``cswap
+        # add`` candidate deserves. Unlike the channel backoff this one
+        # guards a HEALTHY channel, so it must survive the process: the
+        # truth lives in the state file (``drain2ReleaseUntil``, review r1
+        # finding 1) — this field is the in-process mirror, and the only
+        # copy under dry-run (which never writes state).
         self._drain2_release_until = 0.0
+        # In-process half of the "park is on its last account" alert dedup
+        # (CON-572 class A): the durable half is ``lastAccountAlertedAt``
+        # in the state file (shared with cron ``--once`` ticks), and the
+        # only copy under dry-run. Re-armed the moment a qualifying
+        # candidate exists again.
+        self._last_account_alerted = False
 
     # -- state file ---------------------------------------------------------
 
@@ -1404,30 +1437,12 @@ class AutoSwitchEngine:
             if not quiet:
                 self._emit(NoSwitchEvent(reason="sessions-active", detail=detail))
                 return TickOutcome.NO_ACTION
-        elif self._drain2_active_for(trigger):
-            # Drain v2: create the park pause instead of waiting for one —
-            # signal every mid-turn session to checkpoint, confirm fixation
-            # from the roster, then swap. Channel failure falls back to the
-            # passive v1 drain below.
-            mode, drain2 = self._drain2_gate(trigger)
-            if mode == "hold":
-                return TickOutcome.NO_ACTION
-            if mode == "fallback":
-                drain2 = None
-                proceed, drain = self._drain_gate(trigger, active_headroom)
-                if not proceed:
-                    return TickOutcome.NO_ACTION
-        else:
-            # Forced switches drain: a bounded wait for the same silence,
-            # instead of landing at the first busy tick (every live session
-            # on the account being left full-misses its prompt cache). An
-            # at-limit switch off a window already at 100% skips the wait
-            # inside the gate — a dead account has no cache left to drain.
-            proceed, drain = self._drain_gate(trigger, active_headroom)
-            if not proceed:
-                return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
+        # Judged BEFORE any drain gate (CON-572 class A): the stop wave and
+        # the passive wait both belong to a switch that can actually
+        # happen. The 15-08 episode paused six working sessions twice in 13
+        # minutes only to discover there was nobody to switch to.
         candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
@@ -1469,7 +1484,7 @@ class AutoSwitchEngine:
             # re-polling at full cadence.
             self._blocked_wait_long = True
             self._emit(NoSwitchEvent(reason="no-candidates"))
-            self._drain2_release(drain2, "no accounts to switch to")
+            self._abandon_switch_intent(trigger, "no accounts to switch to")
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
@@ -1535,7 +1550,14 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-                self._drain2_release(drain2, "no candidate has provable headroom")
+                self._abandon_switch_intent(
+                    trigger,
+                    "no candidate has provable headroom",
+                    # Unreadable usage is a blip, not a dead intent: keep
+                    # the v1 wait and raise no last-account alarm.
+                    alert=False,
+                    clear_v1=False,
+                )
                 return TickOutcome.BLOCKED
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
@@ -1588,7 +1610,7 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-                self._drain2_release(drain2, "no qualifying candidate")
+                self._abandon_switch_intent(trigger, "no qualifying candidate")
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
             earliest = self._earliest_recovery(usage)
@@ -1603,8 +1625,41 @@ class AutoSwitchEngine:
                     )
                 )
             )
-            self._drain2_release(drain2, "every candidate exhausted")
+            self._abandon_switch_intent(trigger, "every candidate exhausted")
             return TickOutcome.BLOCKED
+
+        # A qualifying candidate exists: the switch intent is real again —
+        # re-arm the last-account alert for the next drought.
+        self._clear_last_account_alert()
+
+        # -- drain gates ---------------------------------------------------
+        # Run only now that a qualifying candidate exists (CON-572): a
+        # pause signaled first would stop the park for a switch that may
+        # not be possible at all.
+        if trigger not in self._gated_triggers():
+            if self._drain2_active_for(trigger):
+                # Drain v2: create the park pause instead of waiting for
+                # one — signal every mid-turn session to checkpoint,
+                # confirm fixation from the roster, then swap. Channel
+                # failure falls back to the passive v1 drain below.
+                mode, drain2 = self._drain2_gate(trigger)
+                if mode == "hold":
+                    return TickOutcome.NO_ACTION
+                if mode == "fallback":
+                    drain2 = None
+                    proceed, drain = self._drain_gate(trigger, active_headroom)
+                    if not proceed:
+                        return TickOutcome.NO_ACTION
+            else:
+                # Forced switches drain: a bounded wait for the same
+                # silence, instead of landing at the first busy tick (every
+                # live session on the account being left full-misses its
+                # prompt cache). An at-limit switch off a window already at
+                # 100% skips the wait inside the gate — a dead account has
+                # no cache left to drain.
+                proceed, drain = self._drain_gate(trigger, active_headroom)
+                if not proceed:
+                    return TickOutcome.NO_ACTION
 
         # -- freshen + switch ----------------------------------------------
         transient_failure = False
@@ -2878,6 +2933,78 @@ class AutoSwitchEngine:
 
             self._mutate_state(close_and_backoff)
         self._drain2_release_until = until
+
+    def _abandon_switch_intent(
+        self,
+        trigger: str,
+        reason: str,
+        *,
+        alert: bool = True,
+        clear_v1: bool = True,
+    ) -> None:
+        """This tick had to switch and learned nobody can take the park:
+        the switch intent is dead, and every drain artifact dies with it
+        (CON-572 class B: the 15-08 stale v1 record — "already waited
+        1648s" — outlived two drain2 releases and authorized a forced swap
+        into a working park the moment ``cswap add`` produced a candidate).
+
+        A signaled drain2 episode is released with the honest no-swap wave
+        (same law as ``_drain2_release``); the passive v1 wait is dropped
+        so a later candidate starts a FRESH episode instead of inheriting
+        waited time from this dead one. No release backoff is armed: with
+        candidates judged before any wave, a fresh pause cannot be
+        signaled while there is still nobody to switch to, and the backoff
+        would only stall the orderly episode a new candidate deserves.
+
+        ``alert`` raises the one deduped "park is on its last account"
+        event; ``clear_v1=False`` keeps the v1 record across a transient
+        no-comparison tick (unreadable usage is a blip, not a dead intent).
+        """
+        record = self._read_drain2()
+        if record is not None and record.get("phase") == "signaled":
+            self._drain2_resume_wave(
+                record,
+                reason=f"released without a swap: {reason}",
+                message=DRAIN2_RELEASE_MESSAGE,
+            )
+            self._write_drain2(None)
+        if clear_v1 and self._read_drain() is not None:
+            self._write_drain(None)
+        if alert and trigger != "consume-first":
+            self._alert_last_account(trigger, reason)
+
+    def _alert_last_account(self, trigger: str, reason: str) -> None:
+        """Emit the "park is on its last working account" alert, once per
+        drought (CON-572 class A). Dedup is two-layered: the in-process
+        flag answers dry-run and saves the state read; the state-file
+        stamp (``lastAccountAlertedAt``) shares the dedup with cron
+        ``--once`` ticks and daemon restarts. ``_clear_last_account_alert``
+        re-arms both the moment a qualifying candidate exists again."""
+        if self._last_account_alerted:
+            return
+        if not self.dry_run:
+            if self._read_state().get("lastAccountAlertedAt") is not None:
+                self._last_account_alerted = True
+                return
+
+            def stamp(state: dict) -> None:
+                state["lastAccountAlertedAt"] = self.clock()
+
+            self._mutate_state(stamp)
+        self._last_account_alerted = True
+        self._emit(LastAccountAlertEvent(trigger=trigger, reason=reason))
+
+    def _clear_last_account_alert(self) -> None:
+        self._last_account_alerted = False
+        if self.dry_run:
+            return
+        if self._read_state().get("lastAccountAlertedAt") is None:
+            return
+
+        def clear(state: dict) -> None:
+            state.pop("lastAccountAlertedAt", None)
+
+        self._mutate_state(clear)
 
     def _drain2_finish(self) -> None:
         """Complete a swapped drain-v2 episode: verify the new account
