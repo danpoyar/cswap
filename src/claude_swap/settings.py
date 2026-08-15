@@ -77,6 +77,25 @@ class AutoSwitchSettings:
     # 0 = drain v2 off (forced proactive switches use the passive
     # drainTimeoutSeconds wait above, exactly as before).
     drain2_wait_seconds: float = 0.0
+    # Early swap on a small park (CON-582). The migration price of a swap is
+    # the sum of the live contexts on the account being left — prompt caches
+    # are per-organization, so every running session re-creates its whole
+    # context at full price after the move — and that sum grows with the
+    # park. At/above this binding-window pct (but still below ``threshold``)
+    # a proactive switch may fire early when at most ``early_swap_max_busy``
+    # sessions are mid-turn: moving two contexts now is strictly cheaper
+    # than moving twelve at the threshold (measured 15-08: 10.2M cache-write
+    # tokens for one at-threshold swap under a full park). 0 = off.
+    early_swap_threshold: float = 0.0
+    # How many mid-turn sessions still count as a small park.
+    early_swap_max_busy: int = 2
+    # Drain v2 wave composition (CON-582): a mid-turn session whose
+    # transcript shows a context at/below this many tokens is left running
+    # through the swap instead of being checkpointed — its post-swap cache
+    # re-create is pocket change next to the checkpoint ceremony (commit,
+    # TaskList sweep, receipt, resume) and the wall-clock it would add to
+    # the pause. 0 = checkpoint every mid-turn session.
+    drain2_small_context_tokens: int = 50_000
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -173,6 +192,30 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help=(
                 "Drain v2: max seconds to wait for signaled sessions to "
                 "checkpoint before a proactive switch (0 = v2 off)"
+            ),
+        ),
+        SettingSpec(
+            "autoswitch", "earlySwapThreshold", "early_swap_threshold",
+            "float", 0.0, 99.9,
+            help=(
+                "Swap early from this binding-window pct while few sessions "
+                "are busy (0 = off)"
+            ),
+        ),
+        SettingSpec(
+            "autoswitch", "earlySwapMaxBusy", "early_swap_max_busy",
+            "int", 0, 1000,
+            help=(
+                "Most busy sessions that still count as a small park for "
+                "the early swap"
+            ),
+        ),
+        SettingSpec(
+            "autoswitch", "drain2SmallContextTokens",
+            "drain2_small_context_tokens", "int", 0, 100_000_000,
+            help=(
+                "Leave sessions whose context is at/below this many tokens "
+                "running through a swap (0 = checkpoint all)"
             ),
         ),
         SettingSpec(

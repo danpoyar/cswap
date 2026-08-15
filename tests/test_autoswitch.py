@@ -30,7 +30,9 @@ from claude_swap.autoswitch import (
     Drain2UnavailableEvent,
     Drain2VerifyEvent,
     DrainTimeoutEvent,
+    EarlySwapEvent,
     ErrorEvent,
+    LastAccountAlertEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -4916,3 +4918,459 @@ class TestDrainV2:
         assert resume.targets == ["fix-a"]
         assert resume.unacked == ["fix-b"]
         assert park.waves[-1] == (["fix-a"], DRAIN2_RESUME_MESSAGE)
+
+
+def _write_session_usage(
+    h: EngineHarness, sid: str, tokens: int
+) -> Path:
+    """A live-shaped transcript for roster session ``sid`` whose last
+    assistant usage shows a ``tokens`` context (all in cache_read)."""
+    line = json.dumps({
+        "type": "assistant",
+        "isSidechain": False,
+        "message": {
+            "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": tokens,
+                "output_tokens": 1,
+            }
+        },
+    })
+    path = h.temp_home / ".claude" / "projects" / "-Users-x" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(line + "\n", encoding="utf-8")
+    ts = h.clock.now - 1.0
+    os.utime(path, (ts, ts))
+    return path
+
+
+class TestEarlySwap:
+    """CON-582 direction (а): the proactive threshold folds in the park
+    size. The migration price of a swap is the sum of the live contexts on
+    the account being left, so at high-but-below-threshold utilization with
+    only a few sessions mid-turn, the engine swaps NOW instead of waiting
+    for the threshold under a full park. Voluntary economics: cooldown and
+    the quiet gate hold it, an unprovable park size declines it, and
+    ``earlySwapThreshold=0`` (the default) keeps it off entirely.
+    """
+
+    _EARLY = {"1": _usage(75), "2": _usage(40), "3": _usage(20)}
+
+    def _harness(self, temp_home: Path, **kwargs) -> tuple[EngineHarness, FakePark]:
+        kwargs.setdefault("early_swap_threshold", 70.0)
+        kwargs.setdefault("early_swap_max_busy", 2)
+        kwargs.setdefault("drain2_wait_seconds", 180.0)
+        kwargs.setdefault("drain_timeout_seconds", 600.0)
+        kwargs.setdefault("switch_under_load", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        return h, park
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def _ack(self, h: EngineHarness, name: str) -> None:
+        ack = h.switcher.backup_dir / "drain2-ack" / name
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        os.utime(ack, (h.clock.now, h.clock.now))
+
+    def test_small_busy_park_swaps_early(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        early = next(e for e in h.events if isinstance(e, EarlySwapEvent))
+        assert early.utilization_pct == 75.0
+        assert early.early_threshold == 70.0
+        assert early.busy_sessions == 2 and early.max_busy == 2
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.trigger == "proactive"
+        assert sorted(signal.targets) == ["fix-a", "fix-b"]
+        assert self._reasons(h) == ["drain2-wait"]
+        # Fixation completes -> the swap lands below the threshold, marked
+        # early in the event (the burn report correlates on it).
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.to_json()["early"] is True
+        assert ", early" in switch.human()
+        # One announcement per episode: the continuation tick must not
+        # re-emit the early event.
+        assert len([e for e in h.events if isinstance(e, EarlySwapEvent)]) == 1
+
+    def test_big_park_holds_for_the_threshold(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("fix-b"),
+            _park_row("fix-c"),
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert park.waves == []
+        assert not [e for e in h.events if isinstance(e, EarlySwapEvent)]
+
+    def test_interactive_sessions_count_toward_park_size(self, temp_home):
+        # 2 background + 1 interactive busy = 3 > 2: interactive sessions
+        # pay the migration too, so they weigh in the "small park" call.
+        h, park = self._harness(temp_home)
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("fix-b"),
+            _park_row("Yor", kind="interactive", state=None),
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert park.waves == []
+
+    def test_off_by_default(self, temp_home):
+        h, park = self._harness(temp_home, early_swap_threshold=0.0)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert park.roster_calls == 0  # off costs no roster subprocess
+        assert AutoSwitchSettings().early_swap_threshold == 0.0
+
+    def test_unreadable_roster_stays_put(self, temp_home):
+        # A park that can't be measured can't be called small: no early
+        # swap, and no drain2-unavailable theater (nothing was draining).
+        h, park = self._harness(temp_home)
+        assert park.roster_value is None
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert not [e for e in h.events if isinstance(e, Drain2UnavailableEvent)]
+
+    def test_cooldown_holds_early(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 60))
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert park.roster_calls == 0 and park.waves == []
+
+    def test_quiet_gate_holds_early_without_switch_under_load(self, temp_home):
+        h, park = self._harness(temp_home, switch_under_load=False)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)  # live traffic
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["below-threshold"]
+        assert park.roster_calls == 0 and park.waves == []
+
+    def test_quiet_empty_park_swaps_early_without_switch_under_load(
+        self, temp_home
+    ):
+        # The free move: transcripts quiet, nobody busy — the early swap
+        # relocates at 75% for zero cache cost instead of waiting for 90%.
+        h, park = self._harness(temp_home, switch_under_load=False)
+        park.roster_value = []
+        _write_transcript(h, age_s=400.0)  # past QUIET_WINDOW_S
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.to_json()["early"] is True
+        assert switch.gate == "quiet"
+
+    def test_growing_park_mid_episode_finishes_the_swap(self, temp_home):
+        # One decision per episode: the pause is already bought, so a park
+        # that grows past the cap mid-episode is topped up and the swap
+        # completes — abandoning would pay the pause twice.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        h.events.clear()
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("fix-b"),
+            _park_row("fix-c"),
+            _park_row("fix-d"),
+        ]
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._EARLY) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["drain2-wait"]  # never below-threshold
+        topup = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert topup.top_up is True
+        assert sorted(topup.targets) == ["fix-c", "fix-d"]
+
+    def test_no_qualifying_candidate_stays_quiet(self, temp_home):
+        # Early opportunism that finds nothing better simply stays put:
+        # no last-account alert, no all-exhausted sleep — those belong to
+        # ticks that MUST move.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        inside_hysteresis = {
+            "1": _usage(75),
+            "2": _usage(72),
+            "3": _usage(74),
+        }
+        assert h.tick_with_usage(inside_hysteresis) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert "lastAccountAlertedAt" not in h.state()
+        assert park.waves == []
+
+    def test_early_under_consume_first_honors_hysteresis(self, temp_home):
+        # Review r2: the early swap is voluntary under EITHER strategy.
+        # Unlike the at-threshold proactive (must move, any healthy landing
+        # qualifies), it must clear the same hysteresis margin `best`
+        # applies — or accounts hovering together in the early band
+        # ping-pong every cooldown, each cycle at full park price.
+        h, park = self._harness(temp_home, strategy="consume-first")
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        inside_hysteresis = {
+            "1": _usage(75),
+            "2": _usage(74),
+            "3": _usage(73),  # a 2% win must never freeze and move the park
+        }
+        assert h.tick_with_usage(inside_hysteresis) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert park.waves == []
+        assert "drain2" not in h.state()
+        # A candidate that clears the margin still qualifies and lands.
+        h.events.clear()
+        clears = {"1": _usage(75), "2": _usage(74), "3": _usage(40)}
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(clears) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_early_never_takes_the_api_key_last_resort(self, temp_home):
+        # Review r1 finding 1: the api-key last resort is for ticks that
+        # MUST move. An early tick that took it would freeze the park in a
+        # signaled episode whose swap can never pass the stale-usage gate
+        # (api-key rows carry no usage) — a below-threshold livelock.
+        h, park = self._harness(temp_home, include_api_key_accounts=True)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        inside_hysteresis = {
+            "1": _usage(75),
+            "2": "api key",
+            "3": _usage(74),  # readable but inside the hysteresis margin
+        }
+        assert h.tick_with_usage(inside_hysteresis) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["no-qualifying-candidate"]
+        assert park.waves == []  # nobody frozen for an impossible swap
+        assert "drain2" not in h.state()
+        assert h.active_number() == 1
+
+    def test_early_with_no_candidates_never_cries_last_account(
+        self, temp_home
+    ):
+        # Review r1 finding 2: with no candidates at all, the early tick
+        # must stay a quiet below-threshold hold — on main this very tick
+        # was a plain below-threshold NO_ACTION, and a voluntary trigger
+        # must not add the last-account alert or the long blocked wait.
+        h = EngineHarness(
+            temp_home,
+            early_swap_threshold=70.0,
+            early_swap_max_busy=2,
+            drain2_wait_seconds=180.0,
+            drain_timeout_seconds=600.0,
+            switch_under_load=True,
+        )
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage({"1": _usage(75)}) is TickOutcome.NO_ACTION
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert "lastAccountAlertedAt" not in h.state()
+        assert self._reasons(h) == ["no-candidates"]
+        assert park.waves == []
+
+
+class TestDrain2MoveCost:
+    """CON-582 directions (б) + (в): the drain wave's composition and its
+    price tag. Before any wave, the engine reads each judged session's
+    transcript and estimates the migration price (the context its next turn
+    re-creates at full price on the new account); sessions whose context is
+    pocket change ride through the swap unfrozen — the checkpoint ceremony
+    would cost more than their cache re-create.
+    """
+
+    _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+
+    def _harness(self, temp_home: Path, **kwargs) -> tuple[EngineHarness, FakePark]:
+        kwargs.setdefault("drain2_wait_seconds", 180.0)
+        kwargs.setdefault("drain_timeout_seconds", 600.0)
+        kwargs.setdefault("switch_under_load", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        return h, park
+
+    def _ack(self, h: EngineHarness, name: str) -> None:
+        ack = h.switcher.backup_dir / "drain2-ack" / name
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        os.utime(ack, (h.clock.now, h.clock.now))
+
+    def test_estimate_logged_before_the_wave(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_session_usage(h, "sid-fix-a", 300_000)
+        _write_session_usage(h, "sid-fix-b", 250_000)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.est_move_tokens == 550_000
+        assert signal.est_session_tokens == {
+            "fix-a": 300_000,
+            "fix-b": 250_000,
+        }
+        assert signal.to_json()["estMoveTokens"] == 550_000
+        assert "550000 tokens to move" in signal.human()
+        # The estimate rides the episode into the switch event.
+        self._ack(h, "fix-a")
+        self._ack(h, "fix-b")
+        h.clock.advance(60.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b", status="idle"),
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"]["estMoveTokens"] == 550_000
+
+    def test_unknown_transcripts_leave_the_estimate_out(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)  # not the session's own transcript
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.est_move_tokens is None
+        assert signal.est_session_tokens == {"fix-a": None}
+        assert "estMoveTokens" not in signal.to_json()
+
+    def test_small_context_session_rides_through_unfrozen(self, temp_home):
+        h, park = self._harness(temp_home)  # default small cap: 50k tokens
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_session_usage(h, "sid-fix-a", 300_000)
+        _write_session_usage(h, "sid-fix-b", 9_000)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.targets == ["fix-a"]
+        assert signal.skipped_small == ["fix-b"]
+        assert signal.est_move_tokens == 309_000  # the small one pays too
+        assert park.waves[0][0] == ["fix-a"]
+        record = h.state()["drain2"]
+        assert sorted(record["signaled"]) == ["fix-a"]
+        assert record["small"] == ["fix-b"]
+        # fix-b keeps working (busy) and never holds fixation hostage.
+        self._ack(h, "fix-a")
+        h.clock.advance(60.0)
+        _write_session_usage(h, "sid-fix-b", 9_500)  # still writing
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),  # still mid-turn
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        drain2 = switch.to_json()["drain2"]
+        assert drain2["outcome"] == "ready"
+        assert drain2["fixed"] == 1 and drain2["forced"] == 0
+        assert drain2["skippedSmall"] == 1
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.targets == ["fix-a"]  # the unfrozen one is not woken
+
+    def test_zero_cap_checkpoints_everyone(self, temp_home):
+        h, park = self._harness(temp_home, drain2_small_context_tokens=0)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_session_usage(h, "sid-fix-a", 300_000)
+        _write_session_usage(h, "sid-fix-b", 9_000)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert sorted(signal.targets) == ["fix-a", "fix-b"]
+        assert signal.skipped_small == []
+
+    def test_unknown_context_is_checkpointed(self, temp_home):
+        # Unknown is not small: a transcript the engine can't read could be
+        # a 900k context — the conservative side is to freeze it.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.targets == ["fix-a"]
+        assert signal.skipped_small == []
+
+    def test_all_small_swaps_without_a_pause(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_session_usage(h, "sid-fix-a", 9_000)
+        _write_session_usage(h, "sid-fix-b", 8_000)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_json()["drain2"] == {
+            "outcome": "ready",
+            "waitedSeconds": 0,
+            "fixed": 0,
+            "forced": 0,
+            "ackFixed": 0,
+            "softFixed": 0,
+            "skippedSmall": 2,
+            "estMoveTokens": 17_000,
+        }
+        assert park.waves == []  # nobody was frozen, nobody needs waking
+
+    def test_topup_skips_small_newcomer_once(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_session_usage(h, "sid-fix-a", 300_000)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        h.events.clear()
+        # A small newcomer appears mid-episode: judged small, not signaled.
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_session_usage(h, "sid-fix-b", 9_000)
+        h.clock.advance(30.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        topup = next(
+            e
+            for e in h.events
+            if isinstance(e, Drain2SignalEvent) and e.top_up
+        )
+        assert topup.targets == []
+        assert topup.skipped_small == ["fix-b"]
+        assert len(park.waves) == 1  # no second wave for the small one
+        assert h.state()["drain2"]["small"] == ["fix-b"]
+        h.events.clear()
+        # And only once: the next tick must not re-announce it.
+        h.clock.advance(30.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert not [
+            e
+            for e in h.events
+            if isinstance(e, Drain2SignalEvent) and e.top_up
+        ]

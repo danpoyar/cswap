@@ -315,3 +315,49 @@ class TestCliOverrides:
     def test_strategy_override(self):
         merged = self._merged(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestCon582Specs:
+    """The CON-582 threshold knobs are settings.json keys with defaults —
+    file parameters, not hardcode."""
+
+    def test_early_swap_threshold_spec(self):
+        spec = SETTING_SPECS["autoswitch.earlySwapThreshold"]
+        assert spec.field == "early_swap_threshold"
+        assert (spec.lo, spec.hi) == (0.0, 99.9)
+        assert AutoSwitchSettings().early_swap_threshold == 0.0  # off
+
+    def test_early_swap_max_busy_spec(self):
+        spec = SETTING_SPECS["autoswitch.earlySwapMaxBusy"]
+        assert spec.field == "early_swap_max_busy"
+        assert spec.kind == "int"
+        assert AutoSwitchSettings().early_swap_max_busy == 2
+
+    def test_small_context_spec(self):
+        spec = SETTING_SPECS["autoswitch.drain2SmallContextTokens"]
+        assert spec.field == "drain2_small_context_tokens"
+        assert spec.kind == "int"
+        assert AutoSwitchSettings().drain2_small_context_tokens == 50_000
+
+    def test_values_round_trip_through_the_file(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.earlySwapThreshold", "70")
+        set_setting(tmp_path, "autoswitch.earlySwapMaxBusy", "3")
+        set_setting(tmp_path, "autoswitch.drain2SmallContextTokens", "80000")
+        loaded = load_settings(tmp_path)
+        assert loaded.early_swap_threshold == 70.0
+        assert loaded.early_swap_max_busy == 3
+        assert loaded.drain2_small_context_tokens == 80_000
+
+    def test_out_of_range_values_clamp_on_load(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "earlySwapThreshold": 200,
+                "earlySwapMaxBusy": -1,
+                "drain2SmallContextTokens": -5,
+            },
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.early_swap_threshold == 99.9
+        assert loaded.early_swap_max_busy == 0
+        assert loaded.drain2_small_context_tokens == 0
