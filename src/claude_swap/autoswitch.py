@@ -176,18 +176,30 @@ DRAIN2_SOFT_FIX_MIN_GAP_S = 20.0
 # names async Task/Agent subagents explicitly and judges by "spends tokens",
 # not by type: chore-ops-340 kept its code-reviewer running through the
 # whole episode on the reasoning "лёгкий разовый вызов, не Workflow-прогон".
+# The stop is a machine loop over TaskList, not prose over memory, and the
+# receipt is gated on the emptied list (CON-486): feat-sto-2 stopped the
+# one builder it remembered and receipted while the builder's own grandchild
+# reviewer — invisible to memory, spawned mid-episode — burned the window
+# to 100%. A re-run TaskList also catches orphans the harness re-parents
+# after their spawner dies.
 DRAIN2_STOP_MESSAGE = (
     "cswap drain: аккаунт парка у порога, готовится переключение — парк "
     "уходит на короткую паузу.\n"
     "1. Доведи ТЕКУЩИЙ ШАГ, не кусок целиком. Закоммить свои файлы по "
     "явным путям; точку остановки — одной строкой комментом в свой тикет.\n"
-    "2. Останови ВСЕ вложенные прогоны, которые тратят токены: Workflow-раны "
-    "И фоновых субагентов (Task/Agent, включая code-reviewer) — TaskStop, а "
+    "2. Останови вложенные прогоны МАШИННО, не по памяти: вызови TaskList "
+    "и каждому фоновому прогону из списка, который тратит токены "
+    "(Workflow-ран, субагент Task/Agent, включая code-reviewer; «лёгкий "
+    "разовый вызов» — тоже такой прогон), — TaskStop по id из списка; "
     "runId/scriptPath/agentId запиши на диск рядом с работой, чтобы "
-    "возобновить ТОГО ЖЕ после паузы. «Лёгкий разовый вызов» — тоже такой "
-    "прогон. Локальные процессы без API-вызовов (тесты, сборки) не трогай.\n"
-    "3. Отметь чекпойнт-квитанцию — по ней cswap видит твою готовность "
-    "сквозь бегущие фоновые задачи и свопнет раньше: "
+    "возобновить ТОГО ЖЕ после паузы. Синхронного субагента не убивай — "
+    "дождись его конца, это и есть тишина. Локальные процессы без "
+    "API-вызовов (тесты, сборки) не трогай.\n"
+    "3. Квитанцию ставь ТОЛЬКО когда повторный TaskList показывает: "
+    "токен-тратящих прогонов не осталось (локальные Bash-задачи не в счёт) "
+    "— стоп по памяти вместо списка уже терял внука-ревьюера, спавнутого "
+    "субагентом, и он дожёг окно до 100%. По квитанции cswap видит твою "
+    "готовность и свопнет раньше: "
     'mkdir -p "{ack_dir}" && touch "{ack_dir}/<имя твоей сессии>"\n'
     "4. Поставь ОДНО фоновое ожидание конца свопа инструментом Bash с "
     "run_in_background: true — этот канал сам разбудит тебя (голый nohup/& "
@@ -1402,14 +1414,16 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             if mode == "fallback":
                 drain2 = None
-                proceed, drain = self._drain_gate(trigger)
+                proceed, drain = self._drain_gate(trigger, active_headroom)
                 if not proceed:
                     return TickOutcome.NO_ACTION
         else:
             # Forced switches drain: a bounded wait for the same silence,
             # instead of landing at the first busy tick (every live session
-            # on the account being left full-misses its prompt cache).
-            proceed, drain = self._drain_gate(trigger)
+            # on the account being left full-misses its prompt cache). An
+            # at-limit switch off a window already at 100% skips the wait
+            # inside the gate — a dead account has no cache left to drain.
+            proceed, drain = self._drain_gate(trigger, active_headroom)
             if not proceed:
                 return TickOutcome.NO_ACTION
 
@@ -2020,7 +2034,9 @@ class AutoSwitchEngine:
             return ("consume-first",)
         return ("proactive", "consume-first")
 
-    def _drain_gate(self, trigger: str) -> tuple[bool, dict | None]:
+    def _drain_gate(
+        self, trigger: str, active_headroom: float | None
+    ) -> tuple[bool, dict | None]:
         """Bounded quiet-wait ("drain") before a forced switch lands.
 
         Forced triggers — at-limit, failover, and proactive under
@@ -2033,6 +2049,14 @@ class AutoSwitchEngine:
         live agents harder than a cache miss does, so at the ceiling the
         switch proceeds anyway, after a one-per-episode DrainTimeoutEvent.
 
+        ``active_headroom`` is the binding-window headroom of the account
+        being left (None = unknown). At or under 0 the wait is skipped
+        outright: the window is at 100%, every call on the account is
+        already failing, so transcript silence measures how long the dying
+        takes — not a cache worth protecting (CON-486: 417s of drain-wait
+        on a dead account while a background reviewer burned itself to the
+        session limit). Agents cut mid-call recover via the wake heal.
+
         Returns ``(proceed, drain_info)``. ``proceed=False`` means hold this
         tick (a ``drain-wait`` line was emitted). ``drain_info`` is the
         additive SwitchEvent payload when an episode preceded the swap:
@@ -2043,6 +2067,12 @@ class AutoSwitchEngine:
         """
         max_wait = self.settings.drain_timeout_seconds
         if max_wait <= 0:
+            return True, None
+        if active_headroom is not None and active_headroom <= 0.0:
+            _logger.info(
+                "Binding window of the active account is at 100%%; "
+                "skipping the drain wait — calls there are already failing"
+            )
             return True, None
         now = self.clock()
         latest = latest_session_activity_ts(self.claude_projects_dir)
@@ -2141,7 +2171,9 @@ class AutoSwitchEngine:
         Proactive only: it is a forewarning below the hard limit, worth a
         couple of minutes of orderly pause. At-limit and failover mean calls
         are already failing (or the account is dead) — orchestrating a pause
-        spends time the park doesn't have, so they keep the passive drain.
+        spends time the park doesn't have, so failover keeps the passive
+        drain and at-limit skips even that (CON-486: its binding window is
+        at 100%, so no wait has a cache left to protect).
         A recent channel failure stands v2 down (see DRAIN2_BACKOFF_S), and
         so does a recent no-swap release (CON-461): pausing the park again
         while there is still nobody to switch to would thrash it.

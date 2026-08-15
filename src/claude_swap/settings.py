@@ -57,12 +57,15 @@ class AutoSwitchSettings:
     # live sessions on the account being left; leave off for interactive work.
     # The below-threshold consume-first rotation stays gated either way.
     switch_under_load: bool = False
-    # Bounded wait ("drain") before a FORCED switch — at-limit, failover, and
-    # proactive under switchUnderLoad — lands while sessions are running: the
-    # engine holds the swap, re-checking every tick, until transcripts have
-    # been quiet for the cache window, and at this many seconds swaps anyway
-    # with a warning (an account pinned at its limit breaks live agents
-    # harder than the cache miss does). 0 = swap immediately (no drain).
+    # Bounded wait ("drain") before a FORCED switch — failover, and proactive
+    # under switchUnderLoad — lands while sessions are running: the engine
+    # holds the swap, re-checking every tick, until transcripts have been
+    # quiet for the cache window, and at this many seconds swaps anyway with
+    # a warning (an account pinned at its limit breaks live agents harder
+    # than the cache miss does). An at-limit switch skips the wait outright
+    # (CON-486): its binding window is at 100%, calls on the account are
+    # already failing, so there is no cache left for the wait to protect.
+    # 0 = swap immediately (no drain).
     drain_timeout_seconds: float = 0.0
     # Drain v2 (active checkpoint) for the proactive-under-load switch: the
     # engine SIGNALS every mid-turn background session to checkpoint and
