@@ -1550,14 +1550,15 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-                self._abandon_switch_intent(
-                    trigger,
-                    "no candidate has provable headroom",
-                    # Unreadable usage is a blip, not a dead intent: keep
-                    # the v1 wait and raise no last-account alarm.
-                    alert=False,
-                    clear_v1=False,
-                )
+                # A signaled drain2 episode SURVIVES this tick: unreadable
+                # usage is transient, not a dead intent — same law as the
+                # transient freshen failure below, which deliberately keeps
+                # the episode so an orderly pause isn't thrown away on a
+                # network blip (review r1 of CON-572: releasing here
+                # re-froze the park with a fresh wave one tick later).
+                # A SUSTAINED unreadable stretch is bounded by
+                # ``_drain2_reconcile``: the gate stops refreshing the
+                # record, so it goes stale and is closed with a resume.
                 return TickOutcome.BLOCKED
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
@@ -2893,22 +2894,23 @@ class AutoSwitchEngine:
 
     def _drain2_release(self, drain2: dict | None, reason: str) -> None:
         """The gate said "swap now" but the swap cannot happen for a
-        non-transient reason (nobody to switch to): release the park and
-        close the episode instead of holding it open.
+        non-transient reason: release the park and close the episode
+        instead of holding it open (live hole 14-08 17:10–17:13Z, CON-461
+        add-on: the record stayed open and the park stood parked until a
+        manual wake).
 
-        Live hole 14-08 17:10–17:13Z (CON-461, add-on): the episode hit its
-        cap, every candidate was exhausted, and the resume — which only
-        ever followed a swap — went to nobody; the record stayed open and
-        the park stood parked until a manual wake. The wave says honestly
-        that no swap happened (``DRAIN2_RELEASE_MESSAGE``), targets the
+        Since CON-572 the no-candidate exits release through
+        ``_abandon_switch_intent`` before any gate runs, so the one caller
+        left is "every ranked target failed to freshen" — candidates keep
+        qualifying but none can be activated. The wave says honestly that
+        no swap happened (``DRAIN2_RELEASE_MESSAGE``), targets the
         sessions that provably parked (the same acked-only law as every
         resume), and the record is dropped regardless of wave health —
-        parked agents keep their bounded self-rescue either way, which is
-        strictly better than today's nothing. A release backoff then keeps
-        v2 from re-signaling a fresh pause while there is still nobody to
-        switch to. Transient freshen failures do NOT release: they retry
-        next tick with the episode intact, so an orderly pause isn't wasted
-        on a network blip.
+        parked agents keep their bounded self-rescue either way. A release
+        backoff then keeps v2 from re-signaling a fresh pause while the
+        same broken candidates keep qualifying. Transient freshen failures
+        do NOT release: they retry next tick with the episode intact, so
+        an orderly pause isn't wasted on a network blip.
         """
         if drain2 is None:
             return
@@ -2934,14 +2936,7 @@ class AutoSwitchEngine:
             self._mutate_state(close_and_backoff)
         self._drain2_release_until = until
 
-    def _abandon_switch_intent(
-        self,
-        trigger: str,
-        reason: str,
-        *,
-        alert: bool = True,
-        clear_v1: bool = True,
-    ) -> None:
+    def _abandon_switch_intent(self, trigger: str, reason: str) -> None:
         """This tick had to switch and learned nobody can take the park:
         the switch intent is dead, and every drain artifact dies with it
         (CON-572 class B: the 15-08 stale v1 record — "already waited
@@ -2955,10 +2950,9 @@ class AutoSwitchEngine:
         candidates judged before any wave, a fresh pause cannot be
         signaled while there is still nobody to switch to, and the backoff
         would only stall the orderly episode a new candidate deserves.
-
-        ``alert`` raises the one deduped "park is on its last account"
-        event; ``clear_v1=False`` keeps the v1 record across a transient
-        no-comparison tick (unreadable usage is a blip, not a dead intent).
+        Only the KNOWN-dead intents call this — a transiently unreadable
+        tick (no-comparison) holds every artifact instead, like the
+        transient freshen failure does.
         """
         record = self._read_drain2()
         if record is not None and record.get("phase") == "signaled":
@@ -2968,10 +2962,9 @@ class AutoSwitchEngine:
                 message=DRAIN2_RELEASE_MESSAGE,
             )
             self._write_drain2(None)
-        if clear_v1 and self._read_drain() is not None:
+        if self._read_drain() is not None:
             self._write_drain(None)
-        if alert and trigger != "consume-first":
-            self._alert_last_account(trigger, reason)
+        self._alert_last_account(trigger, reason)
 
     def _alert_last_account(self, trigger: str, reason: str) -> None:
         """Emit the "park is on its last working account" alert, once per

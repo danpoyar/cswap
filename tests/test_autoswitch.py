@@ -4714,6 +4714,96 @@ class TestDrainV2:
         # The alert dedup re-armed the moment a candidate existed again.
         assert "lastAccountAlertedAt" not in h.state()
 
+    def test_unreadable_candidates_hold_a_live_episode(self, temp_home):
+        # CON-572 review r1, Important 1: one tick of unreadable candidate
+        # usage mid-episode must not release the pause — the first cut of
+        # the fix released it, and the next readable tick re-froze the
+        # park with a fresh STOP wave (thrash wave→release→wave). Same law
+        # as the transient freshen failure: a blip holds every artifact.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert len(park.waves) == 1  # the STOP wave
+        # Blip: no candidate has readable usage this tick.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        blip = {"1": _usage(96), "2": None, "3": None}
+        assert h.tick_with_usage(blip) is TickOutcome.BLOCKED
+        assert not [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert h.state()["drain2"]["phase"] == "signaled"  # pause survived
+        assert len(park.waves) == 1  # no release wave went out
+        # Usage readable again: the SAME episode proceeds — no second STOP.
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert len(
+            [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        ) == 1
+        assert "drain2" not in h.state()
+
+    def test_freshen_dead_targets_release_with_backoff(self, temp_home):
+        # CON-572 review r1, Important 2: the one release path left with a
+        # backoff — candidates keep qualifying but none can be activated
+        # ("every ranked target failed to freshen") — had no live test, so
+        # a mutation dropping the backoff passed the whole suite. Pin it:
+        # the release arms ``drain2ReleaseUntil``, and the next tick with
+        # the same broken candidates goes passive v1, never a fresh pause.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="skip-live-session"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.BLOCKED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.reason == (
+            "released without a swap: every ranked target failed to freshen"
+        )
+        assert resume.targets == ["fix-a"]
+        assert "drain2" not in h.state()
+        assert h.state()["drain2ReleaseUntil"] > h.clock.now  # backoff armed
+        # While the same broken candidates keep qualifying, the backoff
+        # stands v2 down: the passive v1 wait takes over, no new pause.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="skip-live-session"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._reasons(h)[-1] == "drain-wait"
+        assert len(
+            [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        ) == 1
+
+    def test_release_clears_a_fallback_v1_record(self, temp_home):
+        # CON-572 review r1, Minor 3: the line that drops the v1 record on
+        # a dead intent was reachable by no test (the pure drain2 flows
+        # never start a v1 wait). Build the record through the fallback —
+        # park channel down — then crowd the candidates out: the record
+        # must die with the intent, or class B comes back whenever the
+        # channel is broken.
+        h, park = self._harness(temp_home)
+        park.roster_value = None  # `claude agents --json` down → v1 fallback
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert "drain" in h.state()  # passive v1 wait started
+        # Candidates crowd out: the intent dies — the v1 record with it.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        assert "drain" not in h.state()
+        assert [e for e in h.events if e.kind == "last-account"]
+
     def test_rapid_ticks_never_soft_fix_within_one_turn_boundary(
         self, temp_home
     ):
