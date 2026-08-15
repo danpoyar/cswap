@@ -18,8 +18,11 @@ from claude_swap.autoswitch import (
     DRAIN2_SELF_RESCUE_S,
     DRAIN2_STOP_MESSAGE,
     DRAIN_STALE_GAP_S,
+    EPISODE_LATCH_NAME,
+    EPISODE_LATCH_POINTER_NAME,
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
+    QUIET_WINDOW_S,
     SETTINGS_WATCH_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
@@ -31,6 +34,7 @@ from claude_swap.autoswitch import (
     Drain2VerifyEvent,
     DrainTimeoutEvent,
     EarlySwapEvent,
+    EpisodeNoticeEvent,
     ErrorEvent,
     LastAccountAlertEvent,
     NoSwitchEvent,
@@ -5374,3 +5378,273 @@ class TestDrain2MoveCost:
             for e in h.events
             if isinstance(e, Drain2SignalEvent) and e.top_up
         ]
+
+
+class TestEpisodeLatch:
+    """Swap-episode latch + orchestrator notice (CON-581).
+
+    Live hole 15-08 20:33–20:35Z: three door spawns landed seconds before
+    the drain2 STOP wave and rode PAST it — nobody signaled them, the swap
+    risked tearing their first turns. Two machine guarantees close it:
+
+    - The engine mirrors the live episode (any live ``drain``/``drain2``
+      record) into a latch file in the cswap state catalog and publishes
+      the latch's path as a fleet file-parameter; the spawn door holds new
+      spawns while a FRESH latch exists. The reader judges AGE (mtime
+      against the cap baked into the latch), never bare existence — a
+      daemon killed mid-episode must not hold the door forever.
+    - An advisory herald notice to the orchestrator at each episode
+      boundary («спавны держи» / «можно спавнить») — one attempt per
+      boundary, deduped through the state file; the episode NEVER waits
+      on delivery (the latch is the enforcement, the notice a courtesy).
+    """
+
+    _PROACTIVE = {"1": _usage(96), "2": _usage(40), "3": _usage(20)}
+
+    def _harness(self, temp_home: Path, **kwargs) -> tuple[EngineHarness, FakePark]:
+        kwargs.setdefault("drain2_wait_seconds", 180.0)
+        kwargs.setdefault("drain_timeout_seconds", 600.0)
+        kwargs.setdefault("switch_under_load", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        h.engine = h._make_engine(park=park)
+        return h, park
+
+    def _latch(self, h: EngineHarness) -> Path:
+        return h.switcher.backup_dir / EPISODE_LATCH_NAME
+
+    def _pointer(self, h: EngineHarness) -> Path:
+        return (
+            h.temp_home / ".local" / "state" / "fleet"
+            / EPISODE_LATCH_POINTER_NAME
+        )
+
+    def _name_orchestrator(self, h: EngineHarness, name: str) -> None:
+        f = h.temp_home / ".local" / "state" / "fleet" / "orchestrator-name"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"{name}\n")
+
+    def _ack(self, h: EngineHarness, name: str) -> None:
+        ack = h.switcher.backup_dir / "drain2-ack" / name
+        ack.parent.mkdir(parents=True, exist_ok=True)
+        ack.touch()
+        os.utime(ack, (h.clock.now, h.clock.now))
+
+    # -- the latch mirrors the episode --------------------------------------
+
+    def test_signal_raises_the_latch_and_publishes_the_path(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        latch = self._latch(h)
+        assert latch.exists()
+        payload = json.loads(latch.read_text())
+        assert payload["trigger"] == "proactive"
+        assert payload["kind"] == "drain2"
+        assert payload["phase"] == "signaled"
+        assert payload["startedAt"] == h.clock.now
+        assert payload["staleAfterSeconds"] == int(DRAIN_STALE_GAP_S)
+        # The door never hardcodes the latch path: cswap publishes it as a
+        # fleet file-parameter (the orchestrator-name pattern).
+        assert self._pointer(h).read_text() == f"{latch}\n"
+
+    def test_clean_swap_drops_the_latch(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._latch(h).exists()
+        self._ack(h, "fix-a")
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert "drain2" not in h.state()  # episode closed…
+        assert not self._latch(h).exists()  # …and the latch with it
+
+    def test_release_without_swap_drops_the_latch(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._latch(h).exists()
+        self._ack(h, "fix-a")
+        h.clock.advance(200.0)  # past the 180s fixation cap
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("fix-b"),
+        ]
+        exhausted = {"1": _usage(96), "2": _usage(100), "3": _usage(100)}
+        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        assert "drain2" not in h.state()
+        assert not self._latch(h).exists()
+
+    def test_v1_drain_raises_and_drops_the_latch(self, temp_home):
+        # The passive v1 drain is an episode too: a spawn during its wait
+        # keeps the account busy and stretches the very silence the swap
+        # waits for.
+        h, _ = self._harness(temp_home, drain2_wait_seconds=0.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        latch = self._latch(h)
+        assert latch.exists()
+        payload = json.loads(latch.read_text())
+        assert payload["kind"] == "drain"
+        assert payload["trigger"] == "proactive"
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=QUIET_WINDOW_S + 1.0)  # park went quiet
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert not latch.exists()
+
+    def test_restart_clears_a_leftover_latch(self, temp_home):
+        # A daemon killed mid-episode leaves the latch on disk; the reader
+        # side already ignores it by age, and the next engine tick must
+        # remove it (no live record in state = no episode).
+        h, park = self._harness(temp_home)
+        latch = self._latch(h)
+        latch.parent.mkdir(parents=True, exist_ok=True)
+        latch.write_text('{"trigger": "proactive", "kind": "drain2"}')
+        park.roster_value = []
+        _write_transcript(h, age_s=QUIET_WINDOW_S + 1.0)
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert not latch.exists()
+
+    def test_stale_record_drops_the_latch_by_age(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._latch(h).exists()
+        # The engine goes silent past the staleness gap (stopped daemon,
+        # forcing condition gone): the record is another episode's leftovers
+        # and the latch must die with it on the next tick.
+        h.clock.advance(DRAIN_STALE_GAP_S + 1.0)
+        _write_transcript(h, age_s=QUIET_WINDOW_S + 1.0)
+        park.roster_value = []
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert not self._latch(h).exists()
+
+    def test_dry_run_writes_no_latch(self, temp_home):
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        h.engine = h._make_engine(park=park, dry_run=True)
+        h.tick_with_usage(self._PROACTIVE)
+        assert not self._latch(h).exists()
+        assert not self._pointer(h).exists()
+
+    # -- the orchestrator notice --------------------------------------------
+
+    def test_start_notice_reaches_the_live_orchestrator(self, temp_home):
+        h, park = self._harness(temp_home)
+        self._name_orchestrator(h, "Yor")
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("Yor", kind="interactive", state=None),
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        # Separate channel: the STOP wave never carries the orchestrator.
+        stop_names, stop_msg = park.waves[0]
+        assert stop_names == ["fix-a"]
+        assert "Yor" not in stop_names
+        notice_names, notice_msg = park.waves[-1]
+        assert notice_names == ["Yor"]
+        assert "спавны держи" in notice_msg
+        assert "gate=swap-episode" in notice_msg
+        notice = next(
+            e for e in h.events if isinstance(e, EpisodeNoticeEvent)
+        )
+        assert notice.phase == "start"
+        assert notice.target == "Yor"
+        assert notice.delivered is True
+        assert h.state()["episodeNoticeSentAt"] == h.clock.now
+        # One notice per boundary: the next holding tick stays quiet.
+        h.events.clear()
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        waves_before = len(park.waves)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert len(park.waves) == waves_before
+        assert not [e for e in h.events if isinstance(e, EpisodeNoticeEvent)]
+
+    def test_end_notice_follows_the_close(self, temp_home):
+        h, park = self._harness(temp_home)
+        self._name_orchestrator(h, "yor")  # liveness matches case-insensitively
+        park.roster_value = [
+            _park_row("fix-a"),
+            _park_row("Yor", kind="interactive", state=None),
+        ]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [
+            _park_row("fix-a", status="idle"),
+            _park_row("Yor", kind="interactive", state=None),
+        ]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        notice_names, notice_msg = park.waves[-1]
+        assert notice_names == ["yor"]
+        assert "можно спавнить" in notice_msg
+        end = [
+            e
+            for e in h.events
+            if isinstance(e, EpisodeNoticeEvent) and e.phase == "end"
+        ]
+        assert len(end) == 1 and end[0].delivered is True
+        assert "episodeNoticeSentAt" not in h.state()
+
+    def test_no_live_orchestrator_is_an_honest_fallback(self, temp_home):
+        # No orchestrator in the roster: an honest undelivered event, no
+        # herald spawn — and no retry spam (the boundary is handled; the
+        # latch, not the notice, is the enforcement).
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert [names for names, _ in park.waves] == [["fix-a"]]
+        notice = next(
+            e for e in h.events if isinstance(e, EpisodeNoticeEvent)
+        )
+        assert notice.phase == "start"
+        assert notice.target == "orchestrator"  # the file-parameter default
+        assert notice.delivered is False
+        assert "no live" in notice.detail
+        assert h.state()["episodeNoticeSentAt"] == h.clock.now
+        h.events.clear()
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert not [e for e in h.events if isinstance(e, EpisodeNoticeEvent)]
+
+    def test_unreadable_roster_retries_the_notice_next_tick(self, temp_home):
+        # Roster down at the boundary: liveness unknown, so the notice is
+        # NOT written off — the next tick retries. The stamp moves only on
+        # a handled boundary.
+        h, park = self._harness(temp_home)
+        self._name_orchestrator(h, "Yor")
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._latch(h).exists()
+        park.roster_value = None  # channel dies AFTER the signal
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        h.events.clear()
+        h.tick_with_usage(self._PROACTIVE)
+        retry = [
+            e
+            for e in h.events
+            if isinstance(e, EpisodeNoticeEvent) and e.phase == "start"
+        ]
+        assert retry and retry[-1].delivered is False
+        assert "retry" in retry[-1].detail
+        assert "episodeNoticeSentAt" not in h.state()
