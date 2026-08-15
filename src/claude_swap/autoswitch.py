@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, paths, poll_policy
+from claude_swap import context_cost, oauth, paths, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.park import ParkChannel, ParkSession, WaveResult
 from claude_swap.process_detection import pids_with_config_dir
@@ -406,6 +406,10 @@ class SwitchEvent(AutoSwitchEvent):
     # boundary; "timeout" = the fixation cap hit and ``forced`` sessions were
     # swapped mid-turn — the honest waited/torn count in one place. Additive.
     drain2: dict | None = None
+    # True when this proactive switch fired below the threshold off the
+    # small-park early trigger (CON-582) — the burn report correlates the
+    # migration price against it. Additive field, present only when True.
+    early: bool = False
 
     def _fields(self) -> dict:
         fields = {
@@ -420,6 +424,8 @@ class SwitchEvent(AutoSwitchEvent):
             fields["drain"] = self.drain
         if self.drain2 is not None:
             fields["drain2"] = self.drain2
+        if self.early:
+            fields["early"] = True
         return fields
 
     def human(self) -> str:
@@ -457,7 +463,8 @@ class SwitchEvent(AutoSwitchEvent):
                     f", checkpoint cap at {waited}s: {fixed} fixed{proof}, "
                     f"{forced} forced"
                 )
-        return f"{prefix} {src} -> {dst} ({self.trigger}, gate={self.gate}{tail})"
+        label = f"{self.trigger}, early" if self.early else self.trigger
+        return f"{prefix} {src} -> {dst} ({label}, gate={self.gate}{tail})"
 
 
 @dataclass(frozen=True)
@@ -513,9 +520,21 @@ class Drain2SignalEvent(AutoSwitchEvent):
     skipped_interactive: int = 0
     top_up: bool = False  # mid-episode wave to sessions that appeared/woke
     dry_run: bool = False
+    # Migration-price telemetry (CON-582), measured BEFORE the wave: the sum
+    # of the judged sessions' context sizes (each session's last transcript
+    # usage — the prompt footprint its next turn re-creates at full price on
+    # the new account), with the per-session breakdown. None/empty = no
+    # transcript was readable. Additive fields; future thresholds are judged
+    # against these numbers.
+    est_move_tokens: int | None = None
+    est_session_tokens: dict[str, int | None] = field(default_factory=dict)
+    # Sessions left running through the swap on purpose: their context is
+    # at/below ``drain2SmallContextTokens``, so the checkpoint ceremony
+    # would cost more than their cache re-create. Additive.
+    skipped_small: list[str] = field(default_factory=list)
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "targets": self.targets,
             "delivered": self.delivered,
@@ -523,6 +542,13 @@ class Drain2SignalEvent(AutoSwitchEvent):
             "topUp": self.top_up,
             "dryRun": self.dry_run,
         }
+        if self.est_move_tokens is not None:
+            fields["estMoveTokens"] = self.est_move_tokens
+        if self.est_session_tokens:
+            fields["estSessionTokens"] = self.est_session_tokens
+        if self.skipped_small:
+            fields["skippedSmall"] = self.skipped_small
+        return fields
 
     def human(self) -> str:
         confirmed = (
@@ -531,9 +557,47 @@ class Drain2SignalEvent(AutoSwitchEvent):
             else "delivery unconfirmed"
         )
         kind = "top-up checkpoint" if self.top_up else "checkpoint"
+        tail = ""
+        if self.est_move_tokens is not None:
+            tail += f"; ~{self.est_move_tokens} tokens to move"
+        if self.skipped_small:
+            tail += (
+                f"; {len(self.skipped_small)} small session(s) left running"
+            )
         return (
             f"drain2: {kind} signal to {len(self.targets)} session(s) "
-            f"({confirmed}; {self.trigger})"
+            f"({confirmed}; {self.trigger}){tail}"
+        )
+
+
+@dataclass(frozen=True)
+class EarlySwapEvent(AutoSwitchEvent):
+    """A proactive switch starts below the threshold because the busy park
+    is small (CON-582): the migration price of a swap is the sum of the
+    live contexts on the account being left, so at high utilization with
+    only a few sessions mid-turn, leaving now is strictly cheaper than the
+    same forced move at the threshold under a full park."""
+
+    kind: ClassVar[str] = "early-swap"
+    utilization_pct: float
+    early_threshold: float
+    busy_sessions: int
+    max_busy: int
+
+    def _fields(self) -> dict:
+        return {
+            "utilizationPct": self.utilization_pct,
+            "earlyThresholdPct": self.early_threshold,
+            "busySessions": self.busy_sessions,
+            "maxBusy": self.max_busy,
+        }
+
+    def human(self) -> str:
+        return (
+            f"early swap: {pct_label(self.utilization_pct)}% ≥ "
+            f"{pct_label(self.early_threshold)}% with a small park "
+            f"({self.busy_sessions} busy ≤ {self.max_busy}) — proactive "
+            "switch starts before the threshold"
         )
 
 
@@ -1347,12 +1411,21 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        early = False
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                early = self._early_swap_fires(utilization, settings, state)
+                if early:
+                    # The park is small enough that leaving NOW is cheaper
+                    # than the same move at the threshold under a full park
+                    # (CON-582). Rides the proactive trigger end to end —
+                    # ranking, gates, drain2 — only the entry condition and
+                    # the event label differ.
+                    trigger = "proactive"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1365,11 +1438,13 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account
+                    # with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1500,13 +1575,13 @@ class AutoSwitchEngine:
             now=self.clock(),
         )
 
-        if trigger == "consume-first" and ordered:
+        if (trigger == "consume-first" or early) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
-            # decides below the threshold, where the collector only escalates
-            # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
-            # A switch is imminent, so spend the fetches now and re-decide on
-            # fresh data.
+            # and the early swap both decide below the threshold, where the
+            # collector only escalates inside the ESCALATION_MARGIN_PCT band
+            # (flat-traffic invariant). A switch is imminent, so spend the
+            # fetches now and re-decide on fresh data.
             # reserve() serves just-fetched accounts from the store, so this
             # is cheap in-tick and plan-bounded across ticks. The trigger is
             # deliberately NOT re-classified if the fresh active crossed the
@@ -1560,6 +1635,29 @@ class AutoSwitchEngine:
                 # ``_drain2_reconcile``: the gate stops refreshing the
                 # record, so it goes stale and is closed with a resume.
                 return TickOutcome.BLOCKED
+            if early:
+                # Early opportunism that finds nothing better simply stays
+                # put: none of the must-move artifacts — the last-account
+                # alert, the all-exhausted reset sleep — may fire off a
+                # below-threshold tick (the account still has headroom;
+                # nothing is forced). A signaled early episode still
+                # releases: the park must not stay paused for a swap that
+                # cannot happen.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-qualifying-candidate",
+                        detail=(
+                            "no candidate beats the active account by the "
+                            "hysteresis margin; the early swap stays put"
+                        ),
+                    )
+                )
+                self._abandon_switch_intent(
+                    trigger,
+                    "no qualifying candidate for the early swap",
+                    alert=False,
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1643,7 +1741,7 @@ class AutoSwitchEngine:
                 # one — signal every mid-turn session to checkpoint,
                 # confirm fixation from the roster, then swap. Channel
                 # failure falls back to the passive v1 drain below.
-                mode, drain2 = self._drain2_gate(trigger)
+                mode, drain2 = self._drain2_gate(trigger, early=early)
                 if mode == "hold":
                     return TickOutcome.NO_ACTION
                 if mode == "fallback":
@@ -1666,12 +1764,13 @@ class AutoSwitchEngine:
         transient_failure = False
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger == "consume-first" or early:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
-                # or slide to a worse-ranked target; hold and retry next tick.
+                # and the early swap are opportunistic, not escapes — never
+                # act on stale data or slide to a worse-ranked target; hold
+                # and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
                     self._emit(
@@ -1689,7 +1788,7 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform_with_drain2(
-                    num, email, trigger, drain, drain2
+                    num, email, trigger, drain, drain2, early=early
                 )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
@@ -1707,7 +1806,9 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform_with_drain2(num, email, trigger, drain, drain2)
+            return self._perform_with_drain2(
+                num, email, trigger, drain, drain2, early=early
+            )
 
         if transient_failure:
             # Deliberately NO release: the episode survives and the next
@@ -1808,6 +1909,87 @@ class AutoSwitchEngine:
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _early_swap_fires(
+        self, utilization: float, settings: AutoSwitchSettings, state: dict
+    ) -> bool:
+        """Whether the below-threshold early swap fires this tick (CON-582).
+
+        The migration price of a swap is the sum of the live contexts on
+        the account being left — it grows with the park — so at high
+        utilization with only a few sessions mid-turn, leaving NOW is
+        strictly cheaper than the same forced move at the threshold under
+        a full park (the 15-08 episode: 10.2M cache-creation tokens for 12
+        sessions at once). Voluntary economics, never an escape: cooldown
+        and the quiet gate hold it, an unreadable roster declines it (a
+        park that can't be measured can't be called small), and a park
+        bigger than ``earlySwapMaxBusy`` waits for the threshold.
+        Interactive busy sessions count toward the size — they pay the
+        migration like everyone else.
+
+        One decision per episode: a live signaled drain-v2 episode this
+        trigger started keeps firing (the pause is already bought;
+        abandoning it because one more session woke up would pay the pause
+        twice, and the same park would be re-frozen at the threshold
+        anyway). The stickiness ends with the episode — or when
+        utilization leaves the early band, after which the record goes
+        stale and ``_drain2_reconcile`` releases it (same law as a window
+        reset under a threshold episode).
+        """
+        early_threshold = settings.early_swap_threshold
+        if early_threshold <= 0 or utilization < early_threshold:
+            return False
+        record = self._read_drain2()
+        if (
+            record is not None
+            and record.get("phase") == "signaled"
+            and record.get("early")
+        ):
+            updated = record.get("updatedAt")
+            if (
+                isinstance(updated, (int, float))
+                and self.clock() - updated <= DRAIN_STALE_GAP_S
+            ):
+                return True
+        if self._in_cooldown(state):
+            return False
+        if "proactive" in self._gated_triggers():
+            quiet, _ = self._session_quiet()
+            if not quiet:
+                # The quiet gate would hold the switch anyway — don't spend
+                # a roster subprocess proving a park size nobody can use.
+                return False
+        roster = self._park_roster()
+        if roster is None:
+            return False
+        targets, interactive = self._drain2_targets(roster)
+        busy = len(targets) + interactive
+        if busy > settings.early_swap_max_busy:
+            return False
+        self._emit(
+            EarlySwapEvent(
+                utilization_pct=utilization,
+                early_threshold=early_threshold,
+                busy_sessions=busy,
+                max_busy=settings.early_swap_max_busy,
+            )
+        )
+        return True
+
+    def _move_cost(
+        self, sessions: list[tuple[str, str]]
+    ) -> context_cost.MoveCost:
+        """Estimate the migration price of ``sessions`` (name, session_id)
+        from their transcripts; the estimator must never break a tick."""
+        try:
+            return context_cost.estimate_move_cost(
+                self.claude_projects_dir, sessions
+            )
+        except Exception as e:  # pragma: no cover - defensive boundary
+            _logger.debug("move-cost estimate raised: %r", e)
+            return context_cost.MoveCost(
+                per_session={name: None for name, _ in sessions}
+            )
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -1962,12 +2144,15 @@ class AutoSwitchEngine:
         trigger: str,
         drain: dict | None,
         drain2: dict | None,
+        early: bool = False,
     ) -> TickOutcome:
         """Perform the switch, then complete any drain-v2 episode behind it
         (mark swapped → verify the new account → resume wave). A failed
         switch leaves the episode in place, so the retry keeps its label
         and its fixation bookkeeping (acked/soft/streaks)."""
-        outcome = self._perform(number, email, trigger, drain=drain, drain2=drain2)
+        outcome = self._perform(
+            number, email, trigger, drain=drain, drain2=drain2, early=early
+        )
         if outcome is TickOutcome.SWITCHED and drain2 is not None:
             self._drain2_mark_swapped(number)
             self._drain2_finish()
@@ -1980,6 +2165,7 @@ class AutoSwitchEngine:
         trigger: str,
         drain: dict | None = None,
         drain2: dict | None = None,
+        early: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -1994,6 +2180,7 @@ class AutoSwitchEngine:
                     gate="quiet" if quiet else "forced",
                     drain=drain,
                     drain2=drain2,
+                    early=early,
                 )
             )
             return TickOutcome.SWITCHED
@@ -2065,6 +2252,7 @@ class AutoSwitchEngine:
                 gate="quiet" if quiet else "forced",
                 drain=drain,
                 drain2=drain2,
+                early=early,
             )
         )
         return TickOutcome.SWITCHED
@@ -2425,7 +2613,48 @@ class AutoSwitchEngine:
                 excluded |= owned
         return excluded
 
-    def _drain2_gate(self, trigger: str) -> tuple[str, dict | None]:
+    def _drain2_split_small(
+        self, sessions: list[ParkSession]
+    ) -> tuple[context_cost.MoveCost, list[str]]:
+        """Price the sessions and name the ones too small to checkpoint.
+
+        Returns ``(cost, small)``: the transcript-based migration estimate
+        for every session (CON-582 telemetry, taken BEFORE any wave), and
+        the sorted names whose known context sits at/below
+        ``drain2SmallContextTokens`` — their post-swap cache re-create is
+        pocket change next to the checkpoint ceremony, so they ride through
+        the swap unfrozen. Unknown is not small: a transcript the engine
+        can't read could be a 900k context, so it gets checkpointed.
+        """
+        cost = self._move_cost([(s.name, s.session_id) for s in sessions])
+        small_max = self.settings.drain2_small_context_tokens
+        small = sorted(
+            s.name
+            for s in sessions
+            if small_max > 0
+            and (tokens := cost.per_session.get(s.name)) is not None
+            and tokens <= small_max
+        )
+        return cost, small
+
+    @staticmethod
+    def _drain2_cost_fields(record: dict) -> dict:
+        """The additive telemetry a drain2 record carries into its
+        SwitchEvent payload: the pre-wave migration estimate and how many
+        sessions rode through unfrozen. Keys appear only when known, so
+        pre-CON-582 records (and unpriceable parks) keep the old shape."""
+        fields: dict = {}
+        est = record.get("estMoveTokens")
+        if isinstance(est, (int, float)) and not isinstance(est, bool):
+            fields["estMoveTokens"] = int(est)
+        small = record.get("small")
+        if isinstance(small, list) and small:
+            fields["skippedSmall"] = len(small)
+        return fields
+
+    def _drain2_gate(
+        self, trigger: str, *, early: bool = False
+    ) -> tuple[str, dict | None]:
         """Active-checkpoint gate for the forced proactive switch.
 
         Returns ``(mode, drain2_info)``: ``("hold", None)`` — episode in
@@ -2491,8 +2720,8 @@ class AutoSwitchEngine:
         by_name = {s.name: s for s in roster}
 
         if record is None:
-            targets, skipped_interactive = self._drain2_targets(roster)
-            if not targets:
+            busy, skipped_interactive = self._drain2_targets(roster)
+            if not busy:
                 # Nobody is mid-turn: the pause already exists.
                 return "proceed", {
                     "outcome": "ready",
@@ -2502,6 +2731,38 @@ class AutoSwitchEngine:
                     "ackFixed": 0,
                     "softFixed": 0,
                 }
+            # Price the move BEFORE any wave (CON-582): the estimate covers
+            # every mid-turn session — the small ones pay too, just without
+            # the ceremony — so future thresholds are judged by the number.
+            cost, small = self._drain2_split_small(busy)
+            targets = [s for s in busy if s.name not in small]
+            if not targets:
+                # Everyone mid-turn is pocket change: swap without a pause
+                # — freezing them would cost more than their re-creates.
+                info = {
+                    "outcome": "ready",
+                    "waitedSeconds": 0,
+                    "fixed": 0,
+                    "forced": 0,
+                    "ackFixed": 0,
+                    "softFixed": 0,
+                    "skippedSmall": len(small),
+                }
+                if cost.total is not None:
+                    info["estMoveTokens"] = cost.total
+                self._emit(
+                    Drain2SignalEvent(
+                        trigger=trigger,
+                        targets=[],
+                        delivered=[],
+                        skipped_interactive=skipped_interactive,
+                        dry_run=self.dry_run,
+                        est_move_tokens=cost.total,
+                        est_session_tokens=cost.per_session,
+                        skipped_small=small,
+                    )
+                )
+                return "proceed", info
             names = sorted(s.name for s in targets)
             if not self.dry_run:
                 # Receipts from previous episodes must not pre-fix anyone.
@@ -2510,7 +2771,7 @@ class AutoSwitchEngine:
             if not wave.ok:
                 self._drain2_go_unavailable(f"stop wave failed: {wave.detail}")
                 return "fallback", None
-            self._write_drain2({
+            new_record = {
                 "phase": "signaled",
                 "trigger": trigger,
                 "startedAt": now,
@@ -2518,7 +2779,17 @@ class AutoSwitchEngine:
                 "signaled": {
                     s.name: {"sessionId": s.session_id} for s in targets
                 },
-            })
+            }
+            if early:
+                # Marks the episode as started by the small-park early
+                # trigger, so `_early_swap_fires` keeps feeding it without
+                # re-judging the park size every tick.
+                new_record["early"] = True
+            if small:
+                new_record["small"] = small
+            if cost.total is not None:
+                new_record["estMoveTokens"] = cost.total
+            self._write_drain2(new_record)
             self._emit(
                 Drain2SignalEvent(
                     trigger=trigger,
@@ -2526,6 +2797,9 @@ class AutoSwitchEngine:
                     delivered=wave.delivered,
                     skipped_interactive=skipped_interactive,
                     dry_run=self.dry_run,
+                    est_move_tokens=cost.total,
+                    est_session_tokens=cost.per_session,
+                    skipped_small=small,
                 )
             )
             self._emit(
@@ -2541,28 +2815,65 @@ class AutoSwitchEngine:
 
         # Episode in progress: top up newcomers, then judge fixation.
         signaled = dict(record.get("signaled") or {})
+        known_small = sorted(
+            n for n in (record.get("small") or []) if isinstance(n, str)
+        )
         targets, skipped_interactive = self._drain2_targets(roster)
-        fresh = sorted(s.name for s in targets if s.name not in signaled)
-        if fresh:
-            if not self.dry_run:
-                self._drain2_clear_acks(fresh)
-            wave = self._drain2_wave(fresh, self._drain2_stop_message())
-            # Track them regardless of wave health: the count must cover
-            # every session the swap can tear; an unsignaled newcomer is
-            # simply forced at the cap, honestly counted.
-            for s in targets:
-                if s.name in fresh:
-                    signaled[s.name] = {"sessionId": s.session_id}
+        newcomers = [
+            s
+            for s in targets
+            if s.name not in signaled and s.name not in known_small
+        ]
+        if newcomers:
+            # Same law as the initial wave: price first, then leave the
+            # pocket-change contexts running. A session judged small stays
+            # small for the episode (recorded), so it is neither re-priced
+            # nor re-announced every tick.
+            cost, fresh_small = self._drain2_split_small(newcomers)
+            fresh = sorted(
+                s.name for s in newcomers if s.name not in fresh_small
+            )
+            if fresh_small:
+                known_small = sorted({*known_small, *fresh_small})
+                record = {**record, "small": known_small}
+            if cost.total is not None:
+                prev_est = record.get("estMoveTokens")
+                prev_est = (
+                    int(prev_est)
+                    if isinstance(prev_est, (int, float))
+                    and not isinstance(prev_est, bool)
+                    else 0
+                )
+                record = {**record, "estMoveTokens": prev_est + cost.total}
+            wave = None
+            if fresh:
+                if not self.dry_run:
+                    self._drain2_clear_acks(fresh)
+                wave = self._drain2_wave(fresh, self._drain2_stop_message())
+                # Track them regardless of wave health: the count must cover
+                # every session the swap can tear; an unsignaled newcomer is
+                # simply forced at the cap, honestly counted.
+                for s in newcomers:
+                    if s.name in fresh:
+                        signaled[s.name] = {"sessionId": s.session_id}
             self._emit(
                 Drain2SignalEvent(
                     trigger=trigger,
                     targets=fresh,
                     # None = unconfirmed (the wave failed or its report was
-                    # unparseable) — never a confirmed zero.
-                    delivered=wave.delivered if wave.ok else None,
+                    # unparseable) — never a confirmed zero. No wave at all
+                    # (every newcomer was small) is a confirmed zero.
+                    delivered=(
+                        (wave.delivered if wave.ok else None)
+                        if wave is not None
+                        else []
+                    ),
                     skipped_interactive=skipped_interactive,
                     top_up=True,
                     dry_run=self.dry_run,
+                    est_move_tokens=cost.total,
+                    est_session_tokens=cost.per_session,
+                    skipped_small=fresh_small,
                 )
             )
 
@@ -2631,6 +2942,7 @@ class AutoSwitchEngine:
                 "forced": 0,
                 "ackFixed": len(acked),
                 "softFixed": len(soft),
+                **self._drain2_cost_fields(record),
             }
         if waited < max_wait:
             self._write_drain2({
@@ -2681,6 +2993,7 @@ class AutoSwitchEngine:
             "forced": len(unfixed),
             "ackFixed": len(acked),
             "softFixed": len(soft),
+            **self._drain2_cost_fields(record),
         }
 
     def _drain2_mark_swapped(self, number: str) -> None:
@@ -2936,7 +3249,9 @@ class AutoSwitchEngine:
             self._mutate_state(close_and_backoff)
         self._drain2_release_until = until
 
-    def _abandon_switch_intent(self, trigger: str, reason: str) -> None:
+    def _abandon_switch_intent(
+        self, trigger: str, reason: str, *, alert: bool = True
+    ) -> None:
         """This tick had to switch and learned nobody can take the park:
         the switch intent is dead, and every drain artifact dies with it
         (CON-572 class B: the 15-08 stale v1 record — "already waited
@@ -2952,7 +3267,10 @@ class AutoSwitchEngine:
         would only stall the orderly episode a new candidate deserves.
         Only the KNOWN-dead intents call this — a transiently unreadable
         tick (no-comparison) holds every artifact instead, like the
-        transient freshen failure does.
+        transient freshen failure does. ``alert=False`` skips the
+        last-account cry: a below-threshold early tick (CON-582) that found
+        nothing better is staying put by choice, not down to its last
+        account.
         """
         record = self._read_drain2()
         if record is not None and record.get("phase") == "signaled":
@@ -2964,7 +3282,8 @@ class AutoSwitchEngine:
             self._write_drain2(None)
         if self._read_drain() is not None:
             self._write_drain(None)
-        self._alert_last_account(trigger, reason)
+        if alert:
+            self._alert_last_account(trigger, reason)
 
     def _alert_last_account(self, trigger: str, reason: str) -> None:
         """Emit the "park is on its last working account" alert, once per
