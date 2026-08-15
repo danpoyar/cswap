@@ -633,6 +633,12 @@ def run(switcher) -> int:
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                elif ev.kind == "last-account":
+                    # Deduped engine-side (CON-572): fires once per drought,
+                    # re-arms when a qualifying candidate appears again.
+                    rumps.notification(
+                        "claude-swap", "Park is on its last account", ev.human()
+                    )
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a

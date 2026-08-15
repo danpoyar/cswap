@@ -895,22 +895,32 @@ class TestDrainGate:
         assert h.state()["drain"]["startedAt"] == h.clock.now
 
     def test_timeout_warns_once_across_blocked_attempts(self, temp_home):
-        # Ceiling reached but no viable target: the engine keeps trying every
-        # tick (like today) without re-waiting a full ceiling and without
-        # repeating the WARN.
+        # Ceiling reached but the swap keeps failing PAST the gate (every
+        # ranked target refuses to freshen): the engine keeps trying every
+        # tick without re-waiting a full ceiling and without repeating the
+        # WARN. (Since CON-572 a tick with no candidate at all never
+        # starts or keeps a drain — the episode's wait belongs to a switch
+        # that can actually happen — so the blocked attempts here are
+        # post-gate failures.)
         h = self._drain_harness(temp_home, switch_under_load=True)
-        exhausted = {"1": _usage(96), "2": _usage(100), "3": _usage(100)}
         _write_transcript(h, age_s=10.0)
-        assert h.tick_with_usage(exhausted) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
         h.clock.advance(610.0)
         _write_transcript(h, age_s=10.0)
-        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
-        h.clock.advance(60.0)
-        _write_transcript(h, age_s=10.0)
-        assert h.tick_with_usage(exhausted) is TickOutcome.BLOCKED
+        with patch.object(
+            h.engine, "_freshen_target", return_value="skip-live-session"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.BLOCKED
+            h.clock.advance(60.0)
+            _write_transcript(h, age_s=10.0)
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.BLOCKED
         warns = [e for e in h.events if isinstance(e, DrainTimeoutEvent)]
         assert len(warns) == 1
-        assert self._reasons(h) == ["drain-wait"]  # no re-wait after timeout
+        assert self._reasons(h) == [  # no re-wait after the timeout
+            "drain-wait",
+            "no-viable-target",
+            "no-viable-target",
+        ]
         assert h.state()["drain"]["timeoutWarned"] is True
 
     def test_failed_attempt_keeps_the_episode(self, temp_home):
@@ -4526,6 +4536,11 @@ class TestDrainV2:
         assert "drain2" not in h.state()  # episode closed
         # And the next ticks do NOT re-signal a fresh pause into the
         # just-released park while there is still nobody to switch to.
+        # Since CON-572 the guard is structural — candidates are judged
+        # before any wave — so no release backoff is armed for the
+        # no-candidate case (it would stall the orderly episode a fresh
+        # ``cswap add`` candidate deserves; see
+        # test_candidate_added_after_release_starts_a_fresh_episode).
         h.clock.advance(30.0)
         _write_transcript(h, age_s=1.0)
         h.events.clear()
@@ -4533,11 +4548,8 @@ class TestDrainV2:
         h.tick_with_usage(exhausted)
         assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
         assert len(park.waves) == waves_before
-        # The release backoff survives the process (review r1 finding 1):
-        # the episode record shares the state file across cron ``--once``
-        # ticks and daemon restarts, so the backoff must too — a fresh
-        # engine must not re-signal a pause either.
-        assert h.state()["drain2ReleaseUntil"] > h.clock.now
+        assert "drain2ReleaseUntil" not in h.state()
+        # A fresh engine must not re-signal a pause either.
         h.engine = h._make_engine(park=park)
         h.clock.advance(30.0)
         _write_transcript(h, age_s=1.0)
@@ -4568,6 +4580,229 @@ class TestDrainV2:
         assert resume.targets == ["fix-a"]
         assert park.waves[-1][0] == ["fix-a"]
         assert "drain2" not in h.state()
+
+    # -- CON-572 (postmortem 15-08): candidates are judged BEFORE any wave
+    # or passive wait, and no drain artifact outlives its episode.
+
+    def test_no_candidate_alerts_instead_of_waving(self, temp_home):
+        # CON-572 class A (17:16:56Z and 17:29:24Z): the engine paused six
+        # working sessions with a stop wave and only THEN judged candidates
+        # — found nobody, resumed the park 85 seconds later; twice in 13
+        # minutes. The wave belongs to a switch that can actually happen:
+        # with no qualifying candidate the park is on its last account, and
+        # the engine's job is one deduped human alert, not a pause.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a"), _park_row("fix-b")]
+        _write_transcript(h, age_s=1.0)
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        outcome = h.tick_with_usage(crowded)
+        assert park.waves == []  # the park was never paused
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert "drain2" not in h.state() and "drain" not in h.state()
+        alerts = [e for e in h.events if e.kind == "last-account"]
+        assert len(alerts) == 1
+        assert alerts[0].to_json()["reason"]  # says why nobody qualifies
+        # Same condition on later ticks: the alert does not repeat.
+        for _ in range(2):
+            h.clock.advance(30.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        assert len([e for e in h.events if e.kind == "last-account"]) == 1
+        assert park.waves == []
+        # A restarted engine shares the dedup through the state file.
+        h.engine = h._make_engine(park=park)
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        assert len([e for e in h.events if e.kind == "last-account"]) == 1
+        # A candidate appearing re-arms the alert and gets the normal wave.
+        h.seed(4, "d@example.com")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        with_new = {**crowded, "4": _usage(5)}
+        assert h.tick_with_usage(with_new) is TickOutcome.NO_ACTION
+        assert [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert "lastAccountAlertedAt" not in h.state()
+
+    def test_drain2_release_resets_the_whole_drain_state(self, temp_home):
+        # CON-572 class B, root cause: the 15-08 episode left the passive
+        # v1 drain record alive across two drain2 releases; its "already
+        # waited 1648s" timeout later authorized a forced swap into a
+        # WORKING park. A release ends the switch intent — every drain
+        # artifact dies with it, and later no-candidate ticks must not
+        # quietly accumulate a new passive wait in the background.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED  # released
+        assert "drain2" not in h.state() and "drain" not in h.state()
+        # The park works on; ticks keep finding nobody. Neither wave nor
+        # wait may build up while there is nobody to switch to.
+        park.roster_value = [_park_row("fix-a")]
+        waves_before = len(park.waves)
+        for _ in range(4):
+            h.clock.advance(300.0)
+            _write_transcript(h, age_s=1.0)
+            assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+            assert "drain" not in h.state()
+            assert "drain2" not in h.state()
+        assert len(park.waves) == waves_before  # no re-signal, no re-pause
+
+    def test_candidate_added_after_release_starts_a_fresh_episode(
+        self, temp_home
+    ):
+        # CON-572 class B, the money shot (17:34:05Z): ``cswap add`` put a
+        # fresh account onto a park that was WORKING again after two
+        # no-candidate releases — and the engine swapped the same tick,
+        # gate=forced, authorized by a drain episode resumed 3 minutes
+        # earlier (drain: timeout, waitedSeconds=1648). A new candidate on
+        # a working park deserves the normal orderly episode — wave →
+        # checkpoints → swap → resume — never a swap on stale waited time.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED  # released
+        # The park resumes work; the account stays over the threshold and
+        # ticks keep finding nobody — the 17:18–17:33Z stretch.
+        park.roster_value = [_park_row("fix-a")]
+        for _ in range(4):
+            h.clock.advance(300.0)
+            _write_transcript(h, age_s=1.0)
+            h.tick_with_usage(crowded)
+        h.events.clear()
+        waves_before = len(park.waves)
+        # 17:33Z: a fresh slot is added onto the working park.
+        h.seed(4, "d@example.com")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        with_new = {**crowded, "4": _usage(5)}
+        outcome = h.tick_with_usage(with_new)
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1  # nobody swapped under the working park
+        signal = next(e for e in h.events if isinstance(e, Drain2SignalEvent))
+        assert signal.targets == ["fix-a"]
+        assert len(park.waves) == waves_before + 1
+        # The fresh episode then completes normally: checkpoint → swap →
+        # resume (the ticket's regression pin for the reordered tick).
+        self._ack(h, "fix-a")
+        h.clock.advance(60.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(with_new) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        payload = switch.to_json()
+        assert payload["drain2"]["outcome"] == "ready"
+        assert "drain" not in payload  # no stale passive-drain label
+        resume = [e for e in h.events if isinstance(e, Drain2ResumeEvent)][-1]
+        assert resume.targets == ["fix-a"]
+        assert "drain2" not in h.state()
+        # The alert dedup re-armed the moment a candidate existed again.
+        assert "lastAccountAlertedAt" not in h.state()
+
+    def test_unreadable_candidates_hold_a_live_episode(self, temp_home):
+        # CON-572 review r1, Important 1: one tick of unreadable candidate
+        # usage mid-episode must not release the pause — the first cut of
+        # the fix released it, and the next readable tick re-froze the
+        # park with a fresh STOP wave (thrash wave→release→wave). Same law
+        # as the transient freshen failure: a blip holds every artifact.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert len(park.waves) == 1  # the STOP wave
+        # Blip: no candidate has readable usage this tick.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        blip = {"1": _usage(96), "2": None, "3": None}
+        assert h.tick_with_usage(blip) is TickOutcome.BLOCKED
+        assert not [e for e in h.events if isinstance(e, Drain2ResumeEvent)]
+        assert h.state()["drain2"]["phase"] == "signaled"  # pause survived
+        assert len(park.waves) == 1  # no release wave went out
+        # Usage readable again: the SAME episode proceeds — no second STOP.
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.SWITCHED
+        assert len(
+            [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        ) == 1
+        assert "drain2" not in h.state()
+
+    def test_freshen_dead_targets_release_with_backoff(self, temp_home):
+        # CON-572 review r1, Important 2: the one release path left with a
+        # backoff — candidates keep qualifying but none can be activated
+        # ("every ranked target failed to freshen") — had no live test, so
+        # a mutation dropping the backoff passed the whole suite. Pin it:
+        # the release arms ``drain2ReleaseUntil``, and the next tick with
+        # the same broken candidates goes passive v1, never a fresh pause.
+        h, park = self._harness(temp_home)
+        park.roster_value = [_park_row("fix-a")]
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        self._ack(h, "fix-a")
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a", status="idle")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="skip-live-session"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.BLOCKED
+        resume = next(e for e in h.events if isinstance(e, Drain2ResumeEvent))
+        assert resume.reason == (
+            "released without a swap: every ranked target failed to freshen"
+        )
+        assert resume.targets == ["fix-a"]
+        assert "drain2" not in h.state()
+        assert h.state()["drain2ReleaseUntil"] > h.clock.now  # backoff armed
+        # While the same broken candidates keep qualifying, the backoff
+        # stands v2 down: the passive v1 wait takes over, no new pause.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        park.roster_value = [_park_row("fix-a")]
+        with patch.object(
+            h.engine, "_freshen_target", return_value="skip-live-session"
+        ):
+            assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert self._reasons(h)[-1] == "drain-wait"
+        assert len(
+            [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        ) == 1
+
+    def test_release_clears_a_fallback_v1_record(self, temp_home):
+        # CON-572 review r1, Minor 3: the line that drops the v1 record on
+        # a dead intent was reachable by no test (the pure drain2 flows
+        # never start a v1 wait). Build the record through the fallback —
+        # park channel down — then crowd the candidates out: the record
+        # must die with the intent, or class B comes back whenever the
+        # channel is broken.
+        h, park = self._harness(temp_home)
+        park.roster_value = None  # `claude agents --json` down → v1 fallback
+        _write_transcript(h, age_s=1.0)
+        assert h.tick_with_usage(self._PROACTIVE) is TickOutcome.NO_ACTION
+        assert "drain" in h.state()  # passive v1 wait started
+        # Candidates crowd out: the intent dies — the v1 record with it.
+        h.clock.advance(30.0)
+        _write_transcript(h, age_s=1.0)
+        crowded = {"1": _usage(96), "2": _usage(97), "3": _usage(98)}
+        assert h.tick_with_usage(crowded) is TickOutcome.BLOCKED
+        assert "drain" not in h.state()
+        assert [e for e in h.events if e.kind == "last-account"]
 
     def test_rapid_ticks_never_soft_fix_within_one_turn_boundary(
         self, temp_home
