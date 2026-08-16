@@ -381,3 +381,17 @@ class TestSessionProfileEnvPinned:
         custom = get_backup_root() / "sessions-lookalike"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
         assert get_claude_config_home() == custom
+
+    def test_unresolvable_paths_fail_open_to_the_env(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A resolve() failure keeps pre-pin behavior (honor the env): killing
+        a legitimate relocation on a transient OS error would be worse."""
+        custom = self._profile_dir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+
+        def _boom(self, strict=False):
+            raise OSError("resolve failed")
+
+        monkeypatch.setattr(Path, "resolve", _boom)
+        assert get_claude_config_home() == custom

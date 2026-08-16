@@ -1,7 +1,9 @@
 """Path resolution for Claude Code config and credential files.
 
 Mirrors claude-code's own resolution so cswap reads and writes the same files
-claude-code does. Key rules (from claude-code source):
+claude-code does — with one deliberate divergence: a ``CLAUDE_CONFIG_DIR``
+naming one of cswap's own session profiles is ignored (see
+:func:`_config_dir_env`). Key rules (from claude-code source):
 
 - Config home: ``CLAUDE_CONFIG_DIR`` if set, else ``~/.claude``.
 - Global config: ``<config_home>/.config.json`` if it exists (legacy),
@@ -81,10 +83,11 @@ def get_global_config_path() -> Path:
     naming one of cswap's own session profiles is ignored — see
     :func:`_config_dir_env`.
     """
-    legacy = get_claude_config_home() / ".config.json"
+    env = _config_dir_env()
+    config_home = Path(env) if env else Path.home() / ".claude"
+    legacy = config_home / ".config.json"
     if legacy.exists():
         return legacy
-    env = _config_dir_env()
     base = Path(env) if env else Path.home()
     return base / ".claude.json"
 
