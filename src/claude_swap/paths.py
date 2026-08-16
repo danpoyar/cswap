@@ -31,9 +31,43 @@ from claude_swap.models import Platform
 LEGACY_BACKUP_DIRNAME = ".claude-swap-backup"
 
 
-def get_claude_config_home() -> Path:
-    """Return the Claude config home directory (CLAUDE_CONFIG_DIR or ~/.claude)."""
+def _config_dir_env() -> str | None:
+    """``CLAUDE_CONFIG_DIR`` when it names a profile cswap may honor, else None.
+
+    An env value pointing inside cswap's own session-profile root
+    (``<backup_root>/sessions``) is treated as unset: it is the inherited
+    environment of a ``cswap run`` child (or anything that child spawned),
+    not a relocated default profile. Every store these helpers pair with —
+    the active-credential Keychain item, the slot backups, ``sequence.json``
+    — is machine-global, so honoring the session dir makes cswap
+    misattribute the machine's live login to the runner's own slot: ``list``
+    crowns that slot (active) holding the *global* live credential (a
+    phantom credential collision with the real live slot), and the
+    rotated-backup resync's identity re-check passes against the profile's
+    ``.claude.json`` and writes a foreign live credential into the runner's
+    slot backup (CON-713). A genuine relocation (env outside the sessions
+    root) is honored unchanged.
+    """
     env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not env:
+        return None
+    try:
+        candidate = Path(os.path.expanduser(env)).resolve()
+        sessions_root = (get_backup_root() / "sessions").resolve()
+    except OSError:
+        return env
+    if candidate == sessions_root or sessions_root in candidate.parents:
+        return None
+    return env
+
+
+def get_claude_config_home() -> Path:
+    """Return the Claude config home directory (CLAUDE_CONFIG_DIR or ~/.claude).
+
+    A ``CLAUDE_CONFIG_DIR`` naming one of cswap's own session profiles is
+    ignored — see :func:`_config_dir_env`.
+    """
+    env = _config_dir_env()
     if env:
         return Path(env)
     return Path.home() / ".claude"
@@ -43,12 +77,14 @@ def get_global_config_path() -> Path:
     """Return the path to the global Claude config file.
 
     Returns the legacy ``<config_home>/.config.json`` if it exists, else
-    ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``.
+    ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``. A ``CLAUDE_CONFIG_DIR``
+    naming one of cswap's own session profiles is ignored — see
+    :func:`_config_dir_env`.
     """
     legacy = get_claude_config_home() / ".config.json"
     if legacy.exists():
         return legacy
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    env = _config_dir_env()
     base = Path(env) if env else Path.home()
     return base / ".claude.json"
 
