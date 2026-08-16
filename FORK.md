@@ -168,6 +168,21 @@ read in one sitting.
   back to the whole roster when the probe can't answer. Worth sending
   upstream.
 
+- Pool-shield under `consume-first` (`autoswitch.py`, CON-712): with a
+  configured `autoswitch.model`, voluntary decisions judge the account-wide
+  5h/7d axis — the below-threshold/early trigger comparison uses it, and
+  voluntary landings prefer model-burned hosts (model window past the
+  threshold, account itself healthy) over model-fresh ones; a rescue move
+  off a model-fresh active onto a burned host skips reset ordering and the
+  early-swap hysteresis, and the reverse trade (burned host → fresh) is
+  refused below the threshold. The model window still binds the at-limit
+  escape and every escape landing. Without this, the rotation hoarded the
+  fleet's scarcest resource: on 2026-08-16 the engine held account 36
+  (Fable 60%, 5h 0%) as the active host for a whole working day — every
+  other candidate read "unhealthy" through the Fable lens — while the slot
+  pool the bg fleet feeds from ran dry of Fable-fresh accounts. Fleet-shaped
+  policy; offer upstream after it survives the fleet.
+
 ## Syncing with upstream
 
 ```

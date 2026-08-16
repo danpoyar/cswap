@@ -5374,3 +5374,140 @@ class TestDrain2MoveCost:
             for e in h.events
             if isinstance(e, Drain2SignalEvent) and e.top_up
         ]
+
+
+# --- pool-shield: consume-first parks on model-burned hosts (CON-712) ----------
+
+
+def _shield_usage(
+    pct5: float, pct7: float, fable: float, reset7: str | None = None
+) -> dict:
+    """Usage with 5h/7d windows plus a per-model (Fable) weekly window."""
+    seven: dict = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    return {
+        "five_hour": {"pct": pct5},
+        "seven_day": seven,
+        "scoped": [{"name": "Fable", "pct": fable}],
+    }
+
+
+class TestConsumeFirstPoolShield:
+    """With a configured model, the voluntary rotation must not hoard
+    model-fresh accounts (CON-712): fleet work is pinned to that model and
+    starves while the rotation holds a fresh one active (live shape:
+    account 36 sat at Fable 60% / 5h 0% as the held-active host all day
+    with the slot pool dry). Voluntary decisions judge the account-wide
+    5h/7d axis and prefer model-burned hosts; the model window keeps
+    binding the at-limit escape and every escape landing.
+    """
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_fresh_active_moves_to_model_burned_host(self, temp_home):
+        # The ticket's live shape: active #1 is model-fresh (the pool wants
+        # it), #2/#3 are Fable-burned but 5h/7d-healthy. Old rule: both
+        # candidates read unhealthy (Fable >= threshold) and the active
+        # resets soonest -> the fresh account is held forever. New rule:
+        # burned hosts are PREFERRED landings, the rescue move ignores
+        # reset ordering, and soonest reset ranks within the burned class.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(0, 40, 60, _R_SOON),
+            "2": _shield_usage(0, 60, 95, _R_LATEST),
+            "3": _shield_usage(0, 59, 98, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_nudge_never_trades_burned_host_for_fresh(self, temp_home):
+        # Reverse guard: the active host is Fable-burned with 5h/7d room.
+        # Old rule read it as 95% utilized -> proactive escape onto the
+        # fresh account (re-hoarding it). New rule: below the 5h/7d
+        # threshold this is the correct parking spot; a model-fresh
+        # candidate is refused even when it resets strictly sooner.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(10, 50, 95, _R_LATER),
+            "2": _shield_usage(0, 10, 10, _R_SOON),
+            "3": _shield_usage(0, 96, 10, _R_SOON),  # 7d-unhealthy: refused
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_burned_hosts_still_rotate_to_sooner_reset(self, temp_home):
+        # Between two burned hosts the strategy's own law still applies:
+        # move only to a strictly-sooner weekly reset. (Old rule: the
+        # active host read as over-threshold and every burned candidate
+        # was refused outright -> BLOCKED.)
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(0, 50, 95, _R_LATER),
+            "2": _shield_usage(0, 40, 97, _R_SOON),
+            "3": _shield_usage(0, 30, 92, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_at_limit_escape_still_lands_model_fresh(self, temp_home):
+        # The model window keeps binding the escape: Fable maxed on the
+        # active host is the wall for model-pinned work, and the landing
+        # still ranks model-healthy accounts first (2026-07-31 incident
+        # class must not regress).
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(0, 20, 100, _R_LATER),
+            "2": _shield_usage(0, 30, 99, _R_SOON),
+            "3": _shield_usage(0, 60, 30, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+
+    def test_proactive_fires_on_account_wide_axis_and_prefers_burned(
+        self, temp_home
+    ):
+        # 5h really is running out -> must move (proactive), and the
+        # landing still prefers the model-burned host over the fresh one.
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(95, 40, 10, _R_SOON),
+            "2": _shield_usage(0, 50, 95, _R_LATEST),
+            "3": _shield_usage(0, 20, 20, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_without_model_setting_nothing_changes(self, temp_home):
+        # No configured model -> no shield axis: plain consume-first reset
+        # ordering, exactly as before.
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
