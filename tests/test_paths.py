@@ -314,3 +314,84 @@ class TestMigrateLegacyBackupDir:
         moved = target / "credentials" / ".creds-1-user@example.com.enc"
         assert moved.stat().st_mode & 0o777 == 0o600
         assert (target / "credentials").stat().st_mode & 0o777 == 0o700
+
+
+class TestSessionProfileEnvPinned:
+    """``CLAUDE_CONFIG_DIR`` pointing inside cswap's own session-profile root
+    must not redirect the live-profile paths (CON-713).
+
+    A ``cswap run`` child (and every agent it spawns) inherits
+    ``CLAUDE_CONFIG_DIR=<backup_root>/sessions/<slot>``. The stores these
+    helpers pair with — the active-credential Keychain item, the slot
+    backups, ``sequence.json`` — are all machine-global, so honoring the
+    session dir here makes cswap misattribute the machine's live login to
+    the runner's own slot: ``list`` marks that slot (active) and reports a
+    phantom credential collision with the real live slot, and the rotated
+    -backup resync would pass its identity re-check against the profile's
+    ``.claude.json`` and write a foreign live credential into the runner's
+    slot backup. A genuinely relocated config (env outside the sessions
+    root) keeps working unchanged.
+    """
+
+    def _profile_dir(self, name: str = "31-claude12_amouen.com") -> Path:
+        return get_backup_root() / "sessions" / name
+
+    def test_config_home_pins_to_default_inside_session_profile(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._profile_dir()))
+        assert get_claude_config_home() == isolated_home / ".claude"
+
+    def test_global_config_pins_to_default_inside_session_profile(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._profile_dir()))
+        assert get_global_config_path() == isolated_home / ".claude.json"
+
+    def test_credentials_path_pins_to_default_inside_session_profile(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._profile_dir()))
+        assert (
+            get_credentials_path()
+            == isolated_home / ".claude" / ".credentials.json"
+        )
+
+    def test_session_root_itself_pins_to_default(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv(
+            "CLAUDE_CONFIG_DIR", str(get_backup_root() / "sessions")
+        )
+        assert get_claude_config_home() == isolated_home / ".claude"
+
+    def test_foreign_config_dir_is_still_honored(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A genuine relocation (outside the sessions root) keeps working."""
+        custom = isolated_home / "relocated-claude"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        assert get_claude_config_home() == custom
+        assert get_global_config_path() == custom / ".claude.json"
+
+    def test_sibling_of_sessions_root_is_still_honored(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only the sessions subtree pins — not the backup root's siblings."""
+        custom = get_backup_root() / "sessions-lookalike"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+        assert get_claude_config_home() == custom
+
+    def test_unresolvable_paths_fail_open_to_the_env(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A resolve() failure keeps pre-pin behavior (honor the env): killing
+        a legitimate relocation on a transient OS error would be worse."""
+        custom = self._profile_dir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom))
+
+        def _boom(self, strict=False):
+            raise OSError("resolve failed")
+
+        monkeypatch.setattr(Path, "resolve", _boom)
+        assert get_claude_config_home() == custom

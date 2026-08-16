@@ -8030,3 +8030,80 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestSessionProfileEnvPoisoning:
+    """cswap invoked from inside a cswap-spawned session profile (CON-713).
+
+    A ``cswap run`` child inherits ``CLAUDE_CONFIG_DIR=<backup>/sessions/<slot>``,
+    but the live-credential store cswap pairs that identity with (the
+    "Claude Code-credentials" Keychain item) is machine-global. Honoring the
+    inherited env made ``_build_accounts_info`` crown the runner's own slot
+    (active) holding the *global* live credential — a phantom credential
+    collision in ``list`` (the 31+36 → 31+35 shape) — and would let
+    ``_resync_rotated_backup`` write that foreign live credential into the
+    runner's slot backup with every identity guard green.
+    """
+
+    def _seed(self, temp_home, sample_sequence_data, monkeypatch):
+        # The machine-global live login is account 2.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account2@example.com",
+                "accountUuid": "uuid-2",
+            }
+        }))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        creds_a = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-a", "refreshToken": "rt-a",
+        }})
+        creds_b = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-b", "refreshToken": "rt-b",
+        }})
+        switcher._store._write_account_credentials(
+            "1", "account1@example.com", creds_a)
+        switcher._store._write_account_credentials(
+            "2", "account2@example.com", creds_b)
+        # Live store seeded before the env flips (default location).
+        switcher._write_credentials(creds_b)
+        # The session profile of slot 1, shaped as bootstrap creates it.
+        profile = switcher.backup_dir / "sessions" / "1-account1_example.com"
+        profile.mkdir(parents=True)
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "accountUuid": "uuid-1",
+            }
+        }))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        return switcher, creds_a, creds_b
+
+    def test_profile_env_does_not_hijack_active_detection(
+        self, temp_home, sample_sequence_data, monkeypatch,
+    ):
+        switcher, creds_a, creds_b = self._seed(
+            temp_home, sample_sequence_data, monkeypatch)
+        info = switcher._build_accounts_info()
+        by_num = {num: (active, creds)
+                  for num, _email, _o, _u, active, creds, _a in info}
+        # The machine's real live login stays the active slot …
+        assert by_num[2][0] is True
+        assert by_num[1][0] is False
+        # … and the runner's slot reads its own backup, not the live store.
+        assert by_num[1][1] == creds_a
+        # No phantom collision between the runner's slot and the live slot.
+        assert switcher._duplicate_account_warnings(info) == []
+
+    def test_profile_env_resync_refuses_foreign_live_credential(
+        self, temp_home, sample_sequence_data, monkeypatch,
+    ):
+        switcher, creds_a, creds_b = self._seed(
+            temp_home, sample_sequence_data, monkeypatch)
+        # The fast-path resync arrives carrying the live (foreign) credential
+        # for the runner's slot; it must refuse to seed the backup with it.
+        switcher._resync_rotated_backup(
+            "1", "account1@example.com", "", creds_b)
+        assert switcher._read_account_credentials(
+            "1", "account1@example.com") == creds_a

@@ -3233,6 +3233,11 @@ class ClaudeAccountSwitcher:
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
                 if not self._live_identity_matches(email, org_uuid):
+                    self._logger.info(
+                        "Backup resync for account %s refused: the live "
+                        "login is not this account's — a foreign credential "
+                        "never seeds a slot backup.", account_num,
+                    )
                     return
                 # Re-read live under the lock and require it to still carry
                 # the served credential's lineage with a full pair — resync
