@@ -1375,6 +1375,15 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        # Pool-shield axis (CON-712): account-wide 5h/7d headroom, ignoring
+        # configured per-model windows. Voluntary consume-first decisions are
+        # judged on this axis so the rotation can rest on (and prefer)
+        # model-burned hosts instead of hoarding a model-fresh account the
+        # fleet's model-pinned work is starving for; the model-aware map
+        # above keeps binding the at-limit escape and escape landings.
+        base_headroom = (
+            _headroom_by_account(usage, ()) if self._models else headroom
+        )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1416,37 +1425,51 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                early = self._early_swap_fires(utilization, settings, state)
-                if early:
-                    # The park is small enough that leaving NOW is cheaper
-                    # than the same move at the threshold under a full park
-                    # (CON-582). Rides the proactive trigger end to end —
-                    # ranking, gates, drain2 — only the entry condition and
-                    # the event label differ.
-                    trigger = "proactive"
-                elif settings.strategy != "consume-first":
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
-                            ),
-                        )
-                    )
-                    return TickOutcome.NO_ACTION
-                else:
-                    # consume-first: below the threshold we still proactively
-                    # move to whichever account's weekly window resets soonest,
-                    # to burn the most-perishable quota first. Candidate
-                    # selection decides whether a sooner-resetting account
-                    # with room actually exists.
-                    trigger = "consume-first"
+            if active_headroom <= 0:
+                # A maxed *binding* window (model included) always escapes:
+                # whatever is pinned to it is at the wall right now.
+                trigger = "at-limit"
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                if settings.strategy == "consume-first":
+                    # Pool-shield (CON-712): how burned this host is gets
+                    # judged account-wide (5h/7d). A model-burned host with
+                    # session room left is a correct resting spot for the
+                    # rotation — not a threshold breach to flee, which is
+                    # what re-hoarded a model-fresh account on every tick.
+                    base_h = base_headroom.get(current)
+                    if base_h is not None:
+                        utilization = 100.0 - base_h
+                if utilization < settings.threshold:
+                    early = self._early_swap_fires(utilization, settings, state)
+                    if early:
+                        # The park is small enough that leaving NOW is cheaper
+                        # than the same move at the threshold under a full park
+                        # (CON-582). Rides the proactive trigger end to end —
+                        # ranking, gates, drain2 — only the entry condition and
+                        # the event label differ.
+                        trigger = "proactive"
+                    elif settings.strategy != "consume-first":
+                        self._emit(
+                            NoSwitchEvent(
+                                reason="below-threshold",
+                                # Both sides through pct_label: .0f utilization
+                                # could display an impossible "100% < 99.9%".
+                                detail=(
+                                    f"{pct_label(utilization)}% < "
+                                    f"{pct_label(settings.threshold)}%"
+                                ),
+                            )
+                        )
+                        return TickOutcome.NO_ACTION
+                    else:
+                        # consume-first: below the threshold we still
+                        # proactively move to whichever account's weekly
+                        # window resets soonest, to burn the most-perishable
+                        # quota first. Candidate selection decides whether a
+                        # sooner-resetting account with room actually exists.
+                        trigger = "consume-first"
+                else:
+                    trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1547,8 +1570,12 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
+                    # `utilization` and not raw active_headroom: under the
+                    # pool-shield the judged axis is account-wide, and the
+                    # model-aware percent here would contradict the reason
+                    # on a model-burned host ("95% < 90%", review r1 nit).
                     detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
+                        f"{pct_label(utilization)}% < "
                         f"{pct_label(settings.threshold)}%"
                     ),
                 )
@@ -1581,6 +1608,7 @@ class AutoSwitchEngine:
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
+            base_headroom=base_headroom,
             current=current,
             active_headroom=active_headroom,
             settings=settings,
@@ -1605,6 +1633,9 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            base_headroom = (
+                _headroom_by_account(usage, ()) if self._models else headroom
+            )
             active_headroom = headroom.get(current)
             ordered, any_known, active_reset_ts = self._rank_candidates(
                 trigger=trigger,
@@ -1612,6 +1643,7 @@ class AutoSwitchEngine:
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
+                base_headroom=base_headroom,
                 current=current,
                 active_headroom=active_headroom,
                 settings=settings,
@@ -1707,7 +1739,13 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
-                        detail="no sooner-resetting account with room to spare",
+                        # Also covers the pool-shield's reverse-trade guard:
+                        # a model-fresh candidate with room may exist and
+                        # still not be a voluntary target from a burned host.
+                        detail=(
+                            "no eligible sooner-resetting account "
+                            "(pool-shield may hold model-fresh hosts back)"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -1856,6 +1894,7 @@ class AutoSwitchEngine:
         oauth_candidates: list[str],
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
+        base_headroom: dict[str, float | None],
         current: str,
         active_headroom: float | None,
         settings: AutoSwitchSettings,
@@ -1874,6 +1913,31 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # Pool-shield (CON-712): with a configured model, voluntary landings
+        # under consume-first are judged on the account-wide 5h/7d axis and
+        # PREFER hosts whose per-model window is already burned past the
+        # threshold — the rotation parks where model-pinned fleet work has
+        # nothing left to lose, and model-fresh accounts stay free for it.
+        # The model window still binds everywhere else: a maxed binding
+        # window (h <= 0) is never a target, and escape landings keep
+        # ranking model-healthy accounts first.
+        shield = consume_first and bool(self._models)
+        voluntary = trigger in ("proactive", "consume-first")
+        active_burned = False
+        # The active account's headroom on the axis voluntary moves are
+        # judged by: account-wide under the shield, model-aware otherwise.
+        # Keeps the early-swap hysteresis comparison on ONE axis (review
+        # r1 nit: the trigger judged base while the margin judged model).
+        active_voluntary_h = active_headroom
+        if shield and active_headroom is not None and active_headroom > 0:
+            active_base = base_headroom.get(current)
+            if active_base is not None:
+                active_voluntary_h = active_base
+            active_burned = (
+                active_base is not None
+                and (100.0 - active_headroom) >= settings.threshold
+                and (100.0 - active_base) < settings.threshold
+            )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -1893,33 +1957,73 @@ class AutoSwitchEngine:
             # an at-limit escape under consume-first ordering landed on a
             # 1%-headroom account while 38%/60% accounts sat idle.
             unhealthy = (100.0 - h) >= settings.threshold
-            if trigger in ("proactive", "consume-first"):
+            burned = False
+            # The candidate's headroom on the voluntary axis (account-wide
+            # under the shield) — pairs with active_voluntary_h in the
+            # early-swap hysteresis below.
+            judge_h = h
+            if shield and voluntary:
+                # Health for a voluntary landing is account-wide; "burned"
+                # marks the preferred class: model window past the
+                # threshold while the account itself still has room.
+                base_h = base_headroom.get(num)
+                if base_h is not None:
+                    judge_h = base_h
+                    burned = unhealthy and (100.0 - base_h) < settings.threshold
+                    unhealthy = (100.0 - base_h) >= settings.threshold
+            if voluntary:
                 # Landing must be healthy. At-limit and failover are escapes
                 # that skip this whole block — any account with real headroom
                 # beats a blocked or dead one.
                 if unhealthy:
                     continue
                 if consume_first:
-                    # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
+                    # A rescue move frees a model-fresh active for the fleet
+                    # by parking on a burned host — the shield's whole point,
+                    # so it outranks reset ordering and the early-swap
+                    # hysteresis. No ping-pong is possible: once the active
+                    # host is burned, rescue never fires again, and BOTH
+                    # below-threshold voluntary paths — the nudge and the
+                    # early swap — refuse the reverse trade right below.
+                    rescue = burned and not active_burned
+                    if (
+                        (trigger == "consume-first" or early)
+                        and not burned
+                        and active_burned
                     ):
+                        # Never trade a burned host for a model-fresh one
+                        # below the threshold — that is the hoarding this
+                        # shield exists to stop. The early swap rides the
+                        # proactive trigger but decides below the threshold
+                        # too, so it obeys the same law (review r1: without
+                        # this the early band cycled burned -> fresh ->
+                        # rescue -> burned on the cooldown cadence).
                         continue
+                    if trigger == "consume-first":
+                        # Purely proactive on reset ordering: below the
+                        # threshold, only move to accounts whose weekly
+                        # window resets sooner than the active one (above
+                        # the threshold we must move, so any healthy
+                        # account qualifies and the sort picks soonest).
+                        if not rescue and (
+                            reset_ts is None
+                            or active_reset_ts is None
+                            or reset_ts >= active_reset_ts
+                        ):
+                            continue
                     # The early swap is voluntary under consume-first too:
                     # unlike the at-threshold proactive it must clear the
                     # same hysteresis margin `best` applies — a 2% win must
                     # never freeze and move the park, or accounts hovering
                     # together in the early band ping-pong every cooldown
-                    # at full park price (review r2).
+                    # at full park price (review r2). Both sides compare on
+                    # the voluntary axis (account-wide under the shield).
                     if (
                         early
-                        and active_headroom is not None
-                        and h - active_headroom < settings.hysteresis_pct
+                        and not rescue
+                        and active_voluntary_h is not None
+                        and judge_h - active_voluntary_h
+                        < settings.hysteresis_pct
                     ):
                         continue
                 elif active_headroom is not None:
@@ -1932,10 +2036,12 @@ class AutoSwitchEngine:
             # unhealthy candidates); within each group the strategy's own
             # order applies.
             if consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
+                # Burned hosts first (pool-shield; escapes never set the
+                # flag), then soonest weekly reset (unknown resets sort
+                # last), most headroom breaks ties, then sequence order.
                 key: tuple = (
                     unhealthy,
+                    not burned,
                     reset_ts if reset_ts is not None else float("inf"),
                     -h,
                 )

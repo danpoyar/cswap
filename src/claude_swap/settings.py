@@ -101,7 +101,11 @@ class AutoSwitchSettings:
     # per-model weekly limit is folded into the binding window, so the engine
     # switches off an account whose model quota is exhausted even while its
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
-    # (default).
+    # (default). Under the consume-first strategy the named windows bind
+    # only the at-limit escape and escape landings; voluntary moves judge
+    # the account-wide 5h/7d axis and prefer model-burned hosts, so the
+    # rotation never hoards a model-fresh account the fleet's model-pinned
+    # work needs (pool-shield, CON-712).
     model: str | None = None
 
 
