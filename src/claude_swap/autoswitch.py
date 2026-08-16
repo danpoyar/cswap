@@ -1570,8 +1570,12 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
+                    # `utilization` and not raw active_headroom: under the
+                    # pool-shield the judged axis is account-wide, and the
+                    # model-aware percent here would contradict the reason
+                    # on a model-burned host ("95% < 90%", review r1 nit).
                     detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
+                        f"{pct_label(utilization)}% < "
                         f"{pct_label(settings.threshold)}%"
                     ),
                 )
@@ -1735,7 +1739,13 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
-                        detail="no sooner-resetting account with room to spare",
+                        # Also covers the pool-shield's reverse-trade guard:
+                        # a model-fresh candidate with room may exist and
+                        # still not be a voluntary target from a burned host.
+                        detail=(
+                            "no eligible sooner-resetting account "
+                            "(pool-shield may hold model-fresh hosts back)"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -1914,8 +1924,15 @@ class AutoSwitchEngine:
         shield = consume_first and bool(self._models)
         voluntary = trigger in ("proactive", "consume-first")
         active_burned = False
+        # The active account's headroom on the axis voluntary moves are
+        # judged by: account-wide under the shield, model-aware otherwise.
+        # Keeps the early-swap hysteresis comparison on ONE axis (review
+        # r1 nit: the trigger judged base while the margin judged model).
+        active_voluntary_h = active_headroom
         if shield and active_headroom is not None and active_headroom > 0:
             active_base = base_headroom.get(current)
+            if active_base is not None:
+                active_voluntary_h = active_base
             active_burned = (
                 active_base is not None
                 and (100.0 - active_headroom) >= settings.threshold
@@ -1941,12 +1958,17 @@ class AutoSwitchEngine:
             # 1%-headroom account while 38%/60% accounts sat idle.
             unhealthy = (100.0 - h) >= settings.threshold
             burned = False
+            # The candidate's headroom on the voluntary axis (account-wide
+            # under the shield) — pairs with active_voluntary_h in the
+            # early-swap hysteresis below.
+            judge_h = h
             if shield and voluntary:
                 # Health for a voluntary landing is account-wide; "burned"
                 # marks the preferred class: model window past the
                 # threshold while the account itself still has room.
                 base_h = base_headroom.get(num)
                 if base_h is not None:
+                    judge_h = base_h
                     burned = unhealthy and (100.0 - base_h) < settings.threshold
                     unhealthy = (100.0 - base_h) >= settings.threshold
             if voluntary:
@@ -1960,15 +1982,24 @@ class AutoSwitchEngine:
                     # by parking on a burned host — the shield's whole point,
                     # so it outranks reset ordering and the early-swap
                     # hysteresis. No ping-pong is possible: once the active
-                    # host is burned, rescue never fires again, and the
-                    # reverse trade (burned -> fresh) is refused below.
+                    # host is burned, rescue never fires again, and BOTH
+                    # below-threshold voluntary paths — the nudge and the
+                    # early swap — refuse the reverse trade right below.
                     rescue = burned and not active_burned
+                    if (
+                        (trigger == "consume-first" or early)
+                        and not burned
+                        and active_burned
+                    ):
+                        # Never trade a burned host for a model-fresh one
+                        # below the threshold — that is the hoarding this
+                        # shield exists to stop. The early swap rides the
+                        # proactive trigger but decides below the threshold
+                        # too, so it obeys the same law (review r1: without
+                        # this the early band cycled burned -> fresh ->
+                        # rescue -> burned on the cooldown cadence).
+                        continue
                     if trigger == "consume-first":
-                        if not burned and active_burned:
-                            # Never trade a burned host for a model-fresh
-                            # one voluntarily — that is the hoarding this
-                            # shield exists to stop.
-                            continue
                         # Purely proactive on reset ordering: below the
                         # threshold, only move to accounts whose weekly
                         # window resets sooner than the active one (above
@@ -1985,12 +2016,14 @@ class AutoSwitchEngine:
                     # same hysteresis margin `best` applies — a 2% win must
                     # never freeze and move the park, or accounts hovering
                     # together in the early band ping-pong every cooldown
-                    # at full park price (review r2).
+                    # at full park price (review r2). Both sides compare on
+                    # the voluntary axis (account-wide under the shield).
                     if (
                         early
                         and not rescue
-                        and active_headroom is not None
-                        and h - active_headroom < settings.hysteresis_pct
+                        and active_voluntary_h is not None
+                        and judge_h - active_voluntary_h
+                        < settings.hysteresis_pct
                     ):
                         continue
                 elif active_headroom is not None:

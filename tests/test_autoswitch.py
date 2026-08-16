@@ -3225,7 +3225,13 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 1
         holds = [e for e in h.events if isinstance(e, NoSwitchEvent)]
         assert [e.reason for e in holds] == ["already-consuming-soonest"]
-        assert holds[0].detail == "no sooner-resetting account with room to spare"
+        # Wording covers the pool-shield's reverse-trade guard too (CON-712
+        # review r1 nit): a fresh candidate with room may exist and still
+        # not be a voluntary target.
+        assert holds[0].detail == (
+            "no eligible sooner-resetting account "
+            "(pool-shield may hold model-fresh hosts back)"
+        )
 
     def test_single_account_below_threshold_is_no_action(self, temp_home):
         # Exit-code parity with `best`: a healthy below-threshold tick with
@@ -5511,3 +5517,52 @@ class TestConsumeFirstPoolShield:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
+
+    def _early_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(
+            temp_home,
+            strategy="consume-first",
+            model="Fable",
+            early_swap_threshold=70.0,
+            early_swap_max_busy=2,
+            switch_under_load=True,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        park.roster_value = []
+        h.engine = h._make_engine(park=park)
+        return h
+
+    def test_early_swap_never_trades_burned_host_for_fresh(self, temp_home):
+        # Review r1 finding 1: the early swap rides the proactive trigger
+        # but decides below the threshold — without the shared reverse-trade
+        # guard it traded the burned host for the fresh account
+        # (re-hoarding, the CON-712 disease), and the rescue move cycled it
+        # back every cooldown.
+        h = self._early_harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(75, 50, 95, _R_LATER),
+            "2": _shield_usage(0, 10, 10, _R_SOON),
+            "3": _shield_usage(0, 96, 15, _R_SOON),  # base-unhealthy: refused
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_early_swap_still_moves_between_burned_hosts(self, temp_home):
+        # The guard blocks only the burned -> fresh trade; an early move
+        # between burned hosts stays available, with both sides of the
+        # hysteresis margin on the account-wide axis (60 - 25 >= 10; the
+        # model-aware axes would have refused it at 3 - 5).
+        h = self._early_harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _shield_usage(75, 50, 95, _R_LATER),
+            "2": _shield_usage(0, 40, 97, _R_SOON),
+            "3": _shield_usage(0, 96, 15, _R_SOON),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
