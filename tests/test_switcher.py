@@ -942,6 +942,33 @@ class TestFetchAccountUsageSessionProfile:
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         mock_fetch.assert_not_called()
 
+    def test_drifted_profile_with_matching_seed_stamp_defers(
+        self, temp_home: Path
+    ):
+        """Drift re-points the profile at another account, but the slot's own
+        family history stands: if the backup still matches the seed stamp,
+        the profile's claude rotated past it BEFORE drifting — the backup is
+        a consumed grant and must not be POSTed (review r1 F5)."""
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        self._write_profile_identity(switcher, "other@example.com", "org-other")
+        session_dir = switcher._session_dir("2", "test@example.com")
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(backup), encoding="utf-8"
+        )
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
     def test_readded_backup_ignores_stale_seed_stamp(self, temp_home: Path):
         """A backup replaced since the profile was seeded (re-login + cswap
         add) is a fresh family — the stale stamp must not freeze its usage."""
@@ -999,10 +1026,15 @@ class TestPersistRotatedSpill:
         try:
             with patch("claude_swap.switcher.FileLock",
                        lambda path, **kw: _FL(path, timeout=0.1)):
-                switcher.persist_backup_credentials("2", self.EMAIL, rotated)
+                persisted = switcher.persist_backup_credentials(
+                    "2", self.EMAIL, rotated
+                )
         finally:
             holder.release()
 
+        # False = the pair reached only the spill: the caller must not
+        # activate the slot off its stored (consumed) credential.
+        assert persisted is False
         spill = self._spill_path(switcher)
         assert spill.exists(), "rotated pair must be preserved when the lock is held"
         payload = json.loads(spill.read_text())
@@ -1011,6 +1043,95 @@ class TestPersistRotatedSpill:
         # The primary store still holds the predecessor — the spill is the
         # only copy of the new generation.
         assert switcher.read_account_credentials("2", self.EMAIL) == old
+
+    def test_uncontended_persist_reports_primary_store(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        rotated = _oauth_creds("sk-rotated", 7200)
+        assert switcher.persist_backup_credentials(
+            "2", self.EMAIL, rotated
+        ) is True
+        assert switcher.read_account_credentials("2", self.EMAIL) == rotated
+        assert not self._spill_path(switcher).exists()
+
+    def test_spill_restores_into_empty_backup(self, temp_home: Path):
+        """An empty/unreadable backup reads as "" (never None — the
+        credentials store contract): the spill is then the only live copy of
+        the pair and must be restored, not exiled to the unclaimed stash
+        (review r1 F1 — the dead `is None` branch). Field shape: a transient
+        Keychain refusal makes the locked re-read come back empty while the
+        caller still holds the pre-read bytes."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        old = _oauth_creds("sk-old", -100)
+        rotated = _oauth_creds("sk-rotated", 7200)
+        self._spill_path(switcher).write_text(json.dumps({
+            "credentials": rotated,
+            "predecessorFingerprint": oauth.credential_fingerprint(old),
+            "email": self.EMAIL,
+        }))
+
+        writes: list[str] = []
+        with patch.object(switcher, "_read_account_credentials",
+                          return_value=""), \
+             patch.object(switcher, "_write_account_credentials",
+                          side_effect=lambda n, e, c: writes.append(c)), \
+             patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}})) as mock_fetch:
+            switcher._fetch_account_usage(
+                (2, self.EMAIL, "Org", "org-uuid", False, old, "")
+            )
+
+        assert writes == [rotated], "the spill must be restored into the backup"
+        assert not self._spill_path(switcher).exists()
+        args, _kwargs = mock_fetch.call_args
+        assert args[2] == rotated
+        # And it must NOT have been exiled to the unclaimed stash.
+        assert all(
+            meta.get("reason") != "superseded-rotation-spill"
+            for meta in switcher.list_unclaimed_credentials().values()
+        )
+
+    def test_contended_reconcile_defers_instead_of_fetching(
+        self, temp_home: Path
+    ):
+        """A spill that cannot be reconciled (lock contention) means the
+        on-disk generation is consumed — the fetch must defer, never touch
+        the network with it (review r1 F2)."""
+        from claude_swap.exceptions import LockError as _LE
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        old = _oauth_creds("sk-old", -100)
+        switcher._write_account_credentials("2", self.EMAIL, old)
+        self._spill_path(switcher).write_text(json.dumps({
+            "credentials": _oauth_creds("sk-rotated", 7200),
+            "predecessorFingerprint": oauth.credential_fingerprint(old),
+            "email": self.EMAIL,
+        }))
+
+        class _Contended:
+            def __init__(self, *a, **kw): ...
+            def __enter__(self):
+                raise _LE("held elsewhere")
+            def __exit__(self, *a):
+                return False
+
+        with patch("claude_swap.switcher.FileLock", _Contended), \
+             patch.object(switcher, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(
+                (2, self.EMAIL, "Org", "org-uuid", False, old, "")
+            )
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+        assert self._spill_path(switcher).exists()  # waits for the next pass
 
     def test_next_fetch_reconciles_spill_before_network(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -1040,9 +1161,11 @@ class TestPersistRotatedSpill:
         assert switcher.read_account_credentials("2", self.EMAIL) == rotated
         assert not self._spill_path(switcher).exists()
 
-    def test_superseded_spill_is_dropped(self, temp_home: Path):
+    def test_superseded_spill_is_stashed_not_applied(self, temp_home: Path):
         """A backup replaced since the spill (re-login + cswap add) wins: the
-        spill's generation belongs to a family the re-login superseded."""
+        spill's generation is not applied — and its bytes are preserved in
+        the unclaimed stash (its refresh token may still be live), never
+        destroyed."""
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         readded = _oauth_creds("sk-readded", 7200)
@@ -1069,6 +1192,12 @@ class TestPersistRotatedSpill:
         assert args[2] == readded
         assert switcher.read_account_credentials("2", self.EMAIL) == readded
         assert not self._spill_path(switcher).exists()
+        stashed = [
+            meta for meta in switcher.list_unclaimed_credentials().values()
+            if meta.get("reason") == "superseded-rotation-spill"
+        ]
+        assert len(stashed) == 1
+        assert stashed[0]["configSlot"] == "2"
 
 
 class TestListAccountsUsage:

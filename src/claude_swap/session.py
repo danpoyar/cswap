@@ -549,6 +549,13 @@ class SessionManager:
         delete_macos_keychain_entry(session_dir)
 
         creds = self.switcher.read_account_credentials(account_num, email)
+        # A pending spilled rotation supersedes the stored bytes (CON-849):
+        # seeding the profile with the consumed predecessor would hand the
+        # new claude a dead grant. The caller holds the store lock, so the
+        # locked reconcile variant folds the spill in here.
+        creds = self.switcher.reconcile_pending_rotation_locked(
+            account_num, email, creds
+        )
         if not creds:
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
