@@ -340,6 +340,22 @@ class TestBootstrap:
             == ROTATED_CREDS
         )
 
+    def test_bootstrap_stamps_seed_fingerprint(
+        self, manager, auth_status_tracks_seed, refresh_rotates
+    ):
+        """CON-849: the profile records which credential generation seeded it.
+
+        The stamp lets the usage collector recognize the backup as the
+        profile's consumed predecessor once claude rotates the family inside
+        the profile — POSTing that predecessor is the documented way to get
+        the whole saved login revoked (reuse reaction)."""
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        stamp = session_dir / session_mod.SEED_FINGERPRINT_FILE
+        assert stamp.read_text(encoding="utf-8").strip() == (
+            oauth.credential_fingerprint(ROTATED_CREDS)
+        )
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
     def test_profile_permissions(self, manager, auth_status_tracks_seed, refresh_rotates):
         session_dir, _, _ = manager.setup_session("2", share=False)

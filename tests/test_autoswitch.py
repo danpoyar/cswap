@@ -2559,6 +2559,60 @@ class TestTokenIdentity:
             "uuid-2-real"
         )
 
+    def test_pending_spill_reconciles_before_freshen(self, harness):
+        """A pending spilled rotation (CON-849) is folded into the backup
+        before the freshen judges expiry — the reconciled pair is fresh, so
+        no refresh POST is made with the consumed stored generation."""
+        old = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+        }})
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        harness.switcher._write_account_credentials("2", "b@example.com", old)
+        spill = harness.switcher._pending_rotation_path("2")
+        spill.write_text(json.dumps({
+            "credentials": rotated,
+            "predecessorFingerprint": oauth.credential_fingerprint(old),
+            "email": "b@example.com",
+        }))
+
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
+        ) as mock_refresh:
+            status = harness.engine._freshen_target("2", "b@example.com")
+
+        assert status == "ok"
+        mock_refresh.assert_not_called()
+        assert harness.switcher.read_account_credentials(
+            "2", "b@example.com"
+        ) == rotated
+        assert not spill.exists()
+
+    def test_spilled_persist_defers_candidate(self, harness):
+        """A freshen whose persist only reached the spill must not report
+        "ok": the *stored* credential is a consumed generation, and
+        activating the slot off it would hand a live claude a dead grant."""
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(fresh, None, None),
+        ), patch.object(
+            harness.switcher, "persist_backup_credentials", return_value=False
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "transient"
+
     def test_conflicting_token_identity_returns_identity_conflict(self, harness):
         """A slot whose credential authenticates as a different account is not
         a viable target — but the rotated generation is still persisted (the

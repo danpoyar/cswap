@@ -1142,6 +1142,13 @@ class AutoSwitchEngine:
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
         creds = self.switcher.read_account_credentials(number, email)
+        # A pending spilled rotation (CON-849) supersedes the stored bytes:
+        # the backup holds the consumed predecessor, and refreshing or
+        # activating it would present a consumed grant. Reconcile first;
+        # a contended reconcile defers the candidate to the next tick.
+        creds = self.switcher._reconcile_spilled_rotation(number, email, creds)
+        if creds is None:
+            return "transient"
         if not creds:
             return "transient"
         data = oauth.extract_oauth_data(creds)
@@ -1159,10 +1166,17 @@ class AutoSwitchEngine:
         if outcome.error is None and outcome.credentials:
             # Persist first, unconditionally: the grant consumed a generation,
             # and not writing the successor would kill the lineage regardless
-            # of whose it turns out to be.
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
+            # of whose it turns out to be. A persist that only reached the
+            # spill (lock contention, CON-849) preserved the pair but left
+            # the *stored* credential a consumed generation — activating the
+            # slot off it would hand a live claude a dead grant, so the
+            # candidate defers until a reconcile pass lands the pair.
+            persisted = self.switcher.persist_backup_credentials(
+                number, email, outcome.credentials,
+                predecessor=oauth.credential_fingerprint(creds),
             )
+            if not persisted:
+                return "transient"
             if self._note_token_identity(number, outcome.token_account):
                 # The slot's stored credential authenticates as a *different*
                 # account — activating it would put the user on the wrong

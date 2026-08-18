@@ -540,6 +540,10 @@ class ClaudeAccountSwitcher:
         """
         self._ensure_no_live_session(account_num, email, "the operation")
         self._delete_account_credentials(account_num, email)
+        # A pending rotation spill (CON-849) belongs to the removed slot's
+        # family — a plaintext refresh token must not outlive its account
+        # and leak into the slot number's next occupant.
+        self._pending_rotation_path(account_num).unlink(missing_ok=True)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
             config_file.unlink()
@@ -1573,16 +1577,220 @@ class ClaudeAccountSwitcher:
         return self._live_session_pids(account_num, email)
 
     def persist_backup_credentials(
-        self, account_num: str, email: str, credentials: str
-    ) -> None:
+        self,
+        account_num: str,
+        email: str,
+        credentials: str,
+        predecessor: str | None = None,
+    ) -> bool:
         """Persist rotated credentials to a slot's backup store, under the lock.
 
-        For inactive accounts only — never routes to the active store. Mirrors
-        the persist callback ``_fetch_account_usage`` uses. The caller must NOT
-        hold ``self.lock_file`` (FileLock is non-reentrant).
+        For inactive accounts only — never routes to the active store. This is
+        the persist path ``_fetch_account_usage`` and the autoswitch freshen
+        use. The caller must NOT hold ``self.lock_file`` (FileLock is
+        non-reentrant).
+
+        ``predecessor`` names the generation the refresh grant consumed (the
+        fingerprint of the bytes that were POSTed) — pass it whenever known:
+        a fallback read here races a concurrent re-add, and a stale
+        predecessor could later reconcile an old family over a fresh login.
+
+        Lock contention never drops the pair (CON-849): the refresh already
+        consumed the on-disk generation, so discarding the successor kills
+        the lineage — the 13-08 incident stranded a slot exactly this way
+        ("LockError: another instance may be running", dead within hours).
+        After a bounded retry the pair spills to a per-slot sidecar;
+        ``_reconcile_spilled_rotation`` folds it into the backup under the
+        lock before the next network touch. Other write failures (Keychain
+        refusing under a held lock) still propagate to the caller's warn
+        path.
+
+        Returns True when the pair landed in the primary backup store, False
+        when it went to the spill — a False target must not be activated off
+        its stored (consumed) credential until a reconcile pass runs.
         """
-        with FileLock(self.lock_file):
-            self._write_account_credentials(account_num, email, credentials)
+        if predecessor is None:
+            try:
+                prior = self._read_account_credentials(account_num, email)
+                if prior:
+                    predecessor = oauth.credential_fingerprint(prior)
+            except Exception as e:
+                # Unknown predecessor: the spill still preserves the pair,
+                # but the reconcile will only auto-apply it onto an empty
+                # backup — say so instead of silently degrading.
+                self._logger.warning(
+                    "Could not read the prior backup for account %s while "
+                    "persisting a rotation (%r); a spill, if needed, will "
+                    "carry no predecessor.", account_num, e,
+                )
+        for attempt in (1, 2):
+            try:
+                with FileLock(self.lock_file):
+                    self._write_account_credentials(account_num, email, credentials)
+                return True
+            except LockError:
+                if attempt == 1:
+                    continue
+        self._spill_rotated_credentials(
+            account_num, email, credentials, predecessor
+        )
+        return False
+
+    def _pending_rotation_path(self, account_num: str) -> Path:
+        return self.credentials_dir / f".pending-rotated-{account_num}.json"
+
+    def _spill_rotated_credentials(
+        self,
+        account_num: str,
+        email: str,
+        credentials: str,
+        predecessor: str | None,
+    ) -> None:
+        """Preserve a rotated pair the lock race would otherwise drop.
+
+        A plain 0600 file (same exposure class as a session profile's
+        plaintext seed): the spill exists precisely because the locked store
+        path is unavailable, so it must not inherit that path's failure
+        modes — the unclaimed-stash precedent. One file per slot, newest
+        rotation wins (an older spill is a consumed predecessor of the newer
+        one by construction). Never raises.
+        """
+        from datetime import datetime, timezone
+
+        try:
+            self.credentials_dir.mkdir(parents=True, exist_ok=True)
+            path = self._pending_rotation_path(account_num)
+            from claude_swap.settings import atomic_write_json
+
+            atomic_write_json(path, {
+                "credentials": credentials,
+                "predecessorFingerprint": predecessor,
+                "email": email,
+                "createdAt": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            })
+            if sys.platform != "win32":
+                os.chmod(path, 0o600)
+            self._logger.warning(
+                "Could not persist rotated credentials for account %s (%s) — "
+                "lock held by another instance. The pair is preserved in %s "
+                "and will be reconciled into the backup on the next usage "
+                "pass.", account_num, email, path.name,
+            )
+        except Exception:
+            # Last resort: the pair is genuinely lost — say so loudly, the
+            # slot will need a re-login when the consumed grant surfaces.
+            self._logger.warning(
+                "Failed to preserve rotated credentials for account %s (%s); "
+                "the on-disk refresh token is now a consumed generation and "
+                "the lineage will need a re-login.", account_num, email,
+                exc_info=True,
+            )
+
+    def _reconcile_spilled_rotation(
+        self, account_num: str, email: str, creds: str
+    ) -> str | None:
+        """Fold a pending spilled rotation into the backup, under the lock.
+
+        Returns the credential bytes the caller should fetch with, or None
+        when a spill exists but could not be reconciled this pass (lock
+        contention): the on-disk generation is the spill's consumed
+        predecessor, so the caller must defer instead of touching the
+        network with it. Never raises.
+        """
+        path = self._pending_rotation_path(account_num)
+        if not path.exists():
+            return creds
+        try:
+            with FileLock(self.lock_file):
+                return self._reconcile_spilled_rotation_locked(
+                    account_num, email, creds
+                )
+        except LockError:
+            self._logger.warning(
+                "Rotation spill for account %s could not be reconciled "
+                "(lock contended); deferring the fetch — the on-disk "
+                "generation is consumed.", account_num,
+            )
+            return None
+
+    def reconcile_pending_rotation_locked(
+        self, account_num: str, email: str, creds: str
+    ) -> str:
+        """Reconcile variant for callers already holding ``self.lock_file``
+        (the session bootstrap). Returns the bytes to continue with — under
+        the held lock there is no contention to defer for."""
+        if not self._pending_rotation_path(account_num).exists():
+            return creds
+        return self._reconcile_spilled_rotation_locked(account_num, email, creds)
+
+    def _reconcile_spilled_rotation_locked(
+        self, account_num: str, email: str, creds: str
+    ) -> str:
+        """Body of the spill reconcile; caller holds ``self.lock_file``.
+
+        The spill is applied when the backup is empty/unreadable (the spill
+        is then the only live copy — ``_read_account_credentials`` returns
+        ``""`` for a missing backup, never None) or still holds the exact
+        predecessor the spill rotated past. A backup that moved on
+        (re-login + add) wins, and the superseded spill is preserved as an
+        unclaimed safety copy rather than destroyed. An unreadable spill is
+        set aside as forensics — its bytes are unrecoverable either way, and
+        leaving it in place would defer the slot forever.
+        """
+        path = self._pending_rotation_path(account_num)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            try:
+                path.rename(aside)
+                self._logger.warning(
+                    "Unreadable rotation spill for account %s preserved as "
+                    "%s; continuing with the backup credential.",
+                    account_num, aside.name,
+                )
+            except OSError:
+                self._logger.warning(
+                    "Unreadable rotation spill for account %s could not be "
+                    "set aside; leaving it in place.", account_num,
+                )
+            return creds
+        spilled = payload.get("credentials")
+        predecessor = payload.get("predecessorFingerprint")
+        if not isinstance(spilled, str) or not spilled:
+            path.unlink(missing_ok=True)
+            return creds
+        current = self._read_account_credentials(account_num, email)
+        current_fp = oauth.credential_fingerprint(current) if current else None
+        if current and current_fp == oauth.credential_fingerprint(spilled):
+            path.unlink(missing_ok=True)  # already reconciled
+            return current
+        if not current or (predecessor and current_fp == predecessor):
+            self._write_account_credentials(account_num, email, spilled)
+            path.unlink(missing_ok=True)
+            self._logger.info(
+                f"Reconciled spilled rotated credentials for account "
+                f"{account_num} into the backup"
+            )
+            return spilled
+        # The backup moved past the spill's predecessor (re-login / re-add).
+        # The newer family wins; preserve the spilled bytes instead of
+        # destroying a possibly-live refresh token.
+        try:
+            self._store._write_unclaimed_credential(spilled, {
+                "reason": "superseded-rotation-spill",
+                "configSlot": account_num,
+                "fingerprint": oauth.credential_fingerprint(spilled),
+            })
+        except Exception:
+            self._logger.warning(
+                "Superseded rotation spill for account %s could not "
+                "be stashed; dropping it", account_num,
+            )
+        path.unlink(missing_ok=True)
+        return current
 
     def account_identity(self, account_num: str) -> dict:
         """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""
@@ -1683,7 +1891,11 @@ class ClaudeAccountSwitcher:
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
         """
-        from claude_swap.session import STALE_MARKER, delete_macos_keychain_entry
+        from claude_swap.session import (
+            SEED_FINGERPRINT_FILE,
+            STALE_MARKER,
+            delete_macos_keychain_entry,
+        )
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
@@ -1691,6 +1903,9 @@ class ClaudeAccountSwitcher:
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         (session_dir / STALE_MARKER).unlink(missing_ok=True)
+        # A profile without credentials no longer owns a token family — a
+        # stale seed stamp must not freeze the (freshly re-added) backup.
+        (session_dir / SEED_FINGERPRINT_FILE).unlink(missing_ok=True)
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )
@@ -3305,11 +3520,33 @@ class ClaudeAccountSwitcher:
         if is_active:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
+        # A spilled rotation (persist lost the lock race, CON-849) must land
+        # in the backup before any network touch: the on-disk generation it
+        # rotated past is consumed, and fetching with it would strike — or
+        # present a consumed grant the server answers by revoking the login.
+        # A reconcile blocked by contention defers for the same reason.
+        reconciled = self._reconcile_spilled_rotation(str(num), email, creds)
+        if reconciled is None:
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        creds = reconciled
+
+        # The persist tracks which generation each refresh consumed: the
+        # fetch starts from ``creds``, and after a successful primary-store
+        # write the next refresh (the 401-retry path) consumes the pair it
+        # just persisted. A fallback read inside persist would race a
+        # concurrent re-add and could stamp a predecessor from the wrong
+        # family.
+        last_persisted = {"fp": oauth.credential_fingerprint(creds)}
+
         def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-            with FileLock(self.lock_file):
-                self._write_account_credentials(acct_num, acct_email, new_creds)
+            if self.persist_backup_credentials(
+                acct_num, acct_email, new_creds,
+                predecessor=last_persisted["fp"],
+            ):
+                last_persisted["fp"] = oauth.credential_fingerprint(new_creds)
 
         from claude_swap.session import (
+            read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -3356,11 +3593,29 @@ class ClaudeAccountSwitcher:
                     # requesting now would just 401 (same rule as the owned
                     # active account in _fetch_active_usage).
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-                # Expired profile credential and no live session: fall through
-                # to the backup path — cswap must not rotate the profile's
-                # family, but a backup family that is still alive (e.g. the
-                # account was re-added after the profile last ran) can serve
-                # and heal via the normal refresh machinery below.
+                # Expired profile credential and no live session: fall
+                # through to the backup path (seed-guarded below) — cswap
+                # must not rotate the profile's family, but a backup family
+                # that moved past the seed (e.g. the account was re-added
+                # after the profile last ran) can serve and heal via the
+                # normal refresh machinery.
+
+        # Seed guard (CON-849), on EVERY road into the backup path — the
+        # expired-profile fall-through, a drifted profile, and a profile
+        # whose credential file is malformed all end up here. A backup that
+        # still matches the generation that seeded this slot's profile is
+        # the profile family's consumed predecessor (claude rotates the
+        # family in the profile and nothing syncs it back) — POSTing it is
+        # at best an invalid_grant strike and at worst the documented reuse
+        # reaction: the server revokes the whole saved login. A re-added
+        # backup no longer matches the stamp and heals normally.
+        seed = read_seed_fingerprint(session_dir)
+        if seed and seed == oauth.credential_fingerprint(creds):
+            self._logger.debug(
+                f"Backup for account {num} is the profile's consumed "
+                f"seed generation; deferring instead of refreshing"
+            )
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
