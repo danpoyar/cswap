@@ -53,7 +53,7 @@ from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
+from claude_swap.oauth import credential_fingerprint, refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import (
@@ -111,6 +111,25 @@ SHARE_MANIFEST = ".cswap-shared.json"
 # profile must be re-bootstrapped on the next non-live `cswap run` even if it
 # still passes the local reuse check.
 STALE_MARKER = ".cswap-stale-credentials"
+
+# Fingerprint of the credential generation that seeded this profile (CON-849).
+# Once claude rotates the family inside the profile, the slot backup still
+# holds this exact generation — a consumed grant. The usage collector reads
+# the stamp to refuse refreshing a backup that matches it: POSTing a consumed
+# grant is at best an invalid_grant strike and at worst the documented
+# reuse reaction — the server revokes the whole saved login.
+SEED_FINGERPRINT_FILE = ".seed-fingerprint"
+
+
+def read_seed_fingerprint(session_dir: Path) -> str | None:
+    """The profile's seed-generation stamp, or None (absent/unreadable)."""
+    try:
+        text = (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return None
+    return text or None
 
 # The user-scope MCP key mirrored from the default profile's .claude.json.
 MCP_KEY = "mcpServers"
@@ -573,6 +592,15 @@ class SessionManager:
         creds_path.write_text(creds, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(creds_path, 0o600)
+
+        # Stamp which generation seeded the profile: the same bytes sit in the
+        # slot backup, and once claude rotates the family in here that backup
+        # is a consumed grant the usage collector must refuse to POST
+        # (CON-849; see SEED_FINGERPRINT_FILE).
+        stamp_path = session_dir / SEED_FINGERPRINT_FILE
+        stamp_path.write_text(credential_fingerprint(creds), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(stamp_path, 0o600)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
