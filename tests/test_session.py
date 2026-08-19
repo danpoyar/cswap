@@ -631,6 +631,21 @@ class TestSharingPosix:
         mgr._sync_sharing(session_dir, share=True)
         assert (session_dir / "settings.json").readlink() == source / "settings.json"
 
+    def test_links_output_styles(self, share_setup):
+        # Claude resolves the `outputStyle` setting against
+        # $CLAUDE_CONFIG_DIR/output-styles, so a profile without the link
+        # silently runs with no style even though settings.json names one.
+        source, session_dir, mgr = share_setup
+        (source / "output-styles").mkdir()
+        (source / "output-styles" / "danila.md").write_text("style")
+
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert (session_dir / "output-styles").is_symlink()
+        assert (session_dir / "output-styles").readlink() == source / "output-styles"
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "output-styles" in manifest["items"]
+
     def test_prunes_when_source_vanishes(self, share_setup):
         source, session_dir, mgr = share_setup
         mgr._sync_sharing(session_dir, share=True)
