@@ -16,8 +16,8 @@ would couple us to Claude's internal storage format and naming, where a
 mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
-``CLAUDE.md``, ``skills/``, ``commands/``, and ``agents/`` follow them into
-the session profile — symlinks on macOS/Linux (Claude's settings writer
+``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and
+``output-styles/`` follow them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
@@ -83,6 +83,10 @@ SHARED_ITEMS = (
     "skills",
     "commands",
     "agents",
+    # Claude resolves the `outputStyle` setting against
+    # $CLAUDE_CONFIG_DIR/output-styles; without this link a profile names a
+    # style it can never find and silently runs with none.
+    "output-styles",
 )
 
 # Conversation-history items linked additionally under --share-history.
