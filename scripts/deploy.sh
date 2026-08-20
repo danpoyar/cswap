@@ -42,7 +42,10 @@ POLL_S="${CSD_POLL_S:-1}"
 say() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
 
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# GNU branch FIRST: GNU `stat -f %m` misparses -f as filesystem mode and
+# prints garbage to stdout, while BSD `stat -c` fails cleanly with an empty
+# stdout — so -c || -f is portable and -f || -c is not (review r.1, Major-1).
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 
 # One inventory pass. Output lines: pid<TAB>start_epoch<TAB>command.
 # start_epoch may be the literal `x` when unreadable (judged by the caller).
