@@ -198,8 +198,19 @@ in ~/projects/quota runs two live guards against this binary's JSON.
 ## How it is installed
 
 ```
-uv tool install --force git+https://github.com/danpoyar/cswap@main
+scripts/deploy.sh [ref]        # default ref: main
 ```
+
+The door is the ONLY supported way to install on the fleet machine
+(CON-954). It runs `uv tool install --force
+git+https://github.com/danpoyar/cswap@<ref>` and then RESTARTS every
+long-lived cswap process (`cswap auto` via its launchd job, `cswap watch`
+via SIGTERM — the hub pane loop respawns it) and verifies each one started
+at or after the install moment. A bare `uv tool install` is a half-rollout:
+on 2026-08-18 the installed fix never reached the running daemon for 2 days
+and 12 fleet slots lost their refresh tokens. The fleet's sensor job
+watches the same invariant and logs `DEPLOY-SYNC` when a running process
+predates the installed package.
 
 Same package name (`claude-swap`) and the same two entrypoints (`cswap`,
 `claude-swap`), so `~/bin/cswap`, the launchd job `com.amouen.cswap-auto` and
@@ -208,7 +219,9 @@ know what it costs: no PUBLISHED upstream release carries `lastGoodUsage`
 (it landed on main on 2026-07-28), so Quota loses every stored reading and
 shows "No data" for each parked slot. It says so in the footer rather than
 going quiet, and the way back is this fork. To roll back only OUR commits,
-install an earlier ref of this repo instead: `…@<sha>`.
+deploy an earlier ref of this repo instead: `scripts/deploy.sh <sha>` (the
+door restarts the long-lived processes on rollbacks too — a half-rollback
+strands them the same way a half-rollout does).
 
 State lives outside the install and is never touched by reinstalling:
 `~/.claude-swap-backup/` (sequence, usage store, autoswitch state) and the

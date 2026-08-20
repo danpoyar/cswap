@@ -27,6 +27,11 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+      - name: Deploy door suite (CON-954)
+        # Hermetic bash suite for scripts/deploy.sh: a deploy that does not
+        # restart the long-lived processes must scream DEPLOY-INCOMPLETE.
+        run: bash tests/test_deploy_door.sh
+
   test-windows:
     runs-on: windows-latest
 
