@@ -9,7 +9,7 @@ import sys
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import error_envelope
+from claude_swap.json_output import SCHEMA_VERSION, error_envelope
 from claude_swap.printer import (
     accent,
     bolded,
@@ -377,6 +377,152 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _refresh_command(argv: list[str]) -> None:
+    """Handle `cswap refresh [NUM|EMAIL|ALIAS ...] [--all] [--stale-min N]`.
+
+    Actively refreshes parked slots' expired access tokens in place (no
+    session launch) — see claude_swap.refresh for the safety rules. Slots
+    that must not be touched (live session, revoked, condemned lineage)
+    are reported honestly and left alone.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} refresh",
+        description=(
+            "Refresh parked slots' expired access tokens with their stored "
+            "refresh tokens — no session launch needed. Live sessions are "
+            "left to refresh themselves; revoked credentials (no refresh "
+            "token) are reported for re-login, never touched."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap refresh 2
+  cswap refresh 2 5 user@example.com
+  cswap refresh --all
+  cswap refresh --all --stale-min 30 --json
+        """,
+    )
+    parser.add_argument(
+        "accounts",
+        nargs="*",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Accounts to refresh (default: none; use --all for every slot)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Refresh every managed slot (honest per-slot outcomes)",
+    )
+    parser.add_argument(
+        "--stale-min",
+        type=float,
+        default=None,
+        metavar="N",
+        help=(
+            "Only touch slots whose last usage measurement is older than N "
+            "minutes (or that are marked token-expired / never measured)"
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Machine-readable output"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if not args.accounts and not args.all:
+        parser.error("name at least one account, or pass --all")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.refresh import REFRESHED, refresh_accounts
+
+        targets = list(args.accounts)
+        if args.all:
+            data = switcher._get_sequence_data() or {}
+            targets = sorted(data.get("accounts", {}).keys(), key=int)
+            # The active slot is never refreshable from the backup copy
+            # (refresh_account gates it too); dropping it here keeps --all
+            # logs to slots the command can actually act on.
+            active = data.get("activeAccountNumber")
+            if active is not None:
+                targets = [t for t in targets if t != str(active)]
+        if args.stale_min is not None:
+            targets = _stale_targets(switcher, targets, args.stale_min)
+
+        reports = refresh_accounts(switcher, targets)
+
+        if args.json:
+            payload = {
+                "schemaVersion": SCHEMA_VERSION,
+                "results": [
+                    {
+                        "number": int(r.number),
+                        "email": r.email,
+                        "outcome": r.outcome,
+                        "detail": r.detail,
+                        "usageRead": r.usage_read,
+                    }
+                    for r in reports
+                ],
+            }
+            print(json.dumps(payload, indent=2))
+            return
+        if not reports:
+            print(dimmed("No slots matched."))
+            return
+        for r in reports:
+            note = f" ({r.detail})" if r.detail else ""
+            proof = ""
+            if r.outcome == REFRESHED:
+                proof = (
+                    "  · usage read ok" if r.usage_read
+                    else "  · usage read pending"
+                )
+            print(f"  {r.number}: {r.email} — {r.outcome}{note}{proof}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _stale_targets(
+    switcher: ClaudeAccountSwitcher, targets: list[str], stale_min: float
+) -> list[str]:
+    """Filter ``targets`` down to slots worth touching: last measured longer
+    than ``stale_min`` minutes ago, marked token-expired, or never measured.
+    Identifiers that are not bare slot numbers pass through (an explicit
+    email/alias was asked for by name)."""
+    data = switcher._get_sequence_data() or {}
+    accounts = data.get("accounts", {})
+    numeric = [t for t in targets if t in accounts]
+    identities = {
+        num: (
+            accounts[num].get("email", ""),
+            accounts[num].get("organizationUuid", "") or "",
+        )
+        for num in numeric
+    }
+    entries = switcher._usage_store.entries(identities)
+    now = switcher._usage_store.clock()
+    kept = []
+    for t in targets:
+        entry = entries.get(t)
+        if entry is None:
+            kept.append(t)  # non-numeric identifier: explicit request
+            continue
+        stale = (
+            entry.fetched_at is None
+            or (now - entry.fetched_at) > stale_min * 60.0
+        )
+        if stale or entry.token_expired_at is not None:
+            kept.append(t)
+    return kept
 
 
 def _move_command(argv: list[str]) -> None:
@@ -895,6 +1041,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "refresh":
+        _refresh_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -933,6 +1082,8 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s refresh <num|email>        refresh a parked slot's expired token
+  %(prog)s refresh --all              refresh every slot that needs it
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts

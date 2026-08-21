@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -231,6 +232,14 @@ class UsageEntry:
     # condemned generation is unknown (legacy strike): the collector grants
     # one parole probe, whose outcome stamps the lineage either way.
     dead_token_fingerprint: str | None = None
+    # When a collect pass first PROVED the credential expired (CON-1024).
+    # Unlike every other sentinel input this one is persisted: the expired
+    # state must survive claim races and process boundaries, or a pass that
+    # loses the fetch claim serves minutes-old last-good as "ok" and
+    # dashboards paint dead slots as healed. Cleared only by a live
+    # successful usage read (or a credential rewrite via clear_dead_token) —
+    # "fixed" may never be inferred, only measured.
+    token_expired_at: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -568,6 +577,7 @@ class UsageStore:
                 dead_token_fingerprint=(
                     dead_fp if isinstance(dead_fp, str) else None
                 ),
+                token_expired_at=_num_or_none(row.get("tokenExpiredAt")),
             )
         return out
 
@@ -706,6 +716,13 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             if rec.sentinel is not None:
+                # Sentinels stay unpersisted EXCEPT the proven-expired stamp
+                # (CON-1024): first-seen time of the expired state, so every
+                # process keeps reporting it until a live success clears it.
+                if rec.sentinel == USAGE_TOKEN_EXPIRED:
+                    row["tokenExpiredAt"] = (
+                        _num_or_none(row.get("tokenExpiredAt")) or now
+                    )
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
@@ -721,6 +738,7 @@ class UsageStore:
                 row["backoffUntil"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
                 row["deadTokenFingerprint"] = None
+                row["tokenExpiredAt"] = None  # the one legitimate "fixed" proof
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -812,6 +830,9 @@ class UsageStore:
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None
+            # A rewritten credential invalidates the proven-expired stamp the
+            # same way it lifts the quarantine: the next pass re-measures.
+            row["tokenExpiredAt"] = None
 
         self._mutate(identities, nums, apply)
 
