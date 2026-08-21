@@ -159,7 +159,7 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # identically (e.g. owned-and-expired means Claude Code will refresh, not that
 # the user must re-login).
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
+    USAGE_TOKEN_EXPIRED: "token expired — refresh with: cswap refresh",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
@@ -3820,6 +3820,20 @@ class ClaudeAccountSwitcher:
                 if entries[num].token_dead():
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
+        # Sticky proven-expired state (CON-1024): once any pass has measured
+        # the credential expired, the store carries the stamp and every later
+        # pass — including one that lost the fetch claim, or a different
+        # process entirely — keeps reporting "token expired" instead of
+        # serving last-good as healthy. Only a live successful usage read
+        # clears the stamp (in the same record transaction), so "fixed" is
+        # always a measurement, never an inference.
+        for num in info_by_num:
+            if (
+                num not in sentinels
+                and entries[num].token_expired_at is not None
+            ):
+                sentinels[num] = USAGE_TOKEN_EXPIRED
+
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
@@ -4134,6 +4148,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     next_poll_at=entry.next_poll_at,
+                    token_expired_at=entry.token_expired_at,
                 )
             )
         payload = {

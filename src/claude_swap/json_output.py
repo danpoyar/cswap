@@ -227,6 +227,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     next_poll_at: float | None = None,
+    token_expired_at: float | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -240,6 +241,10 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    # Additive: when the expired state was first measured (CON-1024), so a
+    # dashboard can render "Token expired · <age>" instead of guessing.
+    if status == "token_expired" and token_expired_at is not None:
+        row["tokenExpiredAt"] = _iso_utc(token_expired_at)
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so
