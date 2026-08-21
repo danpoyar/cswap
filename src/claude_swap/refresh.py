@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,6 +75,7 @@ _REFRESH_POST_TIMEOUT_S = 10.0
 REFRESHED = "refreshed"  # grant consumed, successor persisted everywhere
 FRESH = "fresh"  # access token not expired — nothing to do
 LIVE_SESSION = "live-session"  # a live claude owns the family; it heals lazily
+ACTIVE_SLOT = "active-slot"  # the live default login; its own path heals it
 RELOGIN_REQUIRED = "relogin-required"  # dead/absent refresh token — human only
 TRANSIENT_ERROR = "transient-error"  # network blip; safe to retry later
 DEFERRED = "deferred"  # unsafe to act now (locks, unreadable keychain)
@@ -146,7 +148,7 @@ def _reseed_profile(session_dir: Path, credentials: str) -> None:
 
 
 def refresh_account(
-    switcher: "ClaudeAccountSwitcher", identifier: str
+    switcher: ClaudeAccountSwitcher, identifier: str
 ) -> RefreshReport:
     """Refresh one slot's access token in place. Raises only for an
     unresolvable identifier (mirrors every other account command)."""
@@ -160,11 +162,18 @@ def refresh_account(
     # so success moves the store's measurement — "last seen" updates without
     # any landing. Best-effort: the refresh itself already succeeded.
     try:
+        before = switcher._usage_store.clock()
         info = (int(account_num), email, "", org_uuid or "", False,
                 switcher.read_account_credentials(account_num, email), "")
         entries = switcher._collect_usage_entries([info], fetch={account_num})
         entry = entries[account_num]
-        usage_read = entry.sentinel is None and entry.last_good is not None
+        # A NEW measurement only — pre-existing last-good would claim a
+        # "live read" that never happened (a failed or claim-lost fetch).
+        usage_read = (
+            entry.sentinel is None
+            and entry.fetched_at is not None
+            and entry.fetched_at >= before
+        )
     except Exception:
         switcher._logger.warning(
             "Post-refresh usage read failed for account %s; the next "
@@ -177,7 +186,7 @@ def refresh_account(
 
 
 def _refresh_resolved(
-    switcher: "ClaudeAccountSwitcher",
+    switcher: ClaudeAccountSwitcher,
     account_num: str,
     email: str,
     org_uuid: str,
@@ -191,6 +200,23 @@ def _refresh_resolved(
     session_dir = switcher._session_dir(account_num, email)
     try:
         with FileLock(switcher.lock_file, timeout=_REFRESH_LOCK_TIMEOUT_S):
+            # The ACTIVE slot is never refreshed from here: its live
+            # credential is Claude Code's store, while this path reads the
+            # profile/backup copy — for the active account that copy is a
+            # consumed predecessor whenever CC rotated during normal use
+            # (rotation-before-collection), and POSTing it is at best an
+            # invalid_grant strike on a LIVE login, at worst the documented
+            # reuse reaction. The active account already has a locked
+            # refresh path (_fetch_active_usage) that any collect pass runs.
+            # Judged under the lock, so a concurrent `cswap switch` (same
+            # lock) cannot make this slot active mid-refresh.
+            current = switcher._get_current_account()
+            if current is not None:
+                cur_email, cur_org = current
+                if cur_email == email and (
+                    not cur_org or not org_uuid or cur_org == org_uuid
+                ):
+                    return out(ACTIVE_SLOT)
             # Re-checked under the lock: a `cswap run` bootstrap racing us
             # holds the same lock, so a session that appears later than this
             # check will find the profile already reseeded — never half-written.
@@ -248,25 +274,23 @@ def _refresh_resolved(
                 proper_lockfile(
                     session_dir / ".oauth_refresh.lock",
                     staleness=CREDENTIALS_STALENESS_S,
-                ) if profile_owned else _noop_lock(),
+                ) if profile_owned else nullcontext(),
                 proper_lockfile(
                     session_dir.parent / (session_dir.name + ".lock"),
                     staleness=CREDENTIALS_STALENESS_S,
-                ) if profile_owned else _noop_lock(),
+                ) if profile_owned else nullcontext(),
             ):
                 result = try_refresh_oauth_credentials(
                     candidate, timeout_s=_REFRESH_POST_TIMEOUT_S
                 )
-                if result.error in ("invalid_grant", "no_refresh_token") or (
-                    result.error is None and not result.credentials
-                ):
+                if result.error in ("invalid_grant", "no_refresh_token"):
                     # Permanently unrefreshable — advance the store's strike
                     # so every surface flips to "re-login needed" instead of
                     # anyone retrying a server-rejected grant.
                     switcher._usage_store.record(
                         {
                             account_num: FetchRecord(
-                                error=result.error or "invalid_grant",
+                                error=result.error,
                                 credential_fingerprint=credential_fingerprint(
                                     candidate
                                 ),
@@ -277,9 +301,13 @@ def _refresh_resolved(
                     return out(RELOGIN_REQUIRED, result.error)
                 if result.error is not None:
                     return out(TRANSIENT_ERROR, result.error)
+                if not result.credentials:
+                    # Contract says a success carries credentials; if that
+                    # ever drifts, retry later — never condemn a lineage on
+                    # a shape the token endpoint did not reject.
+                    return out(TRANSIENT_ERROR, "empty refresh result")
 
                 working = result.credentials
-                assert working is not None
                 # The grant is consumed: the successor MUST survive. Backup
                 # first (write_account_credentials expects the held lock),
                 # then the profile re-seed.
@@ -296,16 +324,8 @@ def _refresh_resolved(
         return out(DEFERRED, "credential locks held elsewhere")
 
 
-class _noop_lock:
-    def __enter__(self):  # noqa: D105
-        return self
-
-    def __exit__(self, *exc):  # noqa: D105
-        return False
-
-
 def refresh_accounts(
-    switcher: "ClaudeAccountSwitcher",
+    switcher: ClaudeAccountSwitcher,
     identifiers: list[str],
 ) -> list[RefreshReport]:
     """Refresh several slots sequentially (one POST at a time — the token

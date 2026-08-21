@@ -444,6 +444,12 @@ Examples:
         if args.all:
             data = switcher._get_sequence_data() or {}
             targets = sorted(data.get("accounts", {}).keys(), key=int)
+            # The active slot is never refreshable from the backup copy
+            # (refresh_account gates it too); dropping it here keeps --all
+            # logs to slots the command can actually act on.
+            active = data.get("activeAccountNumber")
+            if active is not None:
+                targets = [t for t in targets if t != str(active)]
         if args.stale_min is not None:
             targets = _stale_targets(switcher, targets, args.stale_min)
 

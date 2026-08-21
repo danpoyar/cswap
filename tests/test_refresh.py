@@ -200,7 +200,7 @@ class TestRefreshWithoutLanding:
         from claude_swap.refresh import refresh_account
 
         switcher = _make_switcher()
-        backup, profile, session_dir = _mured_slot(switcher)
+        _backup, profile, session_dir = _mured_slot(switcher)
         _seed_last_good(switcher, age_s=6 * 3600)
         rotated = self._rotated()
 
@@ -305,6 +305,54 @@ class TestRefreshWithoutLanding:
             session_dir / ".credentials.json"
         ).read_text(encoding="utf-8") == revoked_profile
         assert switcher.read_account_credentials(NUM, EMAIL) == revoked_backup
+
+    def test_refresh_skips_active_slot(self, temp_home):
+        # The active slot's live credential is Claude Code's store; the
+        # backup this path would POST is a consumed predecessor whenever CC
+        # rotated in place — refreshing it can strike (or revoke) a LIVE
+        # login. The active account heals through its own locked path.
+        from claude_swap.refresh import refresh_account
+
+        switcher = _make_switcher()
+        _mured_slot(switcher)
+
+        with (
+            patch.object(
+                switcher, "_get_current_account", return_value=(EMAIL, "")
+            ),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials"
+            ) as post,
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == "active-slot"
+        post.assert_not_called()
+
+    def test_usage_read_false_without_fresh_measurement(self, temp_home):
+        # Old last-good must not masquerade as the post-refresh live proof:
+        # when the proof fetch fails, usage_read is False even though the
+        # slot still carries an hours-old measurement.
+        from claude_swap.refresh import refresh_account
+
+        switcher = _make_switcher()
+        _backup, _profile, _dir = _mured_slot(switcher)
+        _seed_last_good(switcher, age_s=6 * 3600)
+
+        with (
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(self._rotated(), None),
+            ),
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(None, error="transient"),
+            ),
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == "refreshed"
+        assert report.usage_read is False
 
     def test_refresh_skips_live_session(self, temp_home):
         # A live claude refreshes lazily on its next API call; consuming the
@@ -441,11 +489,26 @@ class TestRefreshCli:
             }
         ]
 
+    def test_refresh_all_excludes_active_slot(self, temp_home, capsys):
+        from claude_swap import cli
+
+        switcher = _make_switcher()
+        data = json.loads(switcher.sequence_file.read_text(encoding="utf-8"))
+        data["activeAccountNumber"] = 2
+        switcher.sequence_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch(
+            "claude_swap.refresh.refresh_accounts", return_value=[]
+        ) as run:
+            cli._refresh_command(["--all", "--json"])
+
+        run.assert_called_once()
+        assert run.call_args.args[1] == []  # slot 2 is active — dropped
+
     def test_refresh_all_stale_min_skips_recently_measured(
         self, temp_home, capsys
     ):
         from claude_swap import cli
-        from claude_swap.refresh import RefreshReport
 
         switcher = _make_switcher()
         # Freshly measured slot: --stale-min filters it out entirely.
