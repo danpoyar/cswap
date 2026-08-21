@@ -232,14 +232,20 @@ class TestRefreshWithoutLanding:
         assert entry.age_s is not None and entry.age_s < 5.0
 
     def test_refresh_consumes_keychain_generation_when_present(
-        self, temp_home, block_real_keychain
+        self, temp_home, block_real_keychain, monkeypatch
     ):
         # claude rotates the profile family into the hashed keychain entry;
         # the plaintext seed is then a CONSUMED generation. POSTing it risks
         # the documented reuse reaction (whole-login revocation), so the
-        # keychain generation must win.
+        # keychain generation must win. Keychain paths are macOS-only —
+        # force the platform so the case runs on any CI host.
         from claude_swap import macos_keychain
+        from claude_swap.models import Platform
         from claude_swap.refresh import refresh_account
+
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
 
         switcher = _make_switcher()
         _backup, _profile, session_dir = _mured_slot(switcher)
