@@ -753,6 +753,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--home",
+        metavar="NUM|EMAIL",
+        default=None,
+        help=(
+            "Pin the live login to this account: auto-switch never rotates "
+            "off it (not at the threshold, not at its limit), leaves it only "
+            "when its token is dead, and returns as soon as it reads again"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",
