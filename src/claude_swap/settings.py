@@ -294,6 +294,15 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
+            # A bare JSON number is the natural hand-written form of a slot
+            # number (``"homeAccount": 32``) and reads as its string; for
+            # every other string key a number is garbage as before.
+            if (
+                spec.json_key == "homeAccount"
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+            ):
+                value = str(value)
             kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
         else:  # choice
             if value not in spec.choices:

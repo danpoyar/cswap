@@ -18,11 +18,15 @@ unknown home makes the pin inert with one warning.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from unittest.mock import patch
 
 from claude_swap.autoswitch import (
     ConfigWarningEvent,
+    ErrorEvent,
     NoSwitchEvent,
+    QuarantineEvent,
     SwitchEvent,
     TickOutcome,
 )
@@ -32,6 +36,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     load_settings,
     set_setting,
+    settings_path,
     unset_setting,
 )
 from tests.test_autoswitch import (
@@ -40,6 +45,7 @@ from tests.test_autoswitch import (
     EngineHarness,
     _usage,
     _usage7,
+    _write_transcript,
 )
 
 HOME = "home@example.com"
@@ -269,3 +275,184 @@ class TestHomeAccountSetting:
         assert load_settings(tmp_path).home_account == "yor@x.com"
         assert unset_setting(tmp_path, "autoswitch.homeAccount") is True
         assert load_settings(tmp_path).home_account is None
+
+
+class TestReturnHomeWaits:
+    """A return that cannot land yet must not silence the rotation's escapes
+    for the slot the login is on (review r1)."""
+
+    def _away(self, temp_home, **kwargs) -> EngineHarness:
+        return _harness(temp_home, live=2, **kwargs)
+
+    def test_traffic_holds_the_return_but_not_the_at_limit_escape(self, temp_home):
+        h = self._away(temp_home)
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(30),
+            "2": _usage(100, "2024-01-05T00:00:00Z"),
+            "3": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "at-limit"
+        assert h.active_number() != 2
+        assert "return-home-wait" in _reasons(h)
+
+    def test_traffic_holds_the_return_and_logs_why(self, temp_home):
+        h = self._away(temp_home)
+        _write_transcript(h, age_s=10.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 30, _R_LATEST),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert _reasons(h)[0] == "return-home-wait"
+
+    def test_live_session_on_home_holds_the_return(self, temp_home):
+        h = self._away(temp_home)
+        with patch.object(h.engine, "_freshen_target", return_value="skip-live-session"):
+            outcome = h.tick_with_usage({
+                "1": _usage7(30, 30, _R_LATEST),
+                "2": _usage7(10, 10, _R_SOON),
+                "3": _usage7(10, 10, _R_SOON),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert _reasons(h)[0] == "return-home-wait"
+        assert "cswap run" in next(
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        )
+
+    def test_dead_current_still_fails_over_while_home_is_held(self, temp_home):
+        # The login's own token died on a rotational slot while a `cswap run`
+        # session holds the home slot: failover must still escape (to any
+        # other healthy slot — the held home is skipped by the same rule).
+        h = self._away(temp_home)
+        real = h.engine._freshen_target
+
+        def freshen(number, email):
+            return "skip-live-session" if number == "1" else real(number, email)
+
+        usage = {"1": _usage(30), "2": None, "3": _usage(10)}
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+        assert h.active_number() == 3
+
+    def test_network_blip_waits_and_leaves_the_rotation_alone(self, temp_home):
+        h = self._away(temp_home)
+        with patch.object(h.engine, "_freshen_target", return_value="transient"):
+            outcome = h.tick_with_usage({
+                "1": _usage7(30, 30, _R_LATEST),
+                "2": _usage7(10, 10, _R_SOON),
+                "3": _usage7(10, 10, _R_SOON),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert _reasons(h)[0] == "return-home-wait"
+        assert not any(isinstance(e, ErrorEvent) for e in h.events)
+
+
+class TestReturnHomeQuarantine:
+    """A dead lineage found by the return is quarantined for the whole tick:
+    the same tick's rotation must not land on it (review r1)."""
+
+    def _over_threshold(self, temp_home) -> tuple[EngineHarness, dict]:
+        h = _harness(temp_home, live=2, strategy="best")
+        usage = {"1": _usage(10), "2": _usage(95), "3": _usage(20)}
+        return h, usage
+
+    def test_identity_conflict_is_not_landed_on_by_the_same_tick(self, temp_home):
+        # First freshen persisted a fresh token for the conflicting slot, so
+        # a second look would say "ok" — only the in-place quarantine keeps
+        # the proactive escape off it.
+        h, usage = self._over_threshold(temp_home)
+        real = h.engine._freshen_target
+        calls: list[str] = []
+
+        def freshen(number, email):
+            calls.append(number)
+            if number == "1" and calls.count("1") == 1:
+                return "identity-conflict"
+            return real(number, email)
+
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+            outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "proactive"
+        assert h.active_number() == 3
+        assert "1" in h.state()["quarantine"]
+        assert calls.count("1") == 1
+        assert len([e for e in h.events if isinstance(e, QuarantineEvent)]) == 1
+
+    def test_invalid_grant_is_quarantined_once(self, temp_home):
+        h, usage = self._over_threshold(temp_home)
+        real = h.engine._freshen_target
+
+        def freshen(number, email):
+            return "invalid_grant" if number == "1" else real(number, email)
+
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+            outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert len([e for e in h.events if isinstance(e, QuarantineEvent)]) == 1
+        # Quarantined: the next tick never tries the return again.
+        h.events.clear()
+        h.clock.advance(60)
+        with patch.object(h.engine, "_freshen_target", side_effect=freshen) as spy:
+            h.tick_with_usage({"1": _usage(10), "2": _usage(95), "3": _usage(20)})
+        assert "1" not in [c.args[0] for c in spy.call_args_list]
+
+
+class TestDisabledHomeAtHome:
+    def test_disabled_home_leaves_by_the_threshold_with_one_warning(self, temp_home):
+        # `cswap disable <home>` while the login sits on it: the pin is
+        # inert there too — the threshold moves the login as without a pin,
+        # and the daemon says why once.
+        h = _harness(temp_home, live=1, strategy="best")
+        h.switcher.set_account_disabled("1", True)
+        usage = {"1": _usage(95), "2": _usage(10), "3": _usage(20)}
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "proactive"
+        assert h.active_number() == 2
+        warnings = [
+            e.message for e in h.events if isinstance(e, ConfigWarningEvent)
+        ]
+        assert len(warnings) == 1 and "disabled" in warnings[0]
+        assert "home-pinned" not in _reasons(h)
+
+    def test_re_enabled_home_pins_again_and_re_warns_on_a_new_disable(self, temp_home):
+        h = _harness(temp_home, live=1)
+        usage = {
+            "1": _usage7(20, 20, _R_LATEST),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        h.switcher.set_account_disabled("1", True)
+        h.tick_with_usage(usage)  # warns, rotation moves the login
+        h.switcher.set_account_disabled("1", False)
+        h.clock.advance(60)
+        h.tick_with_usage(usage)  # returns home
+        h.switcher.set_account_disabled("1", True)
+        h.clock.advance(60)
+        h.tick_with_usage(usage)  # a fresh condition: warns again
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 2
+
+
+class TestSettingsClamp:
+    def test_bare_json_number_reads_as_the_slot(self, tmp_path: Path):
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"autoswitch": {"homeAccount": 32}}))
+        assert load_settings(tmp_path).home_account == "32"

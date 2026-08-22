@@ -1449,11 +1449,14 @@ class AutoSwitchEngine:
         # there instead: nothing voluntary moves it, a maxed window holds
         # too (the wall is the user's own to wait out), and only a dead
         # token — usage unreadable — escalates to failover below. Away from
-        # home, the return preempts every other decision once the home slot
-        # proves alive; an inert pin (disabled, quarantined, unreadable home)
-        # falls through to the plain rotation.
+        # home, the return lands once the home slot proves alive; while it
+        # cannot land yet (no proof of life, traffic, a live session on the
+        # slot) the plain rotation keeps judging the slot the login is on,
+        # so at-limit and failover there still escape (review r1). An inert
+        # pin — home disabled (the user's explicit hold-out wins, said once)
+        # or quarantined — leaves every tick to the plain rotation.
         home = self._home_slot(settings)
-        if home is not None:
+        if home is not None and not self._home_inert(home, quarantined):
             if current != home:
                 outcome = self._return_home(
                     home, quarantined=quarantined, usage=usage
@@ -2508,6 +2511,26 @@ class AutoSwitchEngine:
         self._home_warned = key
         self._emit(ConfigWarningEvent(message=message))
 
+    def _home_inert(self, home: str, quarantined: set[str]) -> bool:
+        """Whether the pin is switched off this tick, wherever the login is.
+
+        A disabled home is the user's explicit hold-out and wins over the
+        pin (said once, not every tick); a quarantined home already failed
+        a landing. Either way the plain rotation judges the tick — also
+        when the login currently sits on the home slot (review r1: a
+        disabled active home must leave by the threshold, as without a pin).
+        """
+        if self.switcher.is_account_disabled(home):
+            self._warn_home_once(
+                f"disabled:{home}",
+                f"autoswitch.homeAccount: Account-{home} is disabled — the "
+                f"pin is inert until 'cswap enable {home}'",
+            )
+            return True
+        if self._home_warned and self._home_warned.startswith("disabled:"):
+            self._home_warned = None
+        return home in quarantined
+
     def _return_home(
         self,
         home: str,
@@ -2517,28 +2540,24 @@ class AutoSwitchEngine:
     ) -> TickOutcome | None:
         """Bring the live login back to the pinned slot once it proves alive.
 
-        Returns ``None`` when the pin is inert this tick — home disabled
-        (the user's explicit hold-out wins, said once), quarantined (a
-        landing there already failed), or without readable usage (no proof
-        of life: a stale backup is exactly what a hand-made switch onto the
-        home slot died on) — and the plain rotation carries on as without a
-        pin. Otherwise the return is attempted and the tick's outcome is
-        returned. Proof of life is positive and live: readable usage now,
-        then the same freshen the daemon gives every target (a live refresh
-        with quarantine on a dead lineage) — never a timer or a cooldown
+        Returns the tick's outcome when the return landed (or was refused by
+        the switch itself), and ``None`` whenever it cannot land this tick —
+        no readable usage (no proof of life: a stale backup is exactly what
+        a hand-made switch onto the home slot died on), session traffic, a
+        ``cswap run`` session holding the slot, a network blip, or a dead
+        lineage just quarantined. ``None`` hands the tick to the plain
+        rotation, which keeps judging the slot the login is on: its at-limit
+        and failover escapes must not be silenced by a return that is
+        merely waiting (review r1). A wait says why in one
+        ``return-home-wait`` no-switch; a quarantine joins ``quarantined``
+        in place so the same tick's rotation never lands on the slot the
+        return just proved dead.
+
+        Proof of life is positive and live: readable usage now, then the
+        same freshen the daemon gives every target (a live refresh with
+        quarantine on a dead lineage) — never a timer or a cooldown
         expiring, which is how failback flaps.
         """
-        if self.switcher.is_account_disabled(home):
-            self._warn_home_once(
-                f"disabled:{home}",
-                f"autoswitch.homeAccount: Account-{home} is disabled — the "
-                f"pin is inert until 'cswap enable {home}'",
-            )
-            return None
-        if self._home_warned and self._home_warned.startswith("disabled:"):
-            self._home_warned = None
-        if home in quarantined:
-            return None
         value = usage.get(home)
         if value is None:
             # Not served this tick (adaptive cadence), and not a dead-token
@@ -2548,48 +2567,36 @@ class AutoSwitchEngine:
             value = entry.decision_value() if entry is not None else None
         if _headroom_by_account({home: value}, self._models).get(home) is None:
             return None
-        quiet, detail = self._session_quiet()
-        if not quiet:
+
+        def wait(detail: str) -> None:
             self._emit(
                 NoSwitchEvent(
-                    reason="sessions-active",
+                    reason="return-home-wait",
                     detail=f"the return to Account-{home} waits: {detail}",
                 )
             )
-            return TickOutcome.NO_ACTION
+
+        quiet, detail = self._session_quiet()
+        if not quiet:
+            wait(detail)
+            return None
         email = self.switcher.account_email(home)
         if self.dry_run:
             return self._perform_with_drain2(home, email, "return-home", None, None)
         status = self._freshen_target(home, email)
         if status in ("identity-conflict", "invalid_grant"):
             self._quarantine(home, email, status)
+            quarantined.add(home)
             return None
         if status == "transient":
-            self._emit(
-                ErrorEvent(
-                    message=(
-                        f"could not freshen Account-{home} for the return "
-                        "home (network?)"
-                    ),
-                    transient=True,
-                )
-            )
-            return TickOutcome.ERROR
+            wait("its token could not be freshened (network?)")
+            return None
         if status == "skip-live-session":
             # A ``cswap run`` session owns this slot's token in its own
             # profile; making it the default login too would fork the
-            # lineage (the stale-copy class). The return waits for that
-            # session to end.
-            self._emit(
-                NoSwitchEvent(
-                    reason="home-live-session",
-                    detail=(
-                        f"a 'cswap run' session holds Account-{home}; the "
-                        "return home waits for it to end"
-                    ),
-                )
-            )
-            return TickOutcome.NO_ACTION
+            # lineage (the stale-copy class).
+            wait(f"a 'cswap run' session holds Account-{home}")
+            return None
         return self._perform_with_drain2(home, email, "return-home", None, None)
 
     def _drain_gate(
