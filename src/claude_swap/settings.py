@@ -107,6 +107,14 @@ class AutoSwitchSettings:
     # rotation never hoards a model-fresh account the fleet's model-pinned
     # work needs (pool-shield, CON-712).
     model: str | None = None
+    # Slot number or email the live login is pinned to (CON-1070). With a
+    # home the daemon never moves the login off it on its own — threshold,
+    # consume-first, the early swap and even a maxed window all hold; a dead
+    # token (failover) is the only escape — and, away from home, returns as
+    # soon as the home slot proves alive (readable usage), ignoring the
+    # cooldown. A disabled or unknown home leaves the pin inert with one
+    # warning. None = plain rotation (default).
+    home_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +233,13 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "homeAccount", "home_account", "string",
+            help=(
+                "Pin the live login to this slot (num or email): auto-switch "
+                "only leaves it on a dead token and returns once it reads again"
+            ),
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -559,6 +574,7 @@ _CLI_OVERRIDE_FIELDS = (
     ("include_api_key_accounts", "include_api_key_accounts"),
     ("model", "model"),
     ("strategy", "strategy"),
+    ("home", "home_account"),
 )
 
 

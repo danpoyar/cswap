@@ -382,7 +382,8 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # "proactive" | "at-limit" | "failover" | "consume-first" | "return-home"
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1008,6 +1009,11 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # ``autoswitch.homeAccount`` (CON-1070) warns once per inert
+        # condition (unknown account / disabled home), keyed here so a
+        # daemon does not repeat itself every tick and says it again only
+        # when the condition changes.
+        self._home_warned: str | None = None
         # Drain episode under dry-run lives here instead of the state file
         # (dry-run must not write anything).
         self._drain_mem: dict | None = None
@@ -1434,6 +1440,40 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+
+        # -- home pin (CON-1070) -------------------------------------------
+        # The fleet seats agents per slot and refuses the *active* one (a
+        # ``cswap run`` of the active slot rides the global login and would
+        # be swapped from under the agent), so a login that rotates costs
+        # the fleet one seat at all times. With a home slot the login rests
+        # there instead: nothing voluntary moves it, a maxed window holds
+        # too (the wall is the user's own to wait out), and only a dead
+        # token — usage unreadable — escalates to failover below. Away from
+        # home, the return preempts every other decision once the home slot
+        # proves alive; an inert pin (disabled, quarantined, unreadable home)
+        # falls through to the plain rotation.
+        home = self._home_slot(settings)
+        if home is not None:
+            if current != home:
+                outcome = self._return_home(
+                    home, quarantined=quarantined, usage=usage
+                )
+                if outcome is not None:
+                    return outcome
+            elif active_headroom is not None:
+                self._unhealthy_ticks = 0
+                self._idle_hold_since = None
+                self._emit(
+                    NoSwitchEvent(
+                        reason="home-pinned",
+                        detail=(
+                            f"the live login rests on Account-{home}; only a "
+                            "dead token moves it"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+
         early = False
         if active_headroom is not None:
             self._unhealthy_ticks = 0
@@ -2428,11 +2468,129 @@ class AutoSwitchEngine:
         threshold is already crossed there, so the choice is "swap now and
         lose prompt caches" against "ride into the wall and lose in-flight
         agents". ``consume-first`` is a below-threshold optimization with
-        nothing to escape, so it stays gated under every setting.
+        nothing to escape, so it stays gated under every setting — and so
+        is ``return-home`` (CON-1070): the login is working where it is,
+        the return is a correction with nothing burning behind it.
         """
         if self.settings.switch_under_load:
-            return ("consume-first",)
-        return ("proactive", "consume-first")
+            return ("consume-first", "return-home")
+        return ("proactive", "consume-first", "return-home")
+
+    # -- home pin (CON-1070) ----------------------------------------------
+
+    def _home_slot(self, settings: AutoSwitchSettings) -> str | None:
+        """Resolve ``autoswitch.homeAccount`` to a managed slot, or None.
+
+        A value that names no managed account leaves the pin inert and says
+        so once — a pin that looks set while gating nothing is the
+        ``autoswitch.model`` typo class all over again.
+        """
+        ident = settings.home_account
+        if not ident:
+            self._home_warned = None
+            return None
+        try:
+            number, _email, _org = self.switcher.resolve_account(ident)
+        except ClaudeSwitchError as e:
+            self._warn_home_once(
+                f"unknown:{ident}",
+                f"autoswitch.homeAccount: {e} — the pin is inert until it "
+                "names a managed account",
+            )
+            return None
+        if self._home_warned and self._home_warned.startswith("unknown:"):
+            self._home_warned = None
+        return number
+
+    def _warn_home_once(self, key: str, message: str) -> None:
+        if self._home_warned == key:
+            return
+        self._home_warned = key
+        self._emit(ConfigWarningEvent(message=message))
+
+    def _return_home(
+        self,
+        home: str,
+        *,
+        quarantined: set[str],
+        usage: dict[str, dict | str | None],
+    ) -> TickOutcome | None:
+        """Bring the live login back to the pinned slot once it proves alive.
+
+        Returns ``None`` when the pin is inert this tick — home disabled
+        (the user's explicit hold-out wins, said once), quarantined (a
+        landing there already failed), or without readable usage (no proof
+        of life: a stale backup is exactly what a hand-made switch onto the
+        home slot died on) — and the plain rotation carries on as without a
+        pin. Otherwise the return is attempted and the tick's outcome is
+        returned. Proof of life is positive and live: readable usage now,
+        then the same freshen the daemon gives every target (a live refresh
+        with quarantine on a dead lineage) — never a timer or a cooldown
+        expiring, which is how failback flaps.
+        """
+        if self.switcher.is_account_disabled(home):
+            self._warn_home_once(
+                f"disabled:{home}",
+                f"autoswitch.homeAccount: Account-{home} is disabled — the "
+                f"pin is inert until 'cswap enable {home}'",
+            )
+            return None
+        if self._home_warned and self._home_warned.startswith("disabled:"):
+            self._home_warned = None
+        if home in quarantined:
+            return None
+        value = usage.get(home)
+        if value is None:
+            # Not served this tick (adaptive cadence), and not a dead-token
+            # sentinel: one targeted fetch. The collector's backoff and
+            # claims still apply, so a dead home is never hammered.
+            entry = self.switcher.usage_entries_by_account(fetch={home}).get(home)
+            value = entry.decision_value() if entry is not None else None
+        if _headroom_by_account({home: value}, self._models).get(home) is None:
+            return None
+        quiet, detail = self._session_quiet()
+        if not quiet:
+            self._emit(
+                NoSwitchEvent(
+                    reason="sessions-active",
+                    detail=f"the return to Account-{home} waits: {detail}",
+                )
+            )
+            return TickOutcome.NO_ACTION
+        email = self.switcher.account_email(home)
+        if self.dry_run:
+            return self._perform_with_drain2(home, email, "return-home", None, None)
+        status = self._freshen_target(home, email)
+        if status in ("identity-conflict", "invalid_grant"):
+            self._quarantine(home, email, status)
+            return None
+        if status == "transient":
+            self._emit(
+                ErrorEvent(
+                    message=(
+                        f"could not freshen Account-{home} for the return "
+                        "home (network?)"
+                    ),
+                    transient=True,
+                )
+            )
+            return TickOutcome.ERROR
+        if status == "skip-live-session":
+            # A ``cswap run`` session owns this slot's token in its own
+            # profile; making it the default login too would fork the
+            # lineage (the stale-copy class). The return waits for that
+            # session to end.
+            self._emit(
+                NoSwitchEvent(
+                    reason="home-live-session",
+                    detail=(
+                        f"a 'cswap run' session holds Account-{home}; the "
+                        "return home waits for it to end"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+        return self._perform_with_drain2(home, email, "return-home", None, None)
 
     def _drain_gate(
         self, trigger: str, active_headroom: float | None
