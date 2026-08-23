@@ -1916,13 +1916,18 @@ class ClaudeAccountSwitcher:
         Keychain first: the hashed service name is derived from the dir path
         and can't be recomputed once the dir is gone.
         """
-        from claude_swap.session import delete_macos_keychain_entry
+        from claude_swap.session import (
+            delete_macos_keychain_entry,
+            discard_profile_dir,
+        )
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        # Transcripts go to the rotation quarantine, never down with the dir
+        # (CON-1112) — see discard_profile_dir.
+        discard_profile_dir(session_dir, self._logger)
         self._logger.info(
             f"Removed session profile for account {account_num} at {session_dir}"
         )

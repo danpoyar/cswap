@@ -38,12 +38,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unicodedata
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -199,6 +201,94 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     ``<backup>/sessions/2-user_x.com/sessions/1234.json`` — intentional.
     """
     return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
+
+
+TRANSCRIPT_TRASH_DIRNAME = ".trash-transcripts"
+
+
+def transcript_trash_root() -> Path:
+    """Quarantine root shared with the fleet's transcript rotation.
+
+    ``~/.claude/.trash-transcripts/YYYY-MM-DD/...`` is where the config
+    repo's transcript-rotate.sh parks transcripts instead of deleting them
+    (an undo window of ``quarantine_days``; the day folder, not its files,
+    is what the purge step judges). Always under the real home: a profile's
+    ``CLAUDE_CONFIG_DIR`` is the thing being removed.
+    """
+    return Path.home() / ".claude" / TRANSCRIPT_TRASH_DIRNAME
+
+
+def quarantine_profile_transcripts(
+    session_dir: Path, today: date | None = None
+) -> Path | None:
+    """Move ``session_dir/projects`` into the rotation quarantine.
+
+    Returns the destination (``<trash>/<YYYY-MM-DD>/<profile dir name>``,
+    suffixed ``-2``, ``-3``... when the same profile is discarded twice in a
+    day — a failed re-bootstrap loop does exactly that) or None when the
+    profile has no ``projects/``. Raises OSError when the move fails; the
+    caller decides what the failure costs.
+    """
+    src = session_dir / "projects"
+    # Under --share-history ``projects`` is a symlink to the real
+    # ~/.claude/projects (HISTORY_ITEMS): the link is not profile data and
+    # dies with the dir — moved into the quarantine it would hand the
+    # rotation's ``rm -rf`` (and anyone tidying the folder) the live root.
+    if src.is_symlink() or not src.is_dir():
+        return None
+    day = (today or date.today()).isoformat()
+    base = transcript_trash_root() / day / session_dir.name
+    dest = base
+    n = 2
+    while dest.exists():
+        dest = base.with_name(f"{base.name}-{n}")
+        n += 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(src, dest)
+    return dest
+
+
+def discard_profile_dir(session_dir: Path, logger: logging.Logger) -> None:
+    """Remove a session profile dir without taking its transcripts with it.
+
+    The only sanctioned way to rmtree a profile (CON-1112): ``cswap remove``
+    and the failed-validation cleanup used to rmtree the whole dir, and the
+    fleet lost 208 sessions' transcripts past rotation and its undo window.
+    ``projects/`` is quarantined first; if that move fails, the transcripts
+    stay put and only the rest of the profile (credentials included) goes.
+    """
+    try:
+        dest = quarantine_profile_transcripts(session_dir)
+    except OSError as e:
+        # shutil.move may have copied part of the tree before failing, so the
+        # transcripts sit in projects/ and/or the quarantine — nothing is
+        # deleted from either; the rest of the profile still goes.
+        logger.warning(
+            f"Could not quarantine transcripts of {session_dir}: {e}; "
+            f"projects/ is not removed (check it and {transcript_trash_root()}), "
+            f"the rest of the profile is"
+        )
+        try:
+            children = list(session_dir.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if child.name == "projects":
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            # Never raise: remove_account would strand the slot between its
+            # backups and sequence.json, the failed-bootstrap path would
+            # trade its SessionError for a traceback.
+            try:
+                child.unlink(missing_ok=True)
+            except OSError as e2:
+                logger.warning(f"Could not remove {child}: {e2}")
+        return
+    if dest is not None:
+        logger.info(f"Quarantined transcripts of {session_dir} to {dest}")
+    shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def keychain_service_name(session_dir: Path) -> str:
@@ -646,7 +736,7 @@ class SessionManager:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone.
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        discard_profile_dir(session_dir, self._logger)
 
     # -- validation ------------------------------------------------------
 
