@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sys
 import unicodedata
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1898,3 +1900,128 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
+
+
+# ---------------------------------------------------------------------------
+# transcript quarantine before a profile dir is removed (CON-1112)
+# ---------------------------------------------------------------------------
+
+
+TRANSCRIPT_BODY = '{"type":"user","uuid":"u1"}\n'
+
+
+def plant_transcript(session_dir: Path, name: str = "abc.jsonl") -> Path:
+    """Drop a claude transcript into a profile, the way claude lays it out."""
+    f = session_dir / "projects" / "-Users-x-proj" / name
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(TRANSCRIPT_BODY)
+    return f
+
+
+def quarantine_dir(temp_home: Path, session_dir: Path) -> Path:
+    return (
+        temp_home
+        / ".claude"
+        / ".trash-transcripts"
+        / date.today().isoformat()
+        / session_dir.name
+    )
+
+
+class TestProfileTranscriptQuarantine:
+    """Both rmtree paths (``cswap remove`` and the failed re-bootstrap
+    cleanup) must move ``projects/`` into the rotation quarantine first —
+    the slice of CON-1108 found 208 fleet sessions / 103M tokens gone
+    through these two paths, past transcript-rotate.sh and its undo window."""
+
+    def test_remove_account_quarantines_transcripts(
+        self, manager, seeded_switcher, temp_home, auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        plant_transcript(session_dir)
+
+        seeded_switcher.remove_account("2", assume_yes=True)
+
+        assert not session_dir.exists()
+        moved = quarantine_dir(temp_home, session_dir) / "-Users-x-proj" / "abc.jsonl"
+        assert moved.read_text() == TRANSCRIPT_BODY
+
+    def test_failed_validation_quarantines_transcripts(
+        self, manager, seeded_switcher, temp_home, monkeypatch, refresh_rotates
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        plant_transcript(session_dir)
+        # claude never sees the profile as logged in -> bootstrap -> still
+        # invalid -> _cleanup_failed_session.
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(SessionError, match="failed validation"):
+            manager.setup_session("2", share=False)
+
+        assert not session_dir.exists()
+        moved = quarantine_dir(temp_home, session_dir) / "-Users-x-proj" / "abc.jsonl"
+        assert moved.read_text() == TRANSCRIPT_BODY
+
+    def test_same_day_collision_keeps_both(self, temp_home, tmp_path):
+        logger = logging.getLogger("cswap-test")
+        session_dir = tmp_path / "35-claude15_amouen.com"
+        session_dir.mkdir()
+        plant_transcript(session_dir, "first.jsonl")
+        session_mod.discard_profile_dir(session_dir, logger)
+        session_dir.mkdir()
+        plant_transcript(session_dir, "second.jsonl")
+        session_mod.discard_profile_dir(session_dir, logger)
+
+        base = quarantine_dir(temp_home, session_dir)
+        assert (base / "-Users-x-proj" / "first.jsonl").read_text() == TRANSCRIPT_BODY
+        twin = base.with_name(base.name + "-2")
+        assert (twin / "-Users-x-proj" / "second.jsonl").read_text() == TRANSCRIPT_BODY
+
+    def test_move_failure_keeps_projects_and_wipes_the_rest(
+        self, temp_home, tmp_path, monkeypatch, caplog
+    ):
+        logger = logging.getLogger("cswap-test")
+        session_dir = tmp_path / "35-claude15_amouen.com"
+        session_dir.mkdir()
+        transcript = plant_transcript(session_dir)
+        (session_dir / ".credentials.json").write_text("{}")
+        (session_dir / "cache").mkdir()
+        (session_dir / "cache" / "x").write_text("x")
+        (session_dir / "agents").symlink_to(tmp_path)
+
+        def refuse(*a, **k):
+            raise OSError("disk says no")
+
+        monkeypatch.setattr(session_mod.shutil, "move", refuse)
+        with caplog.at_level(logging.WARNING, logger="cswap-test"):
+            session_mod.discard_profile_dir(session_dir, logger)
+
+        assert transcript.read_text() == TRANSCRIPT_BODY
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / "cache").exists()
+        assert not (session_dir / "agents").is_symlink()
+        assert tmp_path.exists()  # symlink target untouched
+        assert not quarantine_dir(temp_home, session_dir).exists()
+        assert any("disk says no" in r.message for r in caplog.records)
+
+    def test_profile_without_projects_leaves_no_quarantine(self, temp_home, tmp_path):
+        session_dir = tmp_path / "35-claude15_amouen.com"
+        session_dir.mkdir()
+        (session_dir / ".credentials.json").write_text("{}")
+
+        session_mod.discard_profile_dir(session_dir, logging.getLogger("cswap-test"))
+
+        assert not session_dir.exists()
+        assert not (temp_home / ".claude" / ".trash-transcripts").exists()
