@@ -2025,3 +2025,81 @@ class TestProfileTranscriptQuarantine:
 
         assert not session_dir.exists()
         assert not (temp_home / ".claude" / ".trash-transcripts").exists()
+
+    def test_share_history_symlink_dies_with_profile_on_remove(
+        self, manager, seeded_switcher, temp_home, auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        # --share-history links projects/ to the real ~/.claude/projects: the
+        # link is not profile data — it must die with the dir, never be moved
+        # into a folder the rotation purges with rm -rf.
+        session_dir, _, _ = manager.setup_session(
+            "2", share=False, share_history=True
+        )
+        assert (session_dir / "projects").is_symlink()
+        shared = plant_transcript(temp_home / ".claude")
+
+        seeded_switcher.remove_account("2", assume_yes=True)
+
+        assert not session_dir.exists()
+        assert shared.read_text() == TRANSCRIPT_BODY
+        assert not (temp_home / ".claude" / ".trash-transcripts").exists()
+
+    def test_share_history_symlink_dies_with_profile_on_failed_validation(
+        self, manager, seeded_switcher, temp_home, monkeypatch, refresh_rotates
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        shared = plant_transcript(temp_home / ".claude")
+        (session_dir / "projects").symlink_to(temp_home / ".claude" / "projects")
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(SessionError, match="failed validation"):
+            manager.setup_session("2", share=False, share_history=True)
+
+        assert not session_dir.exists()
+        assert shared.read_text() == TRANSCRIPT_BODY
+        assert not (temp_home / ".claude" / ".trash-transcripts").exists()
+
+    def test_fallback_survives_unlink_failure(
+        self, temp_home, tmp_path, monkeypatch, caplog
+    ):
+        # Both callers rely on a non-raising contract: remove_account would
+        # otherwise leave the slot in sequence.json without its backups, and
+        # the failed-bootstrap path would trade SessionError for a traceback.
+        logger = logging.getLogger("cswap-test")
+        session_dir = tmp_path / "35-claude15_amouen.com"
+        session_dir.mkdir()
+        transcript = plant_transcript(session_dir)
+        creds = session_dir / ".credentials.json"
+        creds.write_text("{}")
+        (session_dir / "history.jsonl").write_text("")
+
+        def refuse_move(*a, **k):
+            raise OSError("disk says no")
+
+        real_unlink = Path.unlink
+
+        def refuse_creds(self, *a, **k):
+            if self.name == ".credentials.json":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(session_mod.shutil, "move", refuse_move)
+        monkeypatch.setattr(Path, "unlink", refuse_creds)
+        with caplog.at_level(logging.WARNING, logger="cswap-test"):
+            session_mod.discard_profile_dir(session_dir, logger)  # must not raise
+
+        assert transcript.read_text() == TRANSCRIPT_BODY
+        assert not (session_dir / "history.jsonl").exists()
+        assert any(".credentials.json" in r.message for r in caplog.records)

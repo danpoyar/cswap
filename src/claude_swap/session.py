@@ -230,7 +230,11 @@ def quarantine_profile_transcripts(
     caller decides what the failure costs.
     """
     src = session_dir / "projects"
-    if not src.is_dir():
+    # Under --share-history ``projects`` is a symlink to the real
+    # ~/.claude/projects (HISTORY_ITEMS): the link is not profile data and
+    # dies with the dir — moved into the quarantine it would hand the
+    # rotation's ``rm -rf`` (and anyone tidying the folder) the live root.
+    if src.is_symlink() or not src.is_dir():
         return None
     day = (today or date.today()).isoformat()
     base = transcript_trash_root() / day / session_dir.name
@@ -256,9 +260,13 @@ def discard_profile_dir(session_dir: Path, logger: logging.Logger) -> None:
     try:
         dest = quarantine_profile_transcripts(session_dir)
     except OSError as e:
+        # shutil.move may have copied part of the tree before failing, so the
+        # transcripts sit in projects/ and/or the quarantine — nothing is
+        # deleted from either; the rest of the profile still goes.
         logger.warning(
             f"Could not quarantine transcripts of {session_dir}: {e}; "
-            f"projects/ left in place, the rest of the profile removed"
+            f"projects/ is not removed (check it and {transcript_trash_root()}), "
+            f"the rest of the profile is"
         )
         try:
             children = list(session_dir.iterdir())
@@ -269,8 +277,14 @@ def discard_profile_dir(session_dir: Path, logger: logging.Logger) -> None:
                 continue
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child, ignore_errors=True)
-            else:
+                continue
+            # Never raise: remove_account would strand the slot between its
+            # backups and sequence.json, the failed-bootstrap path would
+            # trade its SessionError for a traceback.
+            try:
                 child.unlink(missing_ok=True)
+            except OSError as e2:
+                logger.warning(f"Could not remove {child}: {e2}")
         return
     if dest is not None:
         logger.info(f"Quarantined transcripts of {session_dir} to {dest}")
