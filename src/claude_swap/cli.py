@@ -54,6 +54,8 @@ _SUBCOMMAND_FLAGS = {
     "status": "--status",
     "add": "--add-account",
     "add-token": "--add-token",
+    "attach-token": "--attach-token",
+    "detach-token": "--detach-token",
     "remove": "--remove-account",
     "rm": "--remove-account",
     "disable": "--disable-account",
@@ -1079,6 +1081,10 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s attach-token <num|email> [TOKEN|-]
+                                   attach a year-long setup-token to a login slot:
+                                   sessions run on it, quota stays on the login
+  %(prog)s detach-token <num|email>   remove the attached setup-token
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
@@ -1114,6 +1120,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s attach-token 19 -                  # read the setup-token from stdin
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
@@ -1306,6 +1313,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         const="",
         help=argparse.SUPPRESS,
     )
+    group.add_argument(
+        "--attach-token",
+        metavar="NUM|EMAIL",
+        nargs="+",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--detach-token",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
 
     args = parser.parse_args(argv)
 
@@ -1330,6 +1348,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.export is not None
         or args.import_ is not None
         or args.add_token is not None
+        or args.attach_token is not None
+        or args.detach_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
 
@@ -1413,6 +1433,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 email=args.email,
                 slot=args.slot,
             )
+        elif args.attach_token is not None:
+            # `attach-token <num|email> [TOKEN|-]`: identity first, token
+            # second ("-" = stdin, omitted = secure prompt).
+            if len(args.attach_token) > 2:
+                parser.error("attach-token takes <num|email> and an optional TOKEN|-")
+            switcher.attach_inference_token(
+                args.attach_token[0],
+                args.attach_token[1] if len(args.attach_token) > 1 else "",
+            )
+        elif args.detach_token is not None:
+            switcher.detach_inference_token(args.detach_token)
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.disable_account is not None:

@@ -47,6 +47,13 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
+from claude_swap.inference_token import (
+    delete_inference_token,
+    looks_like_inference_token,
+    read_inference_token,
+    token_path as inference_token_path,
+    write_inference_token,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -550,18 +557,23 @@ class ClaudeAccountSwitcher:
         self._delete_session_profile(account_num, email)
 
     def _prune_mappings(self, email: str, org_uuid: str) -> None:
-        """Drop directory mappings for an identity that no longer has a slot.
+        """Drop directory mappings — and the attached inference token — for an
+        identity that no longer has a slot.
 
         Called wherever an identity leaves the account table for good
         (remove_account, add_account/add_token slot overwrite). Slot
         *migration* and --import --force keep the (email, org) identity that
-        mappings are keyed by, so they need no pruning.
+        mappings are keyed by, so they need no pruning. The inference token
+        (CON-1329) is keyed by the same identity: it must not outlive its
+        account and leak into the slot number's next occupant.
         """
         from claude_swap.mappings import MappingStore
 
         pruned = MappingStore(self.backup_dir).prune_account(email, org_uuid or "")
         if pruned:
             print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
+        if delete_inference_token(self.backup_dir, email):
+            print(dimmed("Removed the attached inference token for this account"))
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -1843,9 +1855,16 @@ class ClaudeAccountSwitcher:
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
         if looks_like_api_key(creds):
             return []
+        # CON-1329: an attached inference token is the credential sessions
+        # actually run on — say so next to the login's own token status.
+        token_lines = (
+            ["inference token: attached (sessions run on it; quota from the login)"]
+            if self.has_inference_token(email)
+            else []
+        )
         if is_active:
             line = _label_token_status("active profile", creds)
-            return [line] if line is not None else []
+            return ([line] if line is not None else []) + token_lines
 
         from claude_swap.session import (
             read_session_credentials,
@@ -1865,7 +1884,7 @@ class ClaudeAccountSwitcher:
         backup_line = _label_token_status("stored backup", creds)
         if backup_line is not None:
             lines.append(backup_line)
-        return lines
+        return lines + token_lines
 
     def _live_session_pids(self, account_num: str, email: str) -> list[int]:
         """PIDs of Claude instances running against an account's session profile."""
@@ -2890,6 +2909,79 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+
+    # -- inference token attached to a login slot (CON-1329) ---------------
+
+    def inference_token_for(self, account_num: str, email: str) -> str | None:
+        """The year-long inference token attached to a slot's identity, or None."""
+        if not email:
+            return None
+        return read_inference_token(self.backup_dir, email)
+
+    def has_inference_token(self, email: str) -> bool:
+        """Whether an inference token is attached (no value is read)."""
+        return bool(email) and inference_token_path(self.backup_dir, email).is_file()
+
+    def attach_inference_token(self, identifier: str, token: str) -> None:
+        """Attach a ``claude setup-token`` to a managed login slot.
+
+        The slot keeps its ordinary login (identity + quota measurement; the
+        inference-only token answers 403 on the usage endpoint) and every
+        ``cswap run`` session of the slot runs on the token instead
+        (``CLAUDE_CODE_OAUTH_TOKEN`` + a profile seeded with it), so sessions
+        never touch the login's refresh family. Attaching invalidates the
+        slot's session profile like a credential rewrite does: the next run
+        re-seeds it with the token; a live session keeps its copy.
+
+        Args:
+            identifier: slot number, email or alias.
+            token: raw ``sk-ant-oat…`` setup-token, ``"-"`` to read one line
+                   from stdin, or ``""`` to prompt securely via getpass.
+        """
+        import getpass
+
+        if token == "-":
+            token = sys.stdin.readline().rstrip("\n")
+        elif not token:
+            token = getpass.getpass("Setup-token: ")
+        token = token.strip()
+        if not token:
+            raise ValidationError("Token cannot be empty")
+        if looks_like_api_key(token):
+            raise ValidationError(
+                "An API key cannot be attached to a login slot — attach only a "
+                "`claude setup-token` (sk-ant-oat…); API keys are registered "
+                "with 'cswap add-token'."
+            )
+        if not looks_like_inference_token(token):
+            raise ValidationError(
+                "This does not look like a `claude setup-token` (sk-ant-oat…)"
+            )
+        account_num, email, _org_uuid = self.resolve_account(identifier)
+        if self._account_kind(account_num) == "api_key":
+            raise ValidationError(
+                f"Account-{account_num} ({email}) is an API-key account; an "
+                "inference token attaches to a login (OAuth) slot only."
+            )
+        write_inference_token(self.backup_dir, email, token)
+        self._post_backup_write(account_num, email)
+        self._logger.info(f"Attached inference token to account {account_num}: {email}")
+        print(
+            f"{accent('Attached')} inference token to Account {account_num} "
+            f"({email}): sessions launched with 'cswap run {account_num}' now run "
+            f"on it; the stored login keeps measuring quota."
+        )
+
+    def detach_inference_token(self, identifier: str) -> None:
+        """Remove the attached inference token; sessions fall back to the login."""
+        account_num, email, _org_uuid = self.resolve_account(identifier)
+        if not delete_inference_token(self.backup_dir, email):
+            raise ValidationError(
+                f"Account-{account_num} ({email}) has no attached inference token"
+            )
+        self._post_backup_write(account_num, email)
+        self._logger.info(f"Detached inference token from account {account_num}: {email}")
+        print(f"{accent('Detached')} inference token from Account {account_num} ({email}).")
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -4154,6 +4246,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     next_poll_at=entry.next_poll_at,
                     token_expired_at=entry.token_expired_at,
+                    inference_token=self.has_inference_token(email),
                 )
             )
         payload = {

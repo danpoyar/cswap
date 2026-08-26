@@ -228,6 +228,7 @@ def account_row(
     disabled: bool = False,
     next_poll_at: float | None = None,
     token_expired_at: float | None = None,
+    inference_token: bool = False,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -267,6 +268,13 @@ def account_row(
     # is being served.
     if next_poll_at is not None:
         row["nextPollAt"] = _iso_utc(next_poll_at)
+    # Additive (CON-1329): the slot carries a year-long inference token —
+    # sessions run on it, so a stale/dead ``usageStatus`` here describes the
+    # quota gauge (the stored login), not the slot's ability to work. The
+    # token value itself is never emitted. Consumers pair this with
+    # ``usageAgeSeconds`` / ``lastGoodAgeSeconds`` to see how old the gauge is.
+    if inference_token:
+        row["inferenceToken"] = True
     return row
 
 

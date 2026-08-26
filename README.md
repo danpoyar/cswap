@@ -361,6 +361,25 @@ cswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+### Attach a setup-token to a login slot (inference on the token, quota on the login)
+
+A `claude setup-token` is inference-only: the usage endpoint refuses it (403,
+`user:profile` scope), so a slot made ONLY of a setup-token is blind to quota.
+To keep quota and identity on the ordinary login while sessions run on a
+token that never rotates or expires mid-run:
+
+```bash
+claude setup-token                    # browser flow; prints the token
+cswap attach-token 19 -               # read it from stdin
+cswap run 19 -- -p "hello"            # this session runs on the token
+cswap list --token-status             # "inference token: attached"
+cswap detach-token 19                 # back to the login
+```
+
+`list --json` marks such a slot with `"inferenceToken": true` (the value is
+never emitted). Removing the account or overwriting its slot drops the token.
+
+
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
