@@ -49,6 +49,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
 )
 from claude_swap.inference_token import (
     delete_inference_token,
+    is_inference_token_credentials,
     looks_like_inference_token,
     read_inference_token,
     token_path as inference_token_path,
@@ -2919,8 +2920,71 @@ class ClaudeAccountSwitcher:
         return read_inference_token(self.backup_dir, email)
 
     def has_inference_token(self, email: str) -> bool:
-        """Whether an inference token is attached (no value is read)."""
-        return bool(email) and inference_token_path(self.backup_dir, email).is_file()
+        """Whether a READABLE inference token is attached — the same judgement
+        ``inference_token_for`` makes, so ``list`` never shows "attached" for
+        a file a session would not run on (review r.1 nit)."""
+        return bool(email) and read_inference_token(self.backup_dir, email) is not None
+
+    def adopt_profile_family(
+        self, account_num: str, email: str, org_uuid: str, *, locked: bool = False
+    ) -> bool:
+        """Fold the session profile's login family back into backup before the
+        profile is wiped or re-seeded with the inference token (CON-1329,
+        review r.1 Major).
+
+        Claude rotates the family INSIDE a profile and nothing syncs it back;
+        once that happened the backup is the profile's consumed predecessor
+        (the seed stamp still equals the backup's fingerprint). Invalidating
+        such a profile would destroy the family's newest generation and leave
+        the collector POSTing a consumed grant — an invalid_grant strike at
+        best, the documented reuse revocation at worst. Adopts only when the
+        profile is this slot's identity, holds a refresh family (not the
+        token credential), differs from backup, and backup is still the seed
+        generation (a re-added backup is newer — never overwritten).
+
+        ``locked=True`` — caller holds ``self.lock_file`` (bootstrap paths):
+        writes through the lock-free wrapper; otherwise the locking persist.
+        Returns True when a generation was adopted.
+        """
+        from claude_swap.session import (
+            read_seed_fingerprint,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.is_dir() or session_identity_drifted(
+            session_dir, email, org_uuid
+        ):
+            return False
+        profile = read_session_credentials(session_dir)
+        if not profile or is_inference_token_credentials(profile):
+            return False
+        profile_oauth = oauth.extract_oauth_data(profile)
+        if not profile_oauth or not profile_oauth.get("refreshToken"):
+            return False
+        backup = self._read_account_credentials(account_num, email)
+        fp_profile = oauth.credential_fingerprint(profile)
+        fp_backup = oauth.credential_fingerprint(backup) if backup else None
+        if fp_profile == fp_backup:
+            return False
+        seed = read_seed_fingerprint(session_dir)
+        if backup and seed and seed != fp_backup:
+            # Backup moved past the profile's seed (re-added since): it is
+            # the newer family; the profile's generation is the stale one.
+            return False
+        if locked:
+            self.write_account_credentials(account_num, email, profile)
+            landed = True
+        else:
+            landed = self.persist_backup_credentials(
+                account_num, email, profile, predecessor=fp_backup
+            )
+        self._logger.info(
+            f"Adopted the session profile's newer login generation into the "
+            f"backup of account {account_num} (landed={landed})"
+        )
+        return True
 
     def attach_inference_token(self, identifier: str, token: str) -> None:
         """Attach a ``claude setup-token`` to a managed login slot.
@@ -2940,6 +3004,14 @@ class ClaudeAccountSwitcher:
         """
         import getpass
 
+        # Identity first (an unknown slot is the earlier, clearer error — nit
+        # r.1), then the token, then its shape.
+        account_num, email, org_uuid = self.resolve_account(identifier)
+        if self._account_kind(account_num) == "api_key":
+            raise ValidationError(
+                f"Account-{account_num} ({email}) is an API-key account; an "
+                "inference token attaches to a login (OAuth) slot only."
+            )
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
         elif not token:
@@ -2957,13 +3029,10 @@ class ClaudeAccountSwitcher:
             raise ValidationError(
                 "This does not look like a `claude setup-token` (sk-ant-oat…)"
             )
-        account_num, email, _org_uuid = self.resolve_account(identifier)
-        if self._account_kind(account_num) == "api_key":
-            raise ValidationError(
-                f"Account-{account_num} ({email}) is an API-key account; an "
-                "inference token attaches to a login (OAuth) slot only."
-            )
         write_inference_token(self.backup_dir, email, token)
+        # The profile may hold the family's newest generation — keep it in
+        # backup BEFORE the profile is invalidated (review r.1 Major).
+        self.adopt_profile_family(account_num, email, org_uuid)
         self._post_backup_write(account_num, email)
         self._logger.info(f"Attached inference token to account {account_num}: {email}")
         print(
@@ -2974,11 +3043,14 @@ class ClaudeAccountSwitcher:
 
     def detach_inference_token(self, identifier: str) -> None:
         """Remove the attached inference token; sessions fall back to the login."""
-        account_num, email, _org_uuid = self.resolve_account(identifier)
+        account_num, email, org_uuid = self.resolve_account(identifier)
         if not delete_inference_token(self.backup_dir, email):
             raise ValidationError(
                 f"Account-{account_num} ({email}) has no attached inference token"
             )
+        # A profile that was never re-seeded still holds the family — same
+        # protection as attach before the invalidation.
+        self.adopt_profile_family(account_num, email, org_uuid)
         self._post_backup_write(account_num, email)
         self._logger.info(f"Detached inference token from account {account_num}: {email}")
         print(f"{accent('Detached')} inference token from Account {account_num} ({email}).")
@@ -3670,6 +3742,23 @@ class ClaudeAccountSwitcher:
             self._logger.debug(
                 f"Session profile for account {num} is logged in as a "
                 f"different account; fetching usage from the backup credential"
+            )
+            session_creds = None
+            has_live_session = False
+        if (
+            session_creds
+            and is_inference_token_credentials(session_creds)
+            and self.has_inference_token(email)
+        ):
+            # CON-1329: a token-seeded profile holds no login family — the
+            # backup login is this slot's quota gauge, and the live session
+            # (running on the token) does not own the family, so the backup
+            # may be refreshed and persisted here exactly as for a parked
+            # slot. Without this the collector would measure with the
+            # inference token and get http-403 on every pass (review r.1).
+            self._logger.debug(
+                f"Session profile for account {num} runs on the attached "
+                f"inference token; fetching usage from the backup login"
             )
             session_creds = None
             has_live_session = False

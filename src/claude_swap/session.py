@@ -631,6 +631,14 @@ class SessionManager:
             if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
                 session_dir
             ):
+                if self.switcher.inference_token_for(account_num, email):
+                    # CON-1329: the live session that earned this marker may
+                    # have rotated the family in the profile after the token
+                    # was attached — fold that generation into backup before
+                    # the wipe (review r.1 Major). Lock is held here.
+                    self.switcher.adopt_profile_family(
+                        account_num, email, org_uuid, locked=True
+                    )
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
@@ -665,6 +673,11 @@ class SessionManager:
             # the collector's quota gauge; `claude auth status` on such a
             # profile reports loggedIn/claude.ai with the stored email (live
             # probe 2026-08-26), so the reuse check keeps working.
+            # Whatever family generation the old profile still holds must
+            # survive in backup before the token seed replaces it.
+            self.switcher.adopt_profile_family(
+                account_num, email, org_uuid, locked=True
+            )
             creds = inference_token_credentials(token)
             self._logger.info(
                 f"Account-{account_num}: seeding session profile with the "

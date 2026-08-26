@@ -49,6 +49,29 @@ def looks_like_inference_token(token: str | None) -> bool:
     return text.startswith(_TOKEN_PREFIX) and not text.startswith("{")
 
 
+def is_inference_token_credentials(credentials: str | None) -> bool:
+    """Whether a credential JSON holds ONLY an inference token — no refresh
+    family. A profile seeded this way owns no login generation: the backup
+    login is the slot's family and quota gauge (collector, refresh)."""
+    if not credentials:
+        return False
+    try:
+        data = json.loads(credentials)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    token = oauth.get("accessToken")
+    return (
+        isinstance(token, str)
+        and token.startswith(_TOKEN_PREFIX)
+        and not oauth.get("refreshToken")
+    )
+
+
 def read_inference_token(backup_dir: Path, email: str) -> str | None:
     """Attached token for an identity, or ``None`` (absent or unreadable)."""
     path = token_path(backup_dir, email)

@@ -1,0 +1,34 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-1329",
+  "verdict": "revise",
+  "round": 1,
+  "head_sha": "ae73c9c935577ad9b05e8a446d4c1a13bf66401a",
+  "summary": "2 фактических, 2 нита; принимать нельзя: сборщик меряет квоту inference-токеном (http-403 на каждом проходе), attach сносит новейшее поколение семьи логина и seed-штамп профиля",
+  "findings": [
+    {
+      "severity": "critical",
+      "message": "Требование 2 («квота на логине») не выполняется после первого `cswap run`: _fetch_account_usage читает кред профиля раньше бэкапа (switcher.py:3661-3687), профиль засеян токеном без expiresAt (session.py:668, inference_token.py:107-118), is_oauth_token_expired(None)=False (oauth.py:62-65) → usage-запрос уходит с inference-токеном → http-403 на каждом проходе, к бэкапу логина сборщик не спускается; `cswap refresh N` на таком слоте отвечает relogin-required (refresh.py:258-260). Repro [B] в /tmp/cswap-review-con1329/test_repro.py. FORK.md:114-121/README.md:365-379 утверждают обратное.",
+      "file": "src/claude_swap/switcher.py",
+      "line": 3661
+    },
+    {
+      "severity": "major",
+      "message": "attach/detach зовут _post_backup_write (switcher.py:2967, 2981) без смены бэкапа: _invalidate_session_credentials (1922-1927) сносит кред профиля — по switcher.py:3653-3657 именно профиль держит новейшее поколение семьи логина, бэкап — потреблённый предок — и seed-штамп; следующий проход сборщика POST-ит потреблённый грант бэкапа (3709-3721 → oauth.py:587-607): invalid_grant-страйк/карантин логина-датчика, в худшем случае документированная в коде реакция reuse (3705-3708). Тот же путь через stale-маркер при живой сессии (session.py:631-635). Repro [A].",
+      "file": "src/claude_swap/switcher.py",
+      "line": 2967
+    },
+    {
+      "severity": "nit",
+      "message": "has_inference_token (is_file, switcher.py:2921-2923) и inference_token_for (read_inference_token → None на пустом/битом/нечитаемом файле, inference_token.py:52-66) расходятся: list --json/--token-status показывают «attached», а сессия молча идёт на логине без предупреждения.",
+      "file": "src/claude_swap/switcher.py",
+      "line": 2921
+    },
+    {
+      "severity": "nit",
+      "message": "Проверка формы токена (switcher.py:2947-2960) стоит раньше resolve_account (2961): `cswap attach-token 99 <плохой токен>` сообщает об ошибке токена вместо неизвестного слота.",
+      "file": "src/claude_swap/switcher.py",
+      "line": 2947
+    }
+  ]
+}

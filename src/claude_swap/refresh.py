@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import CREDENTIALS_STALENESS_S, proper_lockfile
 from claude_swap.exceptions import LockError
+from claude_swap.inference_token import is_inference_token_credentials
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.oauth import (
@@ -232,6 +233,20 @@ def _refresh_resolved(
                 if profile_creds is None and err is not None:
                     return out(DEFERRED, err)
 
+            token_profile = False
+            if (
+                profile_creds is not None
+                and is_inference_token_credentials(profile_creds)
+                and switcher.has_inference_token(email)
+            ):
+                # CON-1329: the profile runs on the attached inference token
+                # and holds no family — the backup LOGIN is what expires and
+                # gets refreshed here; the profile is never re-seeded with the
+                # family (review r.1: judged the token as "no refresh token"
+                # → relogin-required on a healthy slot).
+                profile_creds = None
+                token_profile = True
+
             if profile_creds is not None:
                 candidate = profile_creds
             else:
@@ -312,7 +327,7 @@ def _refresh_resolved(
                 # first (write_account_credentials expects the held lock),
                 # then the profile re-seed.
                 switcher.write_account_credentials(account_num, email, working)
-                if profile_owned:
+                if profile_owned and not token_profile:
                     _reseed_profile(session_dir, working)
             # A successful rotation is proof the lineage is alive: lift any
             # stale quarantine state the same way a re-login does.
