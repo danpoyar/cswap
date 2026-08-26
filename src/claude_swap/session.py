@@ -55,7 +55,7 @@ from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import credential_fingerprint, refresh_oauth_credentials
+from claude_swap.oauth import credential_fingerprint, try_refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import (
@@ -638,10 +638,6 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
-        # Claude reads the keychain before the plaintext file — a stale hashed
-        # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
-
         creds = self.switcher.read_account_credentials(account_num, email)
         # A pending spilled rotation supersedes the stored bytes (CON-849):
         # seeding the profile with the consumed predecessor would hand the
@@ -658,15 +654,31 @@ class SessionManager:
 
         # One refresh so the profile starts with a fresh access token; persist
         # a possibly-rotated refresh token back to backup so future switches
-        # and runs see the latest. Failure is non-fatal: the stored token may
-        # still be valid, and claude refreshes on its own at runtime.
+        # and runs see the latest. A TRANSIENT failure is non-fatal: the stored
+        # token may still be valid, and claude refreshes on its own at runtime.
+        # invalid_grant is fatal by design (CON-849, эпизод 26-08): the grant is
+        # dead or already consumed — seeding a claude with it 401s immediately,
+        # CC wipes the profile, and the next spawn re-bootstraps and re-POSTs
+        # the SAME grant (the replay of a consumed refresh grant is the
+        # documented reuse signal — the server revokes the whole saved login).
         # Setup-token accounts (--add-token) have no refresh token by design —
         # skip silently instead of warning about a flow that can't happen.
         if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
+            outcome = try_refresh_oauth_credentials(creds)
+            if outcome.credentials:
+                creds = outcome.credentials
                 self.switcher.write_account_credentials(account_num, email, creds)
+            elif outcome.error == "invalid_grant":
+                raise SessionError(
+                    f"Account-{account_num} ({email}): the token endpoint "
+                    "rejected the stored refresh grant (invalid_grant) — the "
+                    "saved login is dead or this generation was already "
+                    "consumed. Not seeding a session with it (a re-POST of a "
+                    "consumed grant is the documented path to the whole login "
+                    "being revoked). Re-login and re-add the slot: "
+                    f"cswap-relogin.sh {account_num} (or `cswap add --slot "
+                    f"{account_num}` after logging in with {email})."
+                )
             else:
                 warning(
                     f"Could not refresh the token for Account-{account_num}; "
@@ -684,6 +696,13 @@ class SessionManager:
                 f"Account-{account_num} has no stored config backup. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+
+        # The seed is judged good — only now clear the profile's stale hashed
+        # keychain entry (claude reads the keychain before the plaintext file,
+        # so a leftover entry would shadow the seed). Deleting any earlier
+        # would destroy what may be the family's newest generation before the
+        # replacement seed proved usable.
+        delete_macos_keychain_entry(session_dir)
 
         session_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":

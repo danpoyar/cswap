@@ -149,11 +149,11 @@ def auth_status_tracks_seed(monkeypatch):
 def refresh_rotates(monkeypatch):
     calls: list[str] = []
 
-    def fake_refresh(creds: str) -> str:
+    def fake_refresh(creds: str) -> oauth.RefreshOutcome:
         calls.append(creds)
-        return ROTATED_CREDS
+        return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+    monkeypatch.setattr(session_mod, "try_refresh_oauth_credentials", fake_refresh)
     return calls
 
 
@@ -378,13 +378,79 @@ class TestBootstrap:
         assert len(refresh_rotates) == refresh_calls_after_bootstrap  # no new refresh
         assert (session_dir / ".credentials.json").read_text() == first_creds
 
-    def test_refresh_failure_uses_stored_creds(
+    def test_transient_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        """A network blip must stay non-fatal: the stored token may be valid,
+        and claude refreshes on its own at runtime."""
+        monkeypatch.setattr(
+            session_mod,
+            "try_refresh_oauth_credentials",
+            lambda c: oauth.RefreshOutcome(None, "transient"),
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
+
+    def test_bootstrap_invalid_grant_is_fatal_no_seed(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """CON-849 (эпизод 26-08, слот 37): мёртвый грант не сеет claude.
+
+        Нефатальный invalid_grant рождал карусель: профиль сеется мёртвой
+        парой → claude 401 → wipe → следующий спавн снова bootstrap и снова
+        POST того же гранта (реплей потреблённого refresh-гранта —
+        документированный сигнал reuse: сервер отзывает всю цепочку)."""
+        posts: list[str] = []
+        monkeypatch.setattr(
+            session_mod,
+            "try_refresh_oauth_credentials",
+            lambda c: posts.append(c) or oauth.RefreshOutcome(None, "invalid_grant"),
+        )
+        with pytest.raises(SessionError, match="invalid_grant"):
+            manager.setup_session("2", share=False)
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not (session_dir / ".credentials.json").exists()
+        assert len(posts) == 1  # ровно одна попытка, без ретрая внутри
+
+    def test_bootstrap_invalid_grant_preserves_profile_keychain(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """Keychain-запись профиля (возможно свежайшее поколение семьи) должна
+        пережить неудачный посев — удаление только при коммите годного."""
+        deletes: list[Path] = []
+        monkeypatch.setattr(
+            session_mod, "delete_macos_keychain_entry", lambda d: deletes.append(d)
+        )
+        monkeypatch.setattr(
+            session_mod,
+            "try_refresh_oauth_credentials",
+            lambda c: oauth.RefreshOutcome(None, "invalid_grant"),
+        )
+        with pytest.raises(SessionError):
+            manager.setup_session("2", share=False)
+        assert deletes == []
+
+    def test_bootstrap_deletes_stale_keychain_only_after_refresh_decision(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """Порядок: сначала суд посева (refresh POST), потом чистка stale
+        keychain-записи — не наоборот."""
+        order: list[str] = []
+        monkeypatch.setattr(
+            session_mod,
+            "delete_macos_keychain_entry",
+            lambda d: order.append("delete"),
+        )
+        monkeypatch.setattr(
+            session_mod,
+            "try_refresh_oauth_credentials",
+            lambda c: order.append("post") or oauth.RefreshOutcome(ROTATED_CREDS, None),
+        )
+        manager.setup_session("2", share=False)
+        assert order == ["post", "delete"]
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
@@ -397,8 +463,9 @@ class TestBootstrap:
         refresh_calls = []
         monkeypatch.setattr(
             session_mod,
-            "refresh_oauth_credentials",
-            lambda c: refresh_calls.append(c) or None,
+            "try_refresh_oauth_credentials",
+            lambda c: refresh_calls.append(c)
+            or oauth.RefreshOutcome(None, "no_refresh_token"),
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)
