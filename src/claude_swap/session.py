@@ -65,6 +65,7 @@ from claude_swap.process_detection import (
     pids_with_config_dir,
 )
 from claude_swap.settings import atomic_write_json
+from claude_swap.usage_store import FetchRecord
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -664,11 +665,46 @@ class SessionManager:
         # Setup-token accounts (--add-token) have no refresh token by design —
         # skip silently instead of warning about a flow that can't happen.
         if self._has_refresh_token(creds):
+            # Суд заклеймённости ДО POST (ревью р.1) — тот же parole-закон,
+            # что у сборщика и `cswap refresh`: родословную, которой сервер
+            # уже ответил invalid_grant, не реплеим — каждый реплей
+            # потреблённого гранта = документированный сигнал reuse.
+            # Другой fingerprint (слот пере-добавлен) — одна parole-проба.
+            identity = {account_num: (email, org_uuid or "")}
+            entry = self.switcher._usage_store.entries(identity)[account_num]
+            if entry.token_dead() and not self.switcher._parole_eligible(
+                entry, creds
+            ):
+                raise SessionError(
+                    f"Account-{account_num} ({email}): credential lineage "
+                    "condemned (the token endpoint already answered "
+                    "invalid_grant for this generation) — refusing to re-POST "
+                    "a rejected grant. Re-login and re-add the slot: "
+                    f"cswap-relogin.sh {account_num} (or `cswap add --slot "
+                    f"{account_num}` after logging in with {email})."
+                )
             outcome = try_refresh_oauth_credentials(creds)
             if outcome.credentials:
                 creds = outcome.credentials
                 self.switcher.write_account_credentials(account_num, email, creds)
+                # Успешная ротация — доказательство жизни родословной: снять
+                # затхлый карантин, как это делает `cswap refresh`.
+                self.switcher._usage_store.clear_dead_token(
+                    [account_num], identity
+                )
             elif outcome.error == "invalid_grant":
+                # Открытие сервера — в store (эталон refresh.py): страйк
+                # квалифицирует родословную, все поверхности видят
+                # «re-login needed», следующий спавн отвергается ДО POST.
+                self.switcher._usage_store.record(
+                    {
+                        account_num: FetchRecord(
+                            error="invalid_grant",
+                            credential_fingerprint=credential_fingerprint(creds),
+                        )
+                    },
+                    identity,
+                )
                 raise SessionError(
                     f"Account-{account_num} ({email}): the token endpoint "
                     "rejected the stored refresh grant (invalid_grant) — the "
