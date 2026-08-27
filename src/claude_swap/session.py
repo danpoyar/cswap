@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
+from claude_swap.inference_token import inference_token_credentials
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -534,6 +535,21 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        token = self.switcher.inference_token_for(account_num, email)
+        if token:
+            # CON-1329: inference rides the attached year-long token — Claude
+            # Code ranks CLAUDE_CODE_OAUTH_TOKEN above the profile's login
+            # (authentication docs, precedence 5 over 7), so the session never
+            # touches the login's refresh family; the profile's login stays the
+            # identity channel and the backup login the quota gauge. Value is
+            # never printed.
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            print(
+                muted(
+                    "Inference token attached — this session runs on it; "
+                    "quota is read from the stored login."
+                )
+            )
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -615,6 +631,15 @@ class SessionManager:
             if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
                 session_dir
             ):
+                # CON-1329: the live session that earned this marker may have
+                # rotated the family in the profile after the marker was set —
+                # fold that generation into backup before the wipe (review
+                # r.1 Major). Unconditional (review r.2: gating on an attached
+                # token lost the rotation that followed a detach — the adopt
+                # itself refuses every non-family shape). Lock is held here.
+                self.switcher.adopt_profile_family(
+                    account_num, email, org_uuid, locked=True
+                )
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
@@ -639,6 +664,96 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
+        token = self.switcher.inference_token_for(account_num, email)
+        if token:
+            # CON-1329: the slot carries a year-long inference token — seed the
+            # profile with IT, not with the login's refresh family. The session
+            # then never touches the family (no rotation race between sessions
+            # and the collector, no mid-run TTL death), and a dead family can
+            # never be replayed from a profile. The login stays in backup as
+            # the collector's quota gauge; `claude auth status` on such a
+            # profile reports loggedIn/claude.ai with the stored email (live
+            # probe 2026-08-26), so the reuse check keeps working.
+            # Whatever family generation the old profile still holds must
+            # survive in backup before the token seed replaces it.
+            self.switcher.adopt_profile_family(
+                account_num, email, org_uuid, locked=True
+            )
+            creds = inference_token_credentials(token)
+            self._logger.info(
+                f"Account-{account_num}: seeding session profile with the "
+                "attached inference token (login kept for quota)"
+            )
+        else:
+            creds = self._seed_credentials_from_backup(account_num, email, org_uuid)
+
+        config_text = self.switcher.read_account_config(account_num, email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = config_data.get("oauthAccount")
+        if not oauth_account:
+            raise SessionError(
+                f"Account-{account_num} has no stored config backup. "
+                f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+
+        # The seed is judged good — only now clear the profile's stale hashed
+        # keychain entry (claude reads the keychain before the plaintext file,
+        # so a leftover entry would shadow the seed). Deleting any earlier
+        # would destroy what may be the family's newest generation before the
+        # replacement seed proved usable.
+        delete_macos_keychain_entry(session_dir)
+
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(session_dir, 0o700)
+
+        creds_path = session_dir / ".credentials.json"
+        creds_path.write_text(creds, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(creds_path, 0o600)
+
+        # Stamp which generation seeded the profile: the same bytes sit in the
+        # slot backup, and once claude rotates the family in here that backup
+        # is a consumed grant the usage collector must refuse to POST
+        # (CON-849; see SEED_FINGERPRINT_FILE).
+        stamp_path = session_dir / SEED_FINGERPRINT_FILE
+        stamp_path.write_text(credential_fingerprint(creds), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(stamp_path, 0o600)
+
+        # Merge the identity seed into any existing .claude.json so a
+        # re-bootstrap preserves the profile's own projects/history. The
+        # `theme` key is load-bearing: claude shows onboarding when
+        # `!config.theme || !config.hasCompletedOnboarding`.
+        config_path = session_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", config_data.get("theme") or "dark")
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_path, 0o600)
+
+        self._logger.info(
+            f"Bootstrapped session profile for account {account_num} at {session_dir}"
+        )
+
+    def _seed_credentials_from_backup(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> str:
+        """The login's credential bytes to seed a profile with (one refresh).
+
+        Split out of ``_bootstrap`` (CON-1329) so a slot with an attached
+        inference token can skip the whole refresh-family path.
+        """
         creds = self.switcher.read_account_credentials(account_num, email)
         # A pending spilled rotation supersedes the stored bytes (CON-849):
         # seeding the profile with the consumed predecessor would hand the
@@ -721,64 +836,7 @@ class SessionManager:
                     "continuing with the stored credentials."
                 )
 
-        config_text = self.switcher.read_account_config(account_num, email)
-        try:
-            config_data = json.loads(config_text) if config_text else {}
-        except json.JSONDecodeError:
-            config_data = {}
-        oauth_account = config_data.get("oauthAccount")
-        if not oauth_account:
-            raise SessionError(
-                f"Account-{account_num} has no stored config backup. "
-                f"Re-add with: cswap --add-account --slot {account_num}"
-            )
-
-        # The seed is judged good — only now clear the profile's stale hashed
-        # keychain entry (claude reads the keychain before the plaintext file,
-        # so a leftover entry would shadow the seed). Deleting any earlier
-        # would destroy what may be the family's newest generation before the
-        # replacement seed proved usable.
-        delete_macos_keychain_entry(session_dir)
-
-        session_dir.mkdir(parents=True, exist_ok=True)
-        if sys.platform != "win32":
-            os.chmod(session_dir, 0o700)
-
-        creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
-
-        # Stamp which generation seeded the profile: the same bytes sit in the
-        # slot backup, and once claude rotates the family in here that backup
-        # is a consumed grant the usage collector must refuse to POST
-        # (CON-849; see SEED_FINGERPRINT_FILE).
-        stamp_path = session_dir / SEED_FINGERPRINT_FILE
-        stamp_path.write_text(credential_fingerprint(creds), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(stamp_path, 0o600)
-
-        # Merge the identity seed into any existing .claude.json so a
-        # re-bootstrap preserves the profile's own projects/history. The
-        # `theme` key is load-bearing: claude shows onboarding when
-        # `!config.theme || !config.hasCompletedOnboarding`.
-        config_path = session_dir / ".claude.json"
-        existing: dict = {}
-        if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text(encoding="utf-8")) or {}
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-        existing["oauthAccount"] = oauth_account
-        existing["hasCompletedOnboarding"] = True
-        existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
-
-        self._logger.info(
-            f"Bootstrapped session profile for account {account_num} at {session_dir}"
-        )
+        return creds
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:

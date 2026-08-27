@@ -111,6 +111,26 @@ read in one sitting.
   `cswap add --activate` is the conscious immediate swap, logged as a drain
   bypass. Upstream-relevant in spirit, but the motivation is fleet-shaped;
   offer after it survives here.
+- Year-long inference token attached to a login slot (CON-1329, 2026-08-26):
+  `cswap attach-token <num|email> [TOKEN|-]` / `detach-token` store a
+  `claude setup-token` per identity (`<backup>/tokens/<email-slug>.enc`,
+  base64, 0600). The slot KEEPS its ordinary login: the setup-token is
+  `user:inference` only and the usage endpoint answers it `403 … scope
+  requirement user:profile` (live probe 2026-08-26), so the login stays the
+  identity and quota channel for the collector, while every `cswap run`
+  session of the slot is seeded with the token credential and launched with
+  `CLAUDE_CODE_OAUTH_TOKEN` (Claude Code ranks it above the stored login).
+  Effect on the fleet: sessions never touch the login's refresh family — no
+  rotation race with the collector, no mid-run 28-day TTL death, and a dead
+  family (invalid_grant, #21) is not fatal for a token slot because the
+  profile is never seeded from it. `list --json` carries the additive
+  `inferenceToken: true` (never the value); the fleet's slot selector pairs
+  it with `usageAgeSeconds`/`lastGoodAgeSeconds` to rank a slot whose gauge
+  went stale at the tail instead of dropping it. The token is pruned with
+  the identity (`_prune_mappings`: remove, slot overwrite) and survives slot
+  moves and same-identity re-logins. Fleet-shaped by construction (the
+  fleet's quota gauge is `cswap list --json`); offer upstream only the
+  attach/detach + env-injection core once it survives here.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a

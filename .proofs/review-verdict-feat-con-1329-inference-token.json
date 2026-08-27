@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-1329",
+  "verdict": "approve",
+  "round": 3,
+  "head_sha": "ca46bc5b0e0c0afb9126d5a86cf5448e222487f7",
+  "summary": "фактических нет: обе major р.2 закрыты (безусловная адопция на консумпции stale-маркера; ре-штамп seed-fingerprint после landed-адопции), совет по конъюнкту has_inference_token принят; 3 новых теста красные на 13a6427 и зелёные на HEAD (перепроверено самим), полный сьют 1950 passed",
+  "findings": []
+}
