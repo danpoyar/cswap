@@ -37,6 +37,14 @@ Review round-1 fixes (commit 25c69e4):
   (p) an unreadable token file reads as "not attached" everywhere (store,
       ``list``, token status), and an unknown slot beats a malformed token
       in the attach error order.
+
+Review round-2 fixes (stale-marker path):
+  (q) marker consumption adopts unconditionally — a rotation that followed a
+      detach survives (the adopt itself refuses non-family shapes);
+  (r) a landed adoption re-stamps the seed fingerprint, so the same live
+      session's SECOND rotation is not mistaken for a re-added backup;
+  (s) the token-credential shape alone routes the collector to the backup
+      login — an attached-token file is not required (detach window).
 """
 
 from __future__ import annotations
@@ -86,6 +94,15 @@ ROTATED = json.dumps(
         "claudeAiOauth": {
             "accessToken": "fresh-access",
             "refreshToken": "rotated-refresh",
+            "expiresAt": 9999999999999,
+        }
+    }
+)
+ROTATED2 = json.dumps(
+    {
+        "claudeAiOauth": {
+            "accessToken": "fresh-access-2",
+            "refreshToken": "rotated-refresh-2",
             "expiresAt": 9999999999999,
         }
     }
@@ -528,6 +545,26 @@ class TestCollectorOnTokenSlot:
         assert fetch.call_args.kwargs["is_active"] is False
         assert entries[NUM].sentinel is None
 
+    def test_token_shape_alone_routes_to_backup(self, switcher):
+        # (s) the detach window: the profile still holds the token credential
+        # while the attached-token file is already gone — the SHAPE routes
+        # the gauge to the backup login (review r.2)
+        session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            inference_token_credentials(TOKEN), encoding="utf-8"
+        )
+        (session_dir / ".claude.json").write_text(CONFIG, encoding="utf-8")
+        assert not switcher.has_inference_token(EMAIL)
+        info = [(2, EMAIL, "Org Two", ORG, False, LOGIN_CREDS, "")]
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(USAGE),
+        ) as fetch:
+            switcher._collect_usage_entries(info, fetch={NUM})
+        fetch.assert_called_once()
+        assert fetch.call_args.args[2] == LOGIN_CREDS
+
 
 class TestAdoptProfileFamily:
     """(m)(o) The profile's newer login generation survives attach/detach."""
@@ -607,6 +644,63 @@ class TestRefreshOnTokenSlot:
         assert seeded["claudeAiOauth"]["accessToken"] == TOKEN
         assert "refreshToken" not in seeded["claudeAiOauth"]
         assert refresh_calls == []
+
+
+class TestStaleMarkerAdoption:
+    """(q)(r) Review r.2: the stale-marker path must never destroy the
+    family's newest generation the live session rotated to."""
+
+    def test_rotation_after_detach_survives_marker_consumption(
+        self, manager, switcher, capture_exec, auth_status_tracks_seed, monkeypatch
+    ):
+        from claude_swap.session import STALE_MARKER
+
+        # attach + detach while a login session stays live; the live session
+        # kept the profile (marker deferred the invalidation) and claude
+        # rotated the family AFTER the detach, before the session died
+        switcher.attach_inference_token(NUM, TOKEN)
+        switcher.detach_inference_token(NUM)
+        session_dir = _seed_profile_with_family(switcher, ROTATED, seed_of=LOGIN_CREDS)
+        (session_dir / STALE_MARKER).touch()
+
+        posted = []
+
+        def fake_refresh(creds):
+            posted.append(creds)
+            return RefreshOutcome(ROTATED2, None)
+
+        monkeypatch.setattr(
+            session_mod, "try_refresh_oauth_credentials", fake_refresh
+        )
+        with pytest.raises(_ExecCalled):
+            manager.run(NUM, [])
+        # the newest generation was adopted: the bootstrap POSTs it, never
+        # the consumed predecessor (r.2 repro test_A: invalid_grant strike)
+        assert posted and posted[0] == ROTATED
+
+    def test_second_rotation_after_attach_adoption_survives(
+        self, manager, switcher, capture_exec, auth_status_tracks_seed
+    ):
+        # session live before attach, family already rotated once: attach
+        # adopts ROTATED into backup, re-stamps the seed and only marks the
+        # live profile stale (no invalidation under a live session)...
+        session_dir = _seed_profile_with_family(switcher, ROTATED, seed_of=LOGIN_CREDS)
+        with patch.object(switcher, "_live_session_pids", return_value=[123]):
+            switcher.attach_inference_token(NUM, TOKEN)
+        assert switcher.read_account_credentials(NUM, EMAIL) == ROTATED
+        # the adoption re-stamped the seed: backup and profile are one
+        # generation again (r.2 Major — a stale stamp made the NEXT rotation
+        # look like a re-added backup and it was destroyed)
+        assert (session_dir / ".seed-fingerprint").read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(ROTATED)
+        # ...claude rotates AGAIN before the session dies
+        (session_dir / ".credentials.json").write_text(ROTATED2, encoding="utf-8")
+        with pytest.raises(_ExecCalled):
+            manager.run(NUM, [])
+        # the second generation is adopted, not judged "re-added" and wiped
+        # (r.2 repro test_B)
+        assert switcher.read_account_credentials(NUM, EMAIL) == ROTATED2
 
 
 class TestBrokenTokenFile:

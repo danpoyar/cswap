@@ -234,16 +234,16 @@ def _refresh_resolved(
                     return out(DEFERRED, err)
 
             token_profile = False
-            if (
-                profile_creds is not None
-                and is_inference_token_credentials(profile_creds)
-                and switcher.has_inference_token(email)
+            if profile_creds is not None and is_inference_token_credentials(
+                profile_creds
             ):
                 # CON-1329: the profile runs on the attached inference token
                 # and holds no family — the backup LOGIN is what expires and
                 # gets refreshed here; the profile is never re-seeded with the
                 # family (review r.1: judged the token as "no refresh token"
-                # → relogin-required on a healthy slot).
+                # → relogin-required on a healthy slot). Shape alone decides
+                # (review r.2): after a detach the profile may still hold the
+                # token credential until the next run re-seeds it.
                 profile_creds = None
                 token_profile = True
 

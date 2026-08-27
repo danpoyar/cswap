@@ -2942,11 +2942,17 @@ class ClaudeAccountSwitcher:
         token credential), differs from backup, and backup is still the seed
         generation (a re-added backup is newer — never overwritten).
 
+        A landed adoption re-stamps the profile's seed fingerprint to the
+        adopted generation (review r.2 Major): backup and profile are one
+        generation again, so a SECOND rotation by the same live session is
+        not mistaken for a re-added backup and destroyed on the next pass.
+
         ``locked=True`` — caller holds ``self.lock_file`` (bootstrap paths):
         writes through the lock-free wrapper; otherwise the locking persist.
         Returns True when a generation was adopted.
         """
         from claude_swap.session import (
+            SEED_FINGERPRINT_FILE,
             read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
@@ -2980,6 +2986,19 @@ class ClaudeAccountSwitcher:
             landed = self.persist_backup_credentials(
                 account_num, email, profile, predecessor=fp_backup
             )
+        if landed and fp_profile:
+            # Backup now IS the profile's generation — the stamp must say so,
+            # or the re-added guard above throws away the session's NEXT
+            # rotation (review r.2 Major, repro test_B).
+            try:
+                (session_dir / SEED_FINGERPRINT_FILE).write_text(
+                    fp_profile, encoding="utf-8"
+                )
+            except OSError:
+                self._logger.warning(
+                    f"Could not re-stamp the seed fingerprint for account "
+                    f"{account_num} after adoption", exc_info=True,
+                )
         self._logger.info(
             f"Adopted the session profile's newer login generation into the "
             f"backup of account {account_num} (landed={landed})"
@@ -3745,17 +3764,16 @@ class ClaudeAccountSwitcher:
             )
             session_creds = None
             has_live_session = False
-        if (
-            session_creds
-            and is_inference_token_credentials(session_creds)
-            and self.has_inference_token(email)
-        ):
+        if session_creds and is_inference_token_credentials(session_creds):
             # CON-1329: a token-seeded profile holds no login family — the
             # backup login is this slot's quota gauge, and the live session
             # (running on the token) does not own the family, so the backup
             # may be refreshed and persisted here exactly as for a parked
             # slot. Without this the collector would measure with the
             # inference token and get http-403 on every pass (review r.1).
+            # Judged by the credential SHAPE alone (review r.2): a detached
+            # token whose profile still holds the token credential must not
+            # flip the gauge back to the 403 path.
             self._logger.debug(
                 f"Session profile for account {num} runs on the attached "
                 f"inference token; fetching usage from the backup login"
