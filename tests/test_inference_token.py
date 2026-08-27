@@ -22,6 +22,21 @@ Contract (one case per letter, mirrored in the fleet ticket):
   (j) CLI: ``attach-token N -`` reads stdin and dispatches, ``detach-token N``
       dispatches, three positionals are an error;
   (k) ``list --token-status`` names the attached token.
+
+Review round-1 fixes (commit 25c69e4):
+  (l) after ``cswap run`` on a token slot the usage collector measures with
+      the BACKUP login (``is_active=False``), never with the inference token;
+  (m) attach/detach with a profile holding a rotated login family (profile
+      newer than backup, seed stamp == backup's fingerprint) adopts that
+      generation into backup before invalidating the profile — the consumed
+      grant is never POSTed; a backup that moved past the seed is newer and
+      is never overwritten;
+  (n) ``cswap refresh`` on a token slot judges the BACKUP family — an expired
+      backup refreshes to REFRESHED while the profile stays on the token;
+  (o) detach performs the same adoption as attach;
+  (p) an unreadable token file reads as "not attached" everywhere (store,
+      ``list``, token status), and an unknown slot beats a malformed token
+      in the attach error order.
 """
 
 from __future__ import annotations
@@ -37,6 +52,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap import oauth
 from claude_swap import session as session_mod
 from claude_swap.exceptions import SessionError, ValidationError
 from claude_swap.inference_token import (
@@ -462,3 +478,163 @@ class TestTokenStatus:
         assert all(TOKEN not in line for line in lines)
         info1 = (1, "account1@example.com", "Org One", "org-uuid-1", False, LOGIN_CREDS, "")
         assert not any("inference token" in line for line in switcher._token_status_lines(info1))
+
+
+# --- review round-1 fixes ------------------------------------------------------
+
+USAGE = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 40.0}}
+
+
+def _seed_profile_with_family(switcher, credentials: str, seed_of: str) -> Path:
+    """A session profile holding a login FAMILY (claude rotated it in place),
+    with this slot's identity and a seed stamp naming ``seed_of``'s
+    generation — the shape adopt_profile_family exists for."""
+    session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / ".credentials.json").write_text(credentials, encoding="utf-8")
+    (session_dir / ".claude.json").write_text(CONFIG, encoding="utf-8")
+    (session_dir / ".seed-fingerprint").write_text(
+        oauth.credential_fingerprint(seed_of) or "", encoding="utf-8"
+    )
+    return session_dir
+
+
+class TestCollectorOnTokenSlot:
+    """(l) The quota gauge is the backup login, never the inference token."""
+
+    def test_collector_measures_with_backup_login(
+        self, manager, switcher, capture_exec, auth_status_tracks_seed
+    ):
+        switcher.attach_inference_token(NUM, TOKEN)
+        with pytest.raises(_ExecCalled):
+            manager.run(NUM, [])
+        # the profile now runs on the token (no login family, no expiresAt)
+        session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+        seeded = json.loads((session_dir / ".credentials.json").read_text())
+        assert seeded["claudeAiOauth"]["accessToken"] == TOKEN
+
+        info = [(2, EMAIL, "Org Two", ORG, False, LOGIN_CREDS, "")]
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(USAGE),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info, fetch={NUM})
+        fetch.assert_called_once()
+        measured_creds = fetch.call_args.args[2]
+        assert measured_creds == LOGIN_CREDS
+        assert TOKEN not in measured_creds
+        # read-only active mode is for profiles that OWN a family; the token
+        # profile does not — the backup may be refreshed and persisted here
+        assert fetch.call_args.kwargs["is_active"] is False
+        assert entries[NUM].sentinel is None
+
+
+class TestAdoptProfileFamily:
+    """(m)(o) The profile's newer login generation survives attach/detach."""
+
+    def test_attach_adopts_rotated_profile_family(self, switcher, capsys):
+        _seed_profile_with_family(switcher, ROTATED, seed_of=LOGIN_CREDS)
+        switcher.attach_inference_token(NUM, TOKEN)
+        # backup now holds the profile's newer generation: the collector will
+        # POST the live grant, not the consumed predecessor
+        assert switcher.read_account_credentials(NUM, EMAIL) == ROTATED
+        assert "Attached" in capsys.readouterr().out
+
+    def test_attach_keeps_readded_backup(self, switcher):
+        # the backup moved past the profile's seed (account re-added since):
+        # the backup IS the newer family — never overwritten by the stale
+        # profile generation
+        _seed_profile_with_family(switcher, ROTATED, seed_of='{"claudeAiOauth": {"accessToken": "other", "refreshToken": "other-rt", "expiresAt": 5}}')
+        switcher.attach_inference_token(NUM, TOKEN)
+        assert switcher.read_account_credentials(NUM, EMAIL) == LOGIN_CREDS
+
+    def test_detach_adopts_rotated_profile_family(self, switcher):
+        switcher.attach_inference_token(NUM, TOKEN)
+        # a stale profile from before the attach still holds the family
+        _seed_profile_with_family(switcher, ROTATED, seed_of=LOGIN_CREDS)
+        switcher.detach_inference_token(NUM)
+        assert switcher.read_account_credentials(NUM, EMAIL) == ROTATED
+
+    def test_token_profile_is_never_adopted(self, manager, switcher, capture_exec, auth_status_tracks_seed):
+        # a token-seeded profile owns no family — detach must not fold the
+        # bare inference token into the backup login
+        switcher.attach_inference_token(NUM, TOKEN)
+        with pytest.raises(_ExecCalled):
+            manager.run(NUM, [])
+        switcher.detach_inference_token(NUM)
+        assert switcher.read_account_credentials(NUM, EMAIL) == LOGIN_CREDS
+
+
+class TestRefreshOnTokenSlot:
+    """(n) ``cswap refresh`` judges the backup family; the profile keeps the token."""
+
+    def test_refresh_rotates_backup_and_slot_stays_on_token(
+        self, manager, switcher, capture_exec, auth_status_tracks_seed, refresh_calls
+    ):
+        from claude_swap.refresh import REFRESHED, refresh_account
+
+        switcher.attach_inference_token(NUM, TOKEN)
+        with pytest.raises(_ExecCalled):
+            manager.run(NUM, [])
+        session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+
+        with (
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(ROTATED, None),
+            ) as post,
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(USAGE),
+            ),
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == REFRESHED
+        # the expired BACKUP login was judged and consumed — not the token,
+        # and never the profile (before the fix: "no refresh token" →
+        # relogin-required on a healthy slot)
+        post.assert_called_once()
+        assert post.call_args.args[0] == LOGIN_CREDS
+        assert switcher.read_account_credentials(NUM, EMAIL) == ROTATED
+        # the backup write invalidates the profile (the attach canon, case i);
+        # the next run re-seeds it with the token — the slot stays on the
+        # token and the fresh family is never POSTed by the bootstrap
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(NUM, [])
+        assert exc.value.env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+        seeded = json.loads((session_dir / ".credentials.json").read_text())
+        assert seeded["claudeAiOauth"]["accessToken"] == TOKEN
+        assert "refreshToken" not in seeded["claudeAiOauth"]
+        assert refresh_calls == []
+
+
+class TestBrokenTokenFile:
+    """(p) An unreadable token file is "not attached" everywhere."""
+
+    def _break_token_file(self, switcher):
+        path = token_path(switcher.backup_dir, EMAIL)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not base64 !!!")
+
+    def test_has_inference_token_false_on_unreadable_file(self, switcher):
+        self._break_token_file(switcher)
+        assert switcher.has_inference_token(EMAIL) is False
+        assert switcher.inference_token_for(NUM, EMAIL) is None
+
+    def test_list_and_status_do_not_claim_attachment(self, switcher, monkeypatch):
+        monkeypatch.setattr(
+            switcher, "_collect_usage_entries", _no_usage_entries(switcher)
+        )
+        self._break_token_file(switcher)
+        assert "inferenceToken" not in _rows(switcher)[2]
+        info = (2, EMAIL, "Org Two", ORG, False, LOGIN_CREDS, "")
+        assert not any(
+            "inference token" in line for line in switcher._token_status_lines(info)
+        )
+
+    def test_unknown_slot_beats_malformed_token(self, switcher):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        with pytest.raises(AccountNotFoundError):
+            switcher.attach_inference_token("9", "not-a-token")
