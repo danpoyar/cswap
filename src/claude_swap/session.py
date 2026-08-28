@@ -45,12 +45,16 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import (
+    shared_credential_fields,
+    shared_fields_fingerprint,
+)
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.inference_token import inference_token_credentials
 from claude_swap.macos_keychain import KeychainError
@@ -72,10 +76,12 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
-# Deliberately excludes anything account- or instance-scoped: plugins/,
-# ide/, .claude.json, .credentials.json, statsig/ and other telemetry.
+# Deliberately excludes anything account- or instance-scoped: ide/,
+# .claude.json, .credentials.json, statsig/ and other telemetry.
 # projects/ and history.jsonl are per-account by default and move to
-# HISTORY_ITEMS sharing only with the opt-in --share-history flag.
+# HISTORY_ITEMS sharing only with the opt-in --share-history flag
+# (per-project auto-memory inside projects/ is shared separately by
+# _sync_project_memory — CON-1432 access parity).
 # .claude.json stays excluded as a file, but its one user-scoped key —
 # top-level mcpServers — is mirrored separately by _sync_mcp_servers.
 # sessions/ (the machine's session roster) is not an item either: it is
@@ -91,6 +97,22 @@ SHARED_ITEMS = (
     # $CLAUDE_CONFIG_DIR/output-styles; without this link a profile names a
     # style it can never find and silently runs with none.
     "output-styles",
+    # Path-scoped rules load from $CLAUDE_CONFIG_DIR/rules; without the link
+    # profiles silently run without the user's rules (CON-1432).
+    "rules",
+    # CON-1432: one plugin store for the whole fleet. Per-profile copies
+    # drift (each profile installs/updates on its own clock, so the fleet
+    # runs a mix of plugin versions and misses plugins the default profile
+    # has). installed_plugins.json bakes absolute installPath entries, so a
+    # copy is self-referential and never converges with the source; a
+    # symlink resolves every path into the shared store. The docs describe
+    # Claude Code writing to this directory in the background (auto-update,
+    # orphan sweep) and are silent on concurrent access from several config
+    # dirs — accepted risk: writers land identical marketplace content and
+    # use atomic tmp+rename writes, so last-writer-wins converges. A
+    # pre-existing real plugins/ dir is stashed aside once by
+    # _stash_unmanaged_plugins before linking (never silently deleted).
+    "plugins",
 )
 
 # Conversation-history items linked additionally under --share-history.
@@ -119,6 +141,17 @@ SHARE_MANIFEST = ".cswap-shared.json"
 # profile must be re-bootstrapped on the next non-live `cswap run` even if it
 # still passes the local reuse check.
 STALE_MARKER = ".cswap-stale-credentials"
+
+# Fingerprint of the machine-shared credential fields (mcpOAuth and friends)
+# a profile was last seeded with (CON-1432). Damper for the dead-family
+# re-seed trigger: a profile whose MCP auth still fails after a re-seed must
+# not re-bootstrap on every launch — only a NEW live generation (different
+# fingerprint) earns another attempt.
+SHARED_SEED_FP_FILE = ".cswap-shared-seed-fp"
+
+# Claude Code's own verdict cache: which MCP servers needed authentication at
+# the profile's last connect attempt (written by claude, read-only for us).
+MCP_NEEDS_AUTH_CACHE = "mcp-needs-auth-cache.json"
 
 # Fingerprint of the credential generation that seeded this profile (CON-849).
 # Once claude rotates the family inside the profile, the slot backup still
@@ -620,6 +653,31 @@ class SessionManager:
             session_dir
         )
 
+        # CON-1432 access parity: a valid profile can still hold an OUTDATED
+        # set of machine-shared OAuth integrations — the machine authorized a
+        # new MCP server after this profile was seeded. Key-set coverage
+        # (names only, never values) is the staleness signal: value drift is
+        # normal (each profile rotates its fork independently), a MISSING key
+        # is a parity hole. Routed through the ordinary stale-marker
+        # re-bootstrap so the family adoption + invalidation machinery runs
+        # unchanged; skipped under a live session like the marker itself.
+        if not stale:
+            holes = self._missing_live_shared_keys(session_dir)
+            # Key presence is not enough: a family frozen at an old seed can
+            # be present and DEAD (claude's last connect said "needs
+            # authentication" while the live machine holds a working family).
+            # claude's own verdict cache is the death certificate; the seed
+            # fingerprint damps the retry loop when the live generation
+            # hasn't changed since the last attempt.
+            holes = holes or self._dead_shared_families(session_dir)
+            if holes and not live_sessions_for(session_dir):
+                self._logger.info(
+                    f"Account-{account_num}: machine-shared credential parity "
+                    f"holes {holes} — re-seeding for parity (CON-1432)"
+                )
+                mark_session_stale(session_dir)
+                stale = True
+
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
             self._sync_sharing(session_dir, share, share_history)
@@ -687,6 +745,27 @@ class SessionManager:
         else:
             creds = self._seed_credentials_from_backup(account_num, email, org_uuid)
 
+        # CON-1432 access parity: seed the profile with the machine's CURRENT
+        # shared OAuth integrations (mcpOAuth and friends), not the copy
+        # frozen in the slot backup — the same live-wins compose the global
+        # switch path runs (_prepare_credentials_for_activation). Without
+        # this, a profile inherits MCP authorizations only as fresh as its
+        # slot's last global activation, which for fleet slots is months
+        # stale. The claudeAiOauth family is untouched (fingerprint is the
+        # refresh-token hash, so the seed stamp below is unaffected).
+        # Copy-then-rotate-independently is deliberate: each profile forks
+        # its own token family at seed time and never re-copies while its
+        # keys are present (see setup_session), so refresh-token reuse
+        # windows stay confined to bootstrap moments.
+        live_raw = self.switcher._read_credentials()
+        creds = self.switcher._prepare_credentials_for_activation(creds, live_raw)
+        # Stamp which shared-fields generation seeded this profile — the
+        # damper the dead-family re-seed trigger compares against
+        # (SHARED_SEED_FP_FILE above). Stamped even when the live machine has
+        # nothing to share: "seeded with the empty generation" is a valid
+        # damper state too.
+        seeded_shared = shared_credential_fields(live_raw) or {}
+
         config_text = self.switcher.read_account_config(account_num, email)
         try:
             config_data = json.loads(config_text) if config_text else {}
@@ -723,6 +802,14 @@ class SessionManager:
         stamp_path.write_text(credential_fingerprint(creds), encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(stamp_path, 0o600)
+
+        # CON-1432: shared-fields generation stamp (see SHARED_SEED_FP_FILE).
+        shared_fp_path = session_dir / SHARED_SEED_FP_FILE
+        shared_fp_path.write_text(
+            shared_fields_fingerprint(seeded_shared), encoding="utf-8"
+        )
+        if sys.platform != "win32":
+            os.chmod(shared_fp_path, 0o600)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -845,6 +932,97 @@ class SessionManager:
         except (json.JSONDecodeError, AttributeError):
             return True  # unknown shape — let the refresh attempt decide
 
+    def _missing_live_shared_keys(self, session_dir: Path) -> list[str]:
+        """Shared-credential keys the live machine holds but the profile lacks.
+
+        Judges only the dict-shaped families (``mcpOAuth``,
+        ``mcpOAuthClientConfig``) by KEY presence: values rotate
+        independently per profile and are never compared. Empty list on any
+        unreadable side — absence of evidence must not trigger a re-seed
+        loop (the bootstrap path seeds shared fields on its own anyway).
+        """
+        try:
+            live_shared = shared_credential_fields(
+                self.switcher._read_credentials()
+            )
+        except (KeychainError, OSError, ValueError):
+            # Keychain hiccup — never block a launch on a parity probe.
+            return []
+        if not live_shared:
+            return []
+        profile_raw = read_session_credentials(session_dir)
+        if not profile_raw:
+            return []
+        try:
+            profile = json.loads(profile_raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(profile, dict):
+            return []
+        missing: list[str] = []
+        for family in ("mcpOAuth", "mcpOAuthClientConfig"):
+            want = live_shared.get(family)
+            if not isinstance(want, dict):
+                continue
+            have = profile.get(family)
+            have_keys = set(have.keys()) if isinstance(have, dict) else set()
+            missing.extend(
+                f"{family}:{key}" for key in sorted(want.keys() - have_keys)
+            )
+        return missing
+
+    def _dead_shared_families(self, session_dir: Path) -> list[str]:
+        """Servers whose profile MCP auth is dead while the machine's lives.
+
+        The death certificate is claude's own ``mcp-needs-auth-cache.json``
+        (the server set that needed authentication at the profile's last
+        connect). A server from it qualifies when the live machine holds an
+        ``mcpOAuth`` family for it — that family is worth copying. The
+        ``SHARED_SEED_FP_FILE`` stamp damps the loop: if the profile was
+        already seeded with the CURRENT live generation, another copy of the
+        same bytes cannot help (the live family itself is dead — e.g. the
+        machine-wide server outage case), so nothing is reported.
+        """
+        cache_path = session_dir / MCP_NEEDS_AUTH_CACHE
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(cache, dict) or not cache:
+            return []
+        try:
+            live_shared = shared_credential_fields(
+                self.switcher._read_credentials()
+            )
+        except (KeychainError, OSError, ValueError):
+            return []
+        if not live_shared:
+            return []
+        fp = shared_fields_fingerprint(live_shared)
+        try:
+            stamped = (
+                (session_dir / SHARED_SEED_FP_FILE)
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except OSError:
+            stamped = ""
+        if stamped == fp:
+            return []
+        mcp_keys = [
+            key
+            for family in ("mcpOAuth", "mcpOAuthClientConfig")
+            if isinstance(live_shared.get(family), dict)
+            for key in live_shared[family]
+        ]
+        dead = [
+            server
+            for server in sorted(cache)
+            if isinstance(server, str)
+            and any(k == server or k.startswith(f"{server}|") for k in mcp_keys)
+        ]
+        return dead
+
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone.
@@ -948,6 +1126,17 @@ class SessionManager:
             return
 
         use_symlinks = self.switcher.platform != Platform.WINDOWS
+
+        # CON-1432: profiles created before plugins/ became a shared item
+        # hold a real per-profile plugin store that the "never touch user
+        # data" clause below would protect forever, freezing the parity gap
+        # in place. That store is a re-downloadable marketplace cache mirror,
+        # not user-authored data — stash it aside once and let the loop link
+        # the shared one. Skipped under a live session: swapping the plugin
+        # store under a running claude would pull code out from under it.
+        if share and "plugins" in active_items and use_symlinks:
+            self._stash_unmanaged_plugins(session_dir, managed)
+
         new_managed: list[str] = []
 
         for name in active_items:
@@ -1010,6 +1199,109 @@ class SessionManager:
         # write the manifest atomically so a concurrent reader never sees a
         # truncated file.
         self._write_manifest(manifest_path, new_managed)
+
+        # CON-1432: per-project auto-memory parity (a fleet agent must see
+        # the same memory the default profile's sessions accumulated).
+        if share:
+            self._sync_project_memory(session_dir)
+
+    def _stash_unmanaged_plugins(self, session_dir: Path, managed: list[str]) -> None:
+        """Move a pre-existing real plugins/ dir aside so it can be linked.
+
+        Only a real directory cswap does not own (absent from the manifest)
+        is stashed — a symlink or a manifest-listed entry is already ours to
+        replace. The stash (``plugins.pre-share-<stamp>``) is never deleted:
+        removal stays a human decision. No-op under a live session.
+        """
+        dest = session_dir / "plugins"
+        if dest.is_symlink() or not dest.is_dir() or "plugins" in managed:
+            return
+        if live_sessions_for(session_dir):
+            self._logger.info(
+                f"Not stashing {dest}: a live session is using this profile; "
+                "the shared plugins link lands on the next non-live launch"
+            )
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stash = dest.with_name(f"plugins.pre-share-{stamp}")
+        n = 2
+        while stash.exists() or stash.is_symlink():
+            stash = dest.with_name(f"plugins.pre-share-{stamp}-{n}")
+            n += 1
+        try:
+            dest.rename(stash)
+        except OSError as e:
+            self._logger.warning(f"Could not stash profile plugins dir: {e}")
+            return
+        print(
+            dimmed(
+                f"Profile plugin store stashed to {stash.name}; the shared "
+                "~/.claude/plugins now serves this profile (CON-1432)."
+            )
+        )
+
+    def _sync_project_memory(self, session_dir: Path) -> None:
+        """Link every ~/.claude/projects/<project>/memory into the profile.
+
+        Auto-memory lives at ``$CLAUDE_CONFIG_DIR/projects/<project>/memory``
+        (docs: memory#storage-location; ``<project>`` derives from the git
+        repo, so the flattened name is identical across config dirs for the
+        same checkout). Fleet parity (CON-1432) wants agents to read AND
+        write the orchestrator's memory, so each etalon memory dir is
+        symlinked, not copied. POSIX-only, like every other link here.
+
+        A profile-local real memory dir (accumulated before parity) is
+        stashed to ``memory.local-<stamp>`` — never merged silently, never
+        deleted — and only when no session is live on the profile. Under
+        ``--share-history`` the whole projects/ tree is already the etalon's;
+        nothing to do.
+        """
+        if self.switcher.platform == Platform.WINDOWS:
+            return
+        src_root = Path.home() / ".claude" / "projects"
+        dest_root = session_dir / "projects"
+        if not src_root.is_dir() or dest_root.is_symlink():
+            return
+        live: bool | None = None  # lazy: one ps sweep, only if a stash is due
+        for src_mem in sorted(src_root.glob("*/memory")):
+            if src_mem.is_symlink() or not src_mem.is_dir():
+                continue
+            dest_mem = dest_root / src_mem.parent.name / "memory"
+            if dest_mem.is_symlink():
+                try:
+                    if dest_mem.readlink() != src_mem:
+                        dest_mem.unlink()
+                        dest_mem.symlink_to(src_mem)
+                except OSError:
+                    continue
+                continue
+            if dest_mem.exists():
+                if live is None:
+                    live = bool(live_sessions_for(session_dir))
+                if live:
+                    continue
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                stash = dest_mem.with_name(f"memory.local-{stamp}")
+                n = 2
+                while stash.exists() or stash.is_symlink():
+                    stash = dest_mem.with_name(f"memory.local-{stamp}-{n}")
+                    n += 1
+                try:
+                    dest_mem.rename(stash)
+                except OSError as e:
+                    self._logger.warning(
+                        f"Could not stash local memory {dest_mem}: {e}"
+                    )
+                    continue
+                self._logger.info(
+                    f"Stashed profile-local memory to {stash} before linking "
+                    "the shared one (CON-1432)"
+                )
+            try:
+                dest_mem.parent.mkdir(parents=True, exist_ok=True)
+                dest_mem.symlink_to(src_mem)
+            except OSError as e:
+                self._logger.warning(f"Failed to link memory {src_mem}: {e}")
 
     def _sync_session_registry(self, session_dir: Path) -> None:
         """Share claude's session registry (``sessions/``) with ``~/.claude``.

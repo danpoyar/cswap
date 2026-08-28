@@ -18,6 +18,7 @@ orchestration would re-couple. The store owns only its two pieces of state:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -163,6 +164,18 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
                 sorted(unrecognized),
             )
     return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+
+
+def shared_fields_fingerprint(shared_fields: dict) -> str:
+    """Stable fingerprint of a machine-shared credential field set.
+
+    Canonical-JSON hash: two generations compare equal iff every shared
+    family byte-matches. Used by the session re-seed damper (CON-1432) to
+    tell "this profile already carries the current live generation" from
+    "the live machine has something newer to copy".
+    """
+    canonical = json.dumps(shared_fields, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def merge_shared_credential_fields(
