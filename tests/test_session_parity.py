@@ -327,3 +327,73 @@ class TestSharedCredentialSeeding:
         assert seeded["mcpOAuth"]["figma|abc"]["accessToken"] == "live-figma"
         # The slot's own login family is untouched by the merge.
         assert seeded["claudeAiOauth"]["refreshToken"] == "stored-refresh"
+        # The shared-fields generation stamp is written (re-seed damper).
+        from claude_swap.credentials import (
+            shared_credential_fields,
+            shared_fields_fingerprint,
+        )
+        stamp = (session_dir / session_mod.SHARED_SEED_FP_FILE).read_text()
+        assert stamp == shared_fields_fingerprint(
+            shared_credential_fields(LIVE_WITH_MCP)
+        )
+
+
+class TestDeadSharedFamilies:
+    def _needs_auth(self, session_dir: Path, servers: list[str]) -> None:
+        (session_dir / session_mod.MCP_NEEDS_AUTH_CACHE).write_text(
+            json.dumps({s: {"timestamp": 1} for s in servers})
+        )
+
+    def test_cached_dead_server_with_live_family_flags(
+        self, share_setup, monkeypatch
+    ):
+        """Key present but family dead: claude's needs-auth verdict + a live
+        machine family for that server → one re-seed is due."""
+        source, session_dir, mgr = share_setup
+        monkeypatch.setattr(
+            mgr.switcher, "_read_credentials", lambda: LIVE_WITH_MCP
+        )
+        self._needs_auth(session_dir, ["figma", "unrelated-server"])
+
+        assert mgr._dead_shared_families(session_dir) == ["figma"]
+
+    def test_stamp_damps_reseed_loop(self, share_setup, monkeypatch):
+        """Already seeded with the CURRENT live generation → copying the same
+        bytes again cannot help; nothing is reported."""
+        from claude_swap.credentials import (
+            shared_credential_fields,
+            shared_fields_fingerprint,
+        )
+        source, session_dir, mgr = share_setup
+        monkeypatch.setattr(
+            mgr.switcher, "_read_credentials", lambda: LIVE_WITH_MCP
+        )
+        self._needs_auth(session_dir, ["figma"])
+        (session_dir / session_mod.SHARED_SEED_FP_FILE).write_text(
+            shared_fields_fingerprint(shared_credential_fields(LIVE_WITH_MCP))
+        )
+
+        assert mgr._dead_shared_families(session_dir) == []
+
+    def test_new_live_generation_lifts_damper(self, share_setup, monkeypatch):
+        source, session_dir, mgr = share_setup
+        monkeypatch.setattr(
+            mgr.switcher, "_read_credentials", lambda: LIVE_WITH_MCP
+        )
+        self._needs_auth(session_dir, ["figma"])
+        (session_dir / session_mod.SHARED_SEED_FP_FILE).write_text(
+            "sha256:stale-generation"
+        )
+
+        assert mgr._dead_shared_families(session_dir) == ["figma"]
+
+    def test_no_cache_or_no_live_shared_is_quiet(self, share_setup, monkeypatch):
+        source, session_dir, mgr = share_setup
+        monkeypatch.setattr(
+            mgr.switcher, "_read_credentials", lambda: LIVE_WITH_MCP
+        )
+        assert mgr._dead_shared_families(session_dir) == []
+
+        self._needs_auth(session_dir, ["figma"])
+        monkeypatch.setattr(mgr.switcher, "_read_credentials", lambda: None)
+        assert mgr._dead_shared_families(session_dir) == []

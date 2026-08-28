@@ -111,6 +111,22 @@ read in one sitting.
   `cswap add --activate` is the conscious immediate swap, logged as a drain
   bypass. Upstream-relevant in spirit, but the motivation is fleet-shaped;
   offer after it survives here.
+- Fleet access parity for session profiles (CON-1432, 2026-08-28): a spawned
+  agent must see everything the orchestrator's default `~/.claude` sees.
+  `SHARED_ITEMS` grows `rules/` (path-scoped rules silently didn't load in
+  profiles) and `plugins/` (per-profile plugin stores drift in versions and
+  contents; a pre-existing real dir is stashed once to `plugins.pre-share-<ts>`,
+  never deleted, and only when no session is live). `_sync_project_memory`
+  links every `~/.claude/projects/<project>/memory` into the profile
+  (profile-local memory stashed to `memory.local-<ts>`). Credentials:
+  `_bootstrap` seeds the machine's CURRENT shared fields (`mcpOAuth` etc.)
+  via the same live-wins compose as the global switch path, stamps the
+  generation to `.cswap-shared-seed-fp`, and `setup_session` re-seeds through
+  the ordinary stale-marker machinery when the profile lacks a live shared
+  key or Claude's own `mcp-needs-auth-cache.json` says a family is dead while
+  the live machine holds one (the stamp damps the retry loop). Pure fleet
+  machinery; not upstream material — upstream has no notion of a fleet
+  etalon. Gate side lives in the config repo (spawn door, CON-1432).
 - Year-long inference token attached to a login slot (CON-1329, 2026-08-26):
   `cswap attach-token <num|email> [TOKEN|-]` / `detach-token` store a
   `claude setup-token` per identity (`<backup>/tokens/<email-slug>.enc`,

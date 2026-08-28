@@ -51,7 +51,10 @@ from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.credentials import shared_credential_fields
+from claude_swap.credentials import (
+    shared_credential_fields,
+    shared_fields_fingerprint,
+)
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.inference_token import inference_token_credentials
 from claude_swap.macos_keychain import KeychainError
@@ -138,6 +141,17 @@ SHARE_MANIFEST = ".cswap-shared.json"
 # profile must be re-bootstrapped on the next non-live `cswap run` even if it
 # still passes the local reuse check.
 STALE_MARKER = ".cswap-stale-credentials"
+
+# Fingerprint of the machine-shared credential fields (mcpOAuth and friends)
+# a profile was last seeded with (CON-1432). Damper for the dead-family
+# re-seed trigger: a profile whose MCP auth still fails after a re-seed must
+# not re-bootstrap on every launch — only a NEW live generation (different
+# fingerprint) earns another attempt.
+SHARED_SEED_FP_FILE = ".cswap-shared-seed-fp"
+
+# Claude Code's own verdict cache: which MCP servers needed authentication at
+# the profile's last connect attempt (written by claude, read-only for us).
+MCP_NEEDS_AUTH_CACHE = "mcp-needs-auth-cache.json"
 
 # Fingerprint of the credential generation that seeded this profile (CON-849).
 # Once claude rotates the family inside the profile, the slot backup still
@@ -648,12 +662,18 @@ class SessionManager:
         # re-bootstrap so the family adoption + invalidation machinery runs
         # unchanged; skipped under a live session like the marker itself.
         if not stale:
-            missing = self._missing_live_shared_keys(session_dir)
-            if missing and not live_sessions_for(session_dir):
+            holes = self._missing_live_shared_keys(session_dir)
+            # Key presence is not enough: a family frozen at an old seed can
+            # be present and DEAD (claude's last connect said "needs
+            # authentication" while the live machine holds a working family).
+            # claude's own verdict cache is the death certificate; the seed
+            # fingerprint damps the retry loop when the live generation
+            # hasn't changed since the last attempt.
+            holes = holes or self._dead_shared_families(session_dir)
+            if holes and not live_sessions_for(session_dir):
                 self._logger.info(
-                    f"Account-{account_num}: profile lacks machine-shared "
-                    f"credential keys {missing} — re-seeding for parity "
-                    "(CON-1432)"
+                    f"Account-{account_num}: machine-shared credential parity "
+                    f"holes {holes} — re-seeding for parity (CON-1432)"
                 )
                 mark_session_stale(session_dir)
                 stale = True
@@ -737,9 +757,14 @@ class SessionManager:
         # its own token family at seed time and never re-copies while its
         # keys are present (see setup_session), so refresh-token reuse
         # windows stay confined to bootstrap moments.
-        creds = self.switcher._prepare_credentials_for_activation(
-            creds, self.switcher._read_credentials()
-        )
+        live_raw = self.switcher._read_credentials()
+        creds = self.switcher._prepare_credentials_for_activation(creds, live_raw)
+        # Stamp which shared-fields generation seeded this profile — the
+        # damper the dead-family re-seed trigger compares against
+        # (SHARED_SEED_FP_FILE above). Stamped even when the live machine has
+        # nothing to share: "seeded with the empty generation" is a valid
+        # damper state too.
+        seeded_shared = shared_credential_fields(live_raw) or {}
 
         config_text = self.switcher.read_account_config(account_num, email)
         try:
@@ -777,6 +802,14 @@ class SessionManager:
         stamp_path.write_text(credential_fingerprint(creds), encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(stamp_path, 0o600)
+
+        # CON-1432: shared-fields generation stamp (see SHARED_SEED_FP_FILE).
+        shared_fp_path = session_dir / SHARED_SEED_FP_FILE
+        shared_fp_path.write_text(
+            shared_fields_fingerprint(seeded_shared), encoding="utf-8"
+        )
+        if sys.platform != "win32":
+            os.chmod(shared_fp_path, 0o600)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -937,6 +970,58 @@ class SessionManager:
                 f"{family}:{key}" for key in sorted(want.keys() - have_keys)
             )
         return missing
+
+    def _dead_shared_families(self, session_dir: Path) -> list[str]:
+        """Servers whose profile MCP auth is dead while the machine's lives.
+
+        The death certificate is claude's own ``mcp-needs-auth-cache.json``
+        (the server set that needed authentication at the profile's last
+        connect). A server from it qualifies when the live machine holds an
+        ``mcpOAuth`` family for it — that family is worth copying. The
+        ``SHARED_SEED_FP_FILE`` stamp damps the loop: if the profile was
+        already seeded with the CURRENT live generation, another copy of the
+        same bytes cannot help (the live family itself is dead — e.g. the
+        machine-wide server outage case), so nothing is reported.
+        """
+        cache_path = session_dir / MCP_NEEDS_AUTH_CACHE
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(cache, dict) or not cache:
+            return []
+        try:
+            live_shared = shared_credential_fields(
+                self.switcher._read_credentials()
+            )
+        except (KeychainError, OSError, ValueError):
+            return []
+        if not live_shared:
+            return []
+        fp = shared_fields_fingerprint(live_shared)
+        try:
+            stamped = (
+                (session_dir / SHARED_SEED_FP_FILE)
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except OSError:
+            stamped = ""
+        if stamped == fp:
+            return []
+        mcp_keys = [
+            key
+            for family in ("mcpOAuth", "mcpOAuthClientConfig")
+            if isinstance(live_shared.get(family), dict)
+            for key in live_shared[family]
+        ]
+        dead = [
+            server
+            for server in sorted(cache)
+            if isinstance(server, str)
+            and any(k == server or k.startswith(f"{server}|") for k in mcp_keys)
+        ]
+        return dead
 
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
