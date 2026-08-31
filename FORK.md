@@ -246,6 +246,44 @@ read in one sitting.
   Fleet-shaped (profiles are this fork's session mode); offer upstream with
   the session-mode work.
 
+- Two more consumers of the same token family heal it, and the family state
+  is machine-readable (CON-1595, 2026-08-31 — the three holes the CON-1579
+  post-mortem named). (1) The switch refusal on a live-session slot is a
+  typed `LiveSessionRefusal` (a `SwitchError`, so every handler still
+  catches it) carrying the slot, the PIDs and the recipe: the TUI offers
+  `cswap run N` as a confirm and, on yes, exits with a `RunHandoff` that
+  `tui.run` execs in the same terminal (Textual owns the terminal while the
+  app runs — `App.exit(result)` → `run()` returns it); the menu bar shows the
+  recipe with a copy-to-clipboard button. (2) The auto-switch engine's
+  `_freshen_target` runs `heal_backup_before_activation` before it reads the
+  backup: a candidate whose profile rotated past the backup used to get its
+  CONSUMED backup grant POSTed, answered `invalid_grant`, and quarantined —
+  an alive slot lost to the rotation on a false dead-lineage verdict.
+  (3) `cswap refresh N` on an idle slot whose fresh profile outran the backup
+  answers `resynced` (backup adopts the profile's generation, profile
+  reseeded bootstrap-shaped, no POST) instead of `fresh` — the hand recipe;
+  `cswap refresh --all --stale-min N` keeps its usage-staleness gate, so the
+  fleet job's cadence is unchanged. `cswap list --json --token-status`
+  (previously rejected) adds the additive per-account `tokenFamily`
+  (`backup`/`profile` state, `diverged`, `liveSession`; `{"active": …}` on the
+  live login) — the human "session profile: fresh / stored backup: expired"
+  lines that printed for a day before the incident, now readable by the
+  fleet's sensors (config repo: sensor Q TOKEN-DRIFT, night-digest line).
+  The ordering oracles (stale marker, seed stamp) live in one helper,
+  `_backup_is_newer`, shared by the heal and the resync so those two cannot
+  disagree; the resync also refuses while a spilled rotation (CON-849) is
+  pending — the backup family moved on and the reconcile paths own it
+  (folding the spill in first would erase both oracles via the profile
+  invalidation and let the profile's old family overwrite the newest
+  login — review r.1). Known third judge, left as is: the bootstrap's
+  `adopt_profile_family` (CON-1329) reads only the seed stamp, because
+  `setup_session` treats the stale marker itself (adopt, then wipe); the
+  two differ only on a stamp-less profile carrying a marker (profiles
+  older than the CON-849 stamp), where the resync side is the conservative
+  one (no write). Fleet-shaped (profiles are this fork's session mode); the
+  typed refusal + TUI handoff could travel upstream with the session-mode
+  work.
+
 ## Syncing with upstream
 
 ```

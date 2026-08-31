@@ -20,6 +20,7 @@ import logging
 import os
 import plistlib
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -28,7 +29,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import pace
-from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    CredentialReadError,
+    LiveSessionRefusal,
+)
 from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
@@ -367,6 +372,35 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
 
 
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
+
+
+def live_session_alert(refusal: LiveSessionRefusal) -> tuple[str, str, str]:
+    """(title, message, command) for the alert on a refused switch whose slot
+    is owned by a live ``cswap run`` session (CON-1579 refusal, CON-1595 UI).
+
+    The menu bar cannot exec into a terminal the way the TUI does, so it
+    shows the recipe and offers to put the command on the clipboard.
+    """
+    pids = ", ".join(str(p) for p in refusal.pids) or "unknown"
+    title = f"Account {refusal.account_num}: a live session owns its login"
+    message = (
+        f"Account {refusal.account_num} ({refusal.email}) is running a live "
+        f"agent session (PID {pids}) that rotated its login past the stored "
+        "copy. Switching the default login onto it would land a dead login "
+        "(Login expired).\n\n"
+        f"For a terminal on this slot run:\n{refusal.command}\n\n"
+        "“Copy command” puts it on the clipboard."
+    )
+    return title, message, refusal.command
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """macOS clipboard via ``pbcopy``; False when unavailable (never raises)."""
+    try:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
@@ -807,9 +841,26 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self._notify_switched()
-                    self.refresh_async()
+                try:
+                    self.switcher.switch_to(str(num))
+                except LiveSessionRefusal as e:
+                    # CON-1595: the slot's live `cswap run` session owns the
+                    # token family — offer the recipe, don't just fail.
+                    title, message, command = live_session_alert(e)
+                    pressed = rumps.alert(
+                        title=title, message=message, ok="Copy command", cancel="Close"
+                    )
+                    if pressed == 1 and not _copy_to_clipboard(command):
+                        rumps.alert(
+                            title="claude-swap",
+                            message=f"Could not reach the clipboard — run by hand:\n{command}",
+                        )
+                    return
+                except ClaudeSwitchError as e:
+                    rumps.alert(title="claude-swap", message=str(e))
+                    return
+                self._notify_switched()
+                self.refresh_async()
             return cb
 
         def _switch(self, strategy):
