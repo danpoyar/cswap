@@ -760,8 +760,10 @@ Defaults live in settings.json in the backup root; flags override them.
         default=None,
         help=(
             "Pin the live login to this account: auto-switch never rotates "
-            "off it (not at the threshold, not at its limit), leaves it only "
-            "when its token is dead, and returns as soon as it reads again"
+            "off it (not at the threshold, not at an account-wide limit), "
+            "leaves it only on a dead token or a configured model window "
+            "at/over the threshold, and returns as soon as it reads again "
+            "with that window below the threshold"
         ),
     )
     parser.add_argument(

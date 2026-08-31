@@ -109,11 +109,17 @@ class AutoSwitchSettings:
     model: str | None = None
     # Slot number or email the live login is pinned to (CON-1070). With a
     # home the daemon never moves the login off it on its own — threshold,
-    # consume-first, the early swap and even a maxed window all hold; a dead
-    # token (failover) is the only escape — and, away from home, returns as
-    # soon as the home slot proves alive (readable usage), ignoring the
-    # cooldown. A disabled or unknown home leaves the pin inert with one
-    # warning. None = plain rotation (default).
+    # consume-first, the early swap and even a maxed account-wide window
+    # all hold; the escapes are a dead token (failover) and, with
+    # ``model`` configured, that model's scoped window at/over the
+    # threshold (CON-1581: the pinned login's own work is model-bound, so
+    # a model-burned home is a mute terminal, not a rest). Away from home
+    # the login returns as soon as the home slot proves alive (readable
+    # usage) with its model window below the threshold, ignoring the
+    # cooldown; while the pin is active the pool-shield (CON-712) stands
+    # down — voluntary landings are judged model-aware too. A disabled or
+    # unknown home leaves the pin inert with one warning. None = plain
+    # rotation (default).
     home_account: str | None = None
 
 

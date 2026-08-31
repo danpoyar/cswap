@@ -284,6 +284,33 @@ read in one sitting.
   typed refusal + TUI handoff could travel upstream with the session-mode
   work.
 
+- The home pin judges the pinned model's window, and the record follows
+  the real login (CON-1581, 2026-08-31). Live incident: after a reboot and
+  a manual browser `/login`, `return-home` moved the live login back onto
+  the home slot whose Fable window sat at 100% (5h/7d healthy) — the pin
+  judged only token liveness ("only a dead token moves it"), so the
+  interactive terminal, whose work is pinned to that model, was mute until
+  the weekly reset. Three changes: (1) with `autoswitch.model` configured,
+  a home whose scoped model window is at/over `threshold` is not a rest —
+  at home the pin yields the tick to the plain escape triggers (at-limit
+  at 100%, proactive otherwise), and the return refuses with a
+  `home-model-burned` no-switch until the window reads below the
+  threshold; the account-wide 5h/7d walls keep holding at home (CON-1070's
+  contract). (2) While the pin is active the pool-shield (CON-712) stands
+  down — voluntary landings are judged model-aware: the pin already
+  guarantees the fleet a resting login, and a rescue that parks the
+  pinned login on a model-burned host re-creates the mute terminal (and,
+  aimed at the home itself, would ping-pong against the model-window
+  escape); pinless setups keep the shield bit-for-bit. (3) The engine
+  reconciles the recorded `activeAccountNumber` with the live identity
+  (`~/.claude.json` `oauthAccount`) each real tick — the record is written
+  only by switch/add, so a manual `/login` onto a managed slot left every
+  record consumer (`list --json`, the `refresh --all` active-slot
+  exclusion, rotation anchors, the fresh-machine activation) acting on the
+  wrong slot; an adoption is one lock-guarded write on drift plus an
+  `adopt-real-login` event with both numbers. Fleet-shaped policy; the
+  record reconciliation could travel upstream on its own.
+
 ## Syncing with upstream
 
 ```
