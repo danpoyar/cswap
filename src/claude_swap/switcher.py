@@ -1601,6 +1601,53 @@ class ClaudeAccountSwitcher:
         """Whether ``~/.claude.json`` carries any live account identity."""
         return self._get_current_account() is not None
 
+    def adopt_active_account(self, account_num: str) -> tuple[bool, str | None]:
+        """Make the recorded active slot follow the real login (CON-1581).
+
+        ``activeAccountNumber`` is written only by switch/add, so a manual
+        ``claude /login`` onto another managed account leaves the record
+        naming the OLD slot — and every record consumer (the ``list
+        --json`` field, the ``refresh --all`` active-slot exclusion,
+        rotation anchors, the fresh-machine activation path) then acts on
+        the wrong slot. The auto-switch engine calls this each real tick
+        with the slot it resolved from the live identity; the record is
+        rewritten only on drift, under the account lock, with a
+        live-identity re-check (a switch may land between the caller's
+        read and the lock — a stale slot must not be adopted).
+
+        Returns ``(adopted, prior_recorded_number)``; ``(False, prior)``
+        when the record already matches or the re-check refused.
+        """
+        data = self._get_sequence_data()
+        if not data:
+            return (False, None)
+        prior = data.get("activeAccountNumber")
+        prior_num = str(prior) if prior is not None else None
+        if prior_num == str(account_num):
+            return (False, prior_num)
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data()
+            if not data:
+                return (False, None)
+            prior = data.get("activeAccountNumber")
+            prior_num = str(prior) if prior is not None else None
+            if prior_num == str(account_num):
+                return (False, prior_num)
+            identity = self._get_current_account()
+            if identity is None:
+                return (False, prior_num)
+            email, org_uuid = identity
+            if self._find_account_slot(data, email, org_uuid) != str(account_num):
+                return (False, prior_num)
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(
+                f"Adopted the real login into the record: activeAccountNumber "
+                f"{prior_num} -> {account_num} (moved outside cswap)"
+            )
+            return (True, prior_num)
+
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
         return self._live_session_pids(account_num, email)

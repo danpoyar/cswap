@@ -469,6 +469,37 @@ class SwitchEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class AdoptRealLoginEvent(AutoSwitchEvent):
+    """The record's active slot was reconciled with the real login (CON-1581).
+
+    ``activeAccountNumber`` is written only by switch/add, so a manual
+    ``/login`` onto a managed account leaves it naming the old slot — and
+    every record consumer (``list --json``, the ``refresh --all``
+    active-slot exclusion, rotation anchors, the fresh-machine activation)
+    then acts on the wrong slot. Emitted once per adoption, with both
+    numbers.
+    """
+
+    kind: ClassVar[str] = "adopt-real-login"
+    prior: dict | None  # account_ref shape, or None (no recorded active)
+    to_ref: dict
+
+    def _fields(self) -> dict:
+        return {"from": self.prior, "to": self.to_ref}
+
+    def human(self) -> str:
+        src = (
+            f"Account-{self.prior.get('number')}" if self.prior else "(none)"
+        )
+        return (
+            f"Adopted the real login: the record said {src}, the live login "
+            f"is Account-{self.to_ref.get('number')} "
+            f"({self.to_ref.get('email')}) — moved outside cswap (manual "
+            "/login)"
+        )
+
+
+@dataclass(frozen=True)
 class NoSwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "no-switch"
     reason: str
@@ -1424,6 +1455,23 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        if not self.dry_run:
+            # A manual /login moved the live identity without a switch: the
+            # record's active slot goes stale until the next switch, and its
+            # consumers act on the wrong slot (CON-1581, 31-08). Reconcile
+            # every real tick; dry-run must not write anything, same as the
+            # quarantine release above.
+            adopted, prior = self.switcher.adopt_active_account(current)
+            if adopted:
+                prior_ref = (
+                    _ref(prior, self.switcher.account_email(prior))
+                    if prior is not None
+                    else None
+                )
+                self._emit(
+                    AdoptRealLoginEvent(prior=prior_ref, to_ref=dict(active_ref))
+                )
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
@@ -1478,17 +1526,24 @@ class AutoSwitchEngine:
         # ``cswap run`` of the active slot rides the global login and would
         # be swapped from under the agent), so a login that rotates costs
         # the fleet one seat at all times. With a home slot the login rests
-        # there instead: nothing voluntary moves it, a maxed window holds
-        # too (the wall is the user's own to wait out), and only a dead
-        # token — usage unreadable — escalates to failover below. Away from
-        # home, the return lands once the home slot proves alive; while it
-        # cannot land yet (no proof of life, traffic, a live session on the
-        # slot) the plain rotation keeps judging the slot the login is on,
-        # so at-limit and failover there still escape (review r1). An inert
-        # pin — home disabled (the user's explicit hold-out wins, said once)
-        # or quarantined — leaves every tick to the plain rotation.
+        # there instead: nothing voluntary moves it, a maxed account-wide
+        # window holds too (the wall is the user's own to wait out), and
+        # only a dead token — usage unreadable — escalates to failover
+        # below. The one other escape (CON-1581): a configured scoped model
+        # window at/over the threshold — the login's own work is pinned to
+        # that model, so a model-burned home is a mute terminal, not a rest
+        # (31-08: return-home landed on a Fable-100% home and every request
+        # failed until the weekly reset). Away from home, the return lands
+        # once the home slot proves alive AND its model window is below the
+        # threshold; while it cannot land yet (no proof of life, traffic, a
+        # live session on the slot, a burned model window) the plain
+        # rotation keeps judging the slot the login is on, so at-limit and
+        # failover there still escape (review r1). An inert pin — home
+        # disabled (the user's explicit hold-out wins, said once) or
+        # quarantined — leaves every tick to the plain rotation.
         home = self._home_slot(settings)
-        if home is not None and not self._home_inert(home, quarantined):
+        pin_active = home is not None and not self._home_inert(home, quarantined)
+        if pin_active:
             if current != home:
                 outcome = self._return_home(
                     home, quarantined=quarantined, usage=usage
@@ -1496,18 +1551,31 @@ class AutoSwitchEngine:
                 if outcome is not None:
                     return outcome
             elif active_headroom is not None:
-                self._unhealthy_ticks = 0
-                self._idle_hold_since = None
-                self._emit(
-                    NoSwitchEvent(
-                        reason="home-pinned",
-                        detail=(
-                            f"the live login rests on Account-{home}; only a "
-                            "dead token moves it"
-                        ),
+                if self._model_window_burned(usage.get(current)) is None:
+                    self._unhealthy_ticks = 0
+                    self._idle_hold_since = None
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="home-pinned",
+                            detail=(
+                                f"the live login rests on Account-{home}; "
+                                "only a dead token"
+                                + (
+                                    " or a burned model window"
+                                    if self._models
+                                    else ""
+                                )
+                                + " moves it"
+                            ),
+                        )
                     )
-                )
-                return TickOutcome.NO_ACTION
+                    return TickOutcome.NO_ACTION
+                # The pinned model's window is at/over the threshold: the
+                # login cannot serve its model here. The pin yields the
+                # tick to the plain escape triggers below — at-limit at
+                # 100%, proactive otherwise (the pool-shield's account-wide
+                # axis is suspended while the pin is active, so the scoped
+                # window really is the judged axis).
 
         early = False
         if active_headroom is not None:
@@ -1519,12 +1587,17 @@ class AutoSwitchEngine:
                 # whatever is pinned to it is at the wall right now.
                 trigger = "at-limit"
             else:
-                if settings.strategy == "consume-first":
+                if settings.strategy == "consume-first" and not pin_active:
                     # Pool-shield (CON-712): how burned this host is gets
                     # judged account-wide (5h/7d). A model-burned host with
                     # session room left is a correct resting spot for the
                     # rotation — not a threshold breach to flee, which is
                     # what re-hoarded a model-fresh account on every tick.
+                    # Suspended while the home pin is active (CON-1581): the
+                    # pin already guarantees the fleet a resting login, and
+                    # the pinned login's own work is model-pinned — resting
+                    # it on a model-burned host is the mute terminal the
+                    # model-window escape above exists to end.
                     base_h = base_headroom.get(current)
                     if base_h is not None:
                         utilization = 100.0 - base_h
@@ -1703,6 +1776,7 @@ class AutoSwitchEngine:
             settings=settings,
             now=self.clock(),
             early=early,
+            pin_active=pin_active,
         )
 
         if (trigger == "consume-first" or early) and ordered:
@@ -1738,6 +1812,7 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=self.clock(),
                 early=early,
+                pin_active=pin_active,
             )
 
         if (
@@ -1989,6 +2064,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         early: bool = False,
+        pin_active: bool = False,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1996,6 +2072,13 @@ class AutoSwitchEngine:
         no state writes — so the consume-first two-phase commit can run it
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
+
+        ``pin_active`` (CON-1581) stands the pool-shield down: with an
+        active home pin the login is judged model-aware everywhere — the
+        pin already guarantees the fleet a resting login, and a voluntary
+        landing on a model-burned host would park the pinned login's own
+        model-bound work at a wall (and, on the home itself, ping-pong
+        against the model-window escape).
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -2010,7 +2093,7 @@ class AutoSwitchEngine:
         # The model window still binds everywhere else: a maxed binding
         # window (h <= 0) is never a target, and escape landings keep
         # ranking model-healthy accounts first.
-        shield = consume_first and bool(self._models)
+        shield = consume_first and bool(self._models) and not pin_active
         voluntary = trigger in ("proactive", "consume-first")
         active_burned = False
         # The active account's headroom on the axis voluntary moves are
@@ -2513,6 +2596,31 @@ class AutoSwitchEngine:
 
     # -- home pin (CON-1070) ----------------------------------------------
 
+    def _model_window_burned(
+        self, value: dict | str | None
+    ) -> tuple[str, float] | None:
+        """The configured scoped model window at/over the threshold, if any.
+
+        The home pin's model judgment (CON-1581): judged with the same
+        ``threshold`` as the proactive escape, so "burned" means the same
+        thing everywhere. Returns the worst offending ``(window name,
+        pct)``, or ``None`` when every configured scoped window is below
+        the threshold (or none is configured/reported). The account-wide
+        5h/7d windows are deliberately not judged here — at home they are
+        the user's own wall to wait out (CON-1070).
+        """
+        if not self._models or not isinstance(value, dict):
+            return None
+        worst: tuple[str, float] | None = None
+        for label, pct, _ in oauth.relevant_windows(value, self._models):
+            if label in ("5h", "7d"):
+                continue
+            if pct >= self.settings.threshold and (
+                worst is None or pct > worst[1]
+            ):
+                worst = (label, pct)
+        return worst
+
     def _home_slot(self, settings: AutoSwitchSettings) -> str | None:
         """Resolve ``autoswitch.homeAccount`` to a managed slot, or None.
 
@@ -2598,6 +2706,26 @@ class AutoSwitchEngine:
             entry = self.switcher.usage_entries_by_account(fetch={home}).get(home)
             value = entry.decision_value() if entry is not None else None
         if _headroom_by_account({home: value}, self._models).get(home) is None:
+            return None
+        burned = self._model_window_burned(value)
+        if burned is not None:
+            # Alive is not enough (CON-1581): a home whose configured model
+            # window is at/over the threshold cannot serve the login's own
+            # work — returning made the terminal mute on 31-08. Wait out
+            # the window on the slot the login is on; the return lands the
+            # tick the window reads below the threshold again.
+            name, pct = burned
+            self._emit(
+                NoSwitchEvent(
+                    reason="home-model-burned",
+                    detail=(
+                        f"the return to Account-{home} waits: its {name} "
+                        f"window is at {pct_label(pct)}% (switch threshold "
+                        f"{pct_label(self.settings.threshold)}%) — the login "
+                        "cannot serve its model there until the window resets"
+                    ),
+                )
+            )
             return None
 
         def wait(detail: str) -> None:
