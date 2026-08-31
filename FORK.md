@@ -183,6 +183,27 @@ read in one sitting.
   pool the bg fleet feeds from ran dry of Fable-fresh accounts. Fleet-shaped
   policy; offer upstream after it survives the fleet.
 
+- `switch` heals or refuses a slot whose session profile rotated past the
+  stored backup (CON-1579). A `cswap run` session's claude rotates the token
+  family inside its profile and nothing syncs it back, so the slot backup is
+  a CONSUMED generation from the first rotation on — and `switch` activated
+  exactly that backup. Live incident on this fleet, 2026-08-31 09:53–09:56:
+  after a reboot the operator switched by hand onto three slots with live
+  agents; each landed dead ("Login expired · Please run /login" on the first
+  request), Claude Code wiped the live token fields, and only a browser
+  `/login` recovered the terminal. The pre-activation heal
+  (`refresh.heal_backup_before_activation`, wired into `_perform_switch`
+  before the locks) adopts the profile's fresh generation into the backup
+  without a POST, refreshes an expired one through the parked-slot refresh
+  path, drops the idle profile's copy either way (one family, one live
+  copy), and REFUSES when a live session owns the family (recipe:
+  `cswap run N`) or the grant is rejected (recipe: `cswap add --slot N`) —
+  the old warn-and-proceed drift notice stays only for the equal-lineage
+  case. `cswap refresh --all` never healed this shape on purpose: it judges
+  the profile's freshness, and a fresh profile over a dead backup is FRESH.
+  Fleet-shaped (profiles are this fork's session mode); offer upstream with
+  the session-mode work.
+
 ## Syncing with upstream
 
 ```
