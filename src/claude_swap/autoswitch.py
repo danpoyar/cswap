@@ -1546,12 +1546,17 @@ class AutoSwitchEngine:
         if pin_active:
             if current != home:
                 outcome = self._return_home(
-                    home, quarantined=quarantined, usage=usage
+                    home,
+                    quarantined=quarantined,
+                    usage=usage,
+                    threshold=settings.threshold,
                 )
                 if outcome is not None:
                     return outcome
             elif active_headroom is not None:
-                if self._model_window_burned(usage.get(current)) is None:
+                if self._model_window_burned(
+                    usage.get(current), threshold=settings.threshold
+                ) is None:
                     self._unhealthy_ticks = 0
                     self._idle_hold_since = None
                     self._emit(
@@ -2597,17 +2602,20 @@ class AutoSwitchEngine:
     # -- home pin (CON-1070) ----------------------------------------------
 
     def _model_window_burned(
-        self, value: dict | str | None
+        self, value: dict | str | None, *, threshold: float
     ) -> tuple[str, float] | None:
         """The configured scoped model window at/over the threshold, if any.
 
         The home pin's model judgment (CON-1581): judged with the same
         ``threshold`` as the proactive escape, so "burned" means the same
-        thing everywhere. Returns the worst offending ``(window name,
-        pct)``, or ``None`` when every configured scoped window is below
-        the threshold (or none is configured/reported). The account-wide
-        5h/7d windows are deliberately not judged here — at home they are
-        the user's own wall to wait out (CON-1070).
+        thing everywhere — the caller passes its tick-snapshotted value
+        (``apply_threshold()`` can land mid-tick from the TUI thread, and
+        one tick must judge every window on one number). Returns the worst
+        offending ``(window name, pct)``, or ``None`` when every
+        configured scoped window is below the threshold (or none is
+        configured/reported). The account-wide 5h/7d windows are
+        deliberately not judged here — at home they are the user's own
+        wall to wait out (CON-1070).
         """
         if not self._models or not isinstance(value, dict):
             return None
@@ -2615,9 +2623,7 @@ class AutoSwitchEngine:
         for label, pct, _ in oauth.relevant_windows(value, self._models):
             if label in ("5h", "7d"):
                 continue
-            if pct >= self.settings.threshold and (
-                worst is None or pct > worst[1]
-            ):
+            if pct >= threshold and (worst is None or pct > worst[1]):
                 worst = (label, pct)
         return worst
 
@@ -2677,6 +2683,7 @@ class AutoSwitchEngine:
         *,
         quarantined: set[str],
         usage: dict[str, dict | str | None],
+        threshold: float,
     ) -> TickOutcome | None:
         """Bring the live login back to the pinned slot once it proves alive.
 
@@ -2707,7 +2714,7 @@ class AutoSwitchEngine:
             value = entry.decision_value() if entry is not None else None
         if _headroom_by_account({home: value}, self._models).get(home) is None:
             return None
-        burned = self._model_window_burned(value)
+        burned = self._model_window_burned(value, threshold=threshold)
         if burned is not None:
             # Alive is not enough (CON-1581): a home whose configured model
             # window is at/over the threshold cannot serve the login's own
@@ -2721,8 +2728,8 @@ class AutoSwitchEngine:
                     detail=(
                         f"the return to Account-{home} waits: its {name} "
                         f"window is at {pct_label(pct)}% (switch threshold "
-                        f"{pct_label(self.settings.threshold)}%) — the login "
-                        "cannot serve its model there until the window resets"
+                        f"{pct_label(threshold)}%) — the login cannot serve "
+                        "its model there until the window resets"
                     ),
                 )
             )

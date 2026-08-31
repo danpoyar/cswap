@@ -104,6 +104,20 @@ class TestReturnHomeModelBurned:
         assert _switches(h) == []
         assert "home-model-burned" in _reasons(h)
 
+    def test_model_all_sentinel_judges_every_scoped_window(self, temp_home):
+        # "all" names no particular window and matches whatever scoped
+        # windows the account reports — a burned one still blocks the
+        # return.
+        h = _harness(temp_home, live=2, model="all")
+        h.tick_with_usage({
+            "1": _scoped_usage(5.0, 100.0),
+            "2": _scoped_usage(10.0, 20.0),
+            "3": _scoped_usage(10.0, 30.0),
+        })
+        assert h.active_number() == 2
+        assert _switches(h) == []
+        assert "home-model-burned" in _reasons(h)
+
     def test_return_lands_while_the_window_is_below_threshold(self, temp_home):
         h = _harness(temp_home, live=2)
         outcome = h.tick_with_usage({
