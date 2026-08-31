@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-1595",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "e52697d3e876af8534fcfbf05814e38044271b4a",
+  "summary": "раунд 2: major-1 (reconcile спилла стирал оракулы до суда) и minor-2 (RESYNCED из _refresh_resolved оставлял копию профиля) починены — репро ревьюера против e52697d даёт fresh без записи, тесты автора 47 passed; minor-3 принят как факт с обоснованием в FORK.md; можно принимать; альтернативы: judged",
+  "findings": []
+}
