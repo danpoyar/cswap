@@ -397,11 +397,21 @@ def _backup_lags_profile(
 ) -> bool:
     """Whether the stored backup is a superseded (or missing) generation of
     the family the profile holds — the shape ``switch`` used to activate dead.
-    Caller holds ``switcher.lock_file``; a pending spilled rotation is folded
-    into the backup first, so a spill that already carries the profile's
-    generation is not mistaken for a lag."""
+
+    Caller holds ``switcher.lock_file``. Judged on the disk state AS IS: a
+    pending spilled rotation (CON-849) means the BACKUP family moved on and
+    its newest generation is waiting to land — never a lag of the backup
+    behind the profile, so it answers False and the reconcile paths keep
+    owning the spill. Folding the spill in here first would run
+    ``_post_backup_write`` → ``_invalidate_session_credentials`` (the profile
+    is idle), erasing the stale marker and the seed stamp BEFORE they are
+    read — the ordering judge would then call the profile "ahead" and the
+    resync would write the profile's OLD family over the newest login
+    (review r.1 of CON-1595, live repro).
+    """
+    if switcher._pending_rotation_path(account_num).exists():
+        return False
     backup = switcher.read_account_credentials(account_num, email)
-    backup = switcher.reconcile_pending_rotation_locked(account_num, email, backup)
     if backup and credential_fingerprint(backup) == credential_fingerprint(
         profile_creds
     ):
@@ -507,10 +517,12 @@ def heal_backup_before_activation(
 
     if is_oauth_token_expired(profile_oauth.get("expiresAt")):
         report = _refresh_resolved(switcher, account_num, email, org_uuid)
-        if report.outcome == REFRESHED:
+        if report.outcome in (REFRESHED, RESYNCED):
             # The parked-slot path reseeds the profile for a future `cswap
-            # run`; here the generation is about to become the live login,
-            # so the profile copy must not survive (one family, one copy).
+            # run` (REFRESHED — or RESYNCED when a concurrent refresh made
+            # the profile fresh between our pre-lock read and its lock);
+            # here the generation is about to become the live login, so the
+            # profile copy must not survive (one family, one copy).
             switcher._invalidate_session_credentials(account_num, email)
             return report
         if report.outcome != FRESH:

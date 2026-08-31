@@ -2621,7 +2621,11 @@ class AutoSwitchEngine:
             quarantined.add(home)
             return None
         if status == "transient":
-            wait("its token could not be freshened (network?)")
+            wait(
+                "its stored login could not be freshened or healed this tick "
+                "(network, credential locks held elsewhere, or an unreadable "
+                "keychain entry)"
+            )
             return None
         if status == "skip-live-session":
             # A ``cswap run`` session owns this slot's token in its own

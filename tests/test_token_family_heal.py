@@ -246,6 +246,92 @@ class TestRefreshResyncsIdleDivergedSlot:
         assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
         no_network.assert_not_called()
 
+    def test_pending_spill_with_stale_marker_is_never_resynced_over(
+        self, temp_home, no_network
+    ):
+        """Review r.1 of CON-1595 (live repro): re-login under a live session
+        rewrote the BACKUP (marker on the profile), the collector then rotated
+        the new backup under a held lock → spilled rotation pending; the
+        session exited; `cswap refresh N`. Folding the spill in FIRST ran the
+        profile invalidation, erased the marker and the stamp, and the resync
+        wrote the profile's OLD family over the newest login. Now: a pending
+        spill is never a lag — nothing is written, the spill stays for the
+        reconcile paths."""
+        s = _make_parked_switcher()
+        seed = _creds("at-seed-2", "rt-seed-2", expires=EXPIRED_MS)
+        new_login = _creds("at-new-2", "rt-new-2")
+        s.write_account_credentials(NUM, EMAIL, new_login)
+        session_dir = s._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        old_family = _creds("at-old-2", "rt-old-2")
+        (session_dir / ".credentials.json").write_text(old_family, encoding="utf-8")
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(seed), encoding="utf-8"
+        )
+        (session_dir / STALE_MARKER).touch()
+        rotated_new = _creds("at-new-2b", "rt-new-2b")
+        spill = s._pending_rotation_path(NUM)
+        spill.write_text(
+            json.dumps(
+                {
+                    "credentials": rotated_new,
+                    "predecessorFingerprint": oauth.credential_fingerprint(new_login),
+                    "email": EMAIL,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = refresh_account(s, NUM)
+
+        assert report.outcome == FRESH
+        assert s.read_account_credentials(NUM, EMAIL) == new_login
+        assert spill.exists(), "the spill belongs to the reconcile paths — untouched"
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == old_family
+        assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+    def test_pending_spill_without_marker_is_not_a_lag_either(
+        self, temp_home, no_network
+    ):
+        s = _make_parked_switcher()
+        backup, profile, session_dir = _rotated_profile(s)
+        spill = s._pending_rotation_path(NUM)
+        spill.write_text(
+            json.dumps(
+                {
+                    "credentials": _creds("at-spilled-2", "rt-spilled-2"),
+                    "predecessorFingerprint": oauth.credential_fingerprint(backup),
+                    "email": EMAIL,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = refresh_account(s, NUM)
+
+        assert report.outcome == FRESH
+        assert s.read_account_credentials(NUM, EMAIL) == backup
+        assert spill.exists()
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
+        no_network.assert_not_called()
+
+    def test_missing_backup_is_resynced_from_the_profile(self, temp_home, no_network):
+        """The profile is the family's only copy: the backup adopts it."""
+        s = _make_parked_switcher()
+        session_dir = s._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        profile = _creds("at-only-2", "rt-only-2")
+        (session_dir / ".credentials.json").write_text(profile, encoding="utf-8")
+        assert s.read_account_credentials(NUM, EMAIL) == ""
+
+        report = refresh_account(s, NUM)
+
+        assert report.outcome == RESYNCED
+        assert s.read_account_credentials(NUM, EMAIL) == profile
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
+        no_network.assert_not_called()
+
     def test_backup_newer_than_profile_is_never_overwritten(
         self, temp_home, no_network
     ):
@@ -271,6 +357,30 @@ class TestRefreshResyncsIdleDivergedSlot:
         assert report.outcome != RESYNCED
         assert s.read_account_credentials(NUM, EMAIL) == new_login
         no_network.assert_not_called()
+
+
+class TestHealDropsTheProfileCopyOnResync:
+    def test_resynced_from_the_parked_path_leaves_one_copy(self, temp_home, no_network):
+        """Review r.1 minor: heal read an expired profile pre-lock, but a
+        concurrent refresh made it fresh before `_refresh_resolved` took the
+        lock → that path answers RESYNCED with a reseeded profile copy. The
+        generation is about to become the live login: one family, one copy."""
+        from claude_swap.refresh import RefreshReport, heal_backup_before_activation
+
+        s = _make_parked_switcher()
+        backup, _profile, session_dir = _rotated_profile(s, profile_expires=EXPIRED_MS)
+
+        # The parked path is stubbed: it "found the profile fresh under the
+        # lock" and answered RESYNCED (its own writes are not the point here).
+        with patch(
+            "claude_swap.refresh._refresh_resolved",
+            return_value=RefreshReport(NUM, EMAIL, RESYNCED),
+        ):
+            report = heal_backup_before_activation(s, NUM, EMAIL, "")
+
+        assert report.outcome == RESYNCED
+        assert not (session_dir / ".credentials.json").exists()
+        assert s.read_account_credentials(NUM, EMAIL) == backup  # stub wrote nothing
 
 
 class TestListJsonTokenFamily:

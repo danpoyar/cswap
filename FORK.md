@@ -270,8 +270,17 @@ read in one sitting.
   lines that printed for a day before the incident, now readable by the
   fleet's sensors (config repo: sensor Q TOKEN-DRIFT, night-digest line).
   The ordering oracles (stale marker, seed stamp) live in one helper,
-  `_backup_is_newer`, shared by the heal and the resync so they cannot
-  disagree. Fleet-shaped (profiles are this fork's session mode); the
+  `_backup_is_newer`, shared by the heal and the resync so those two cannot
+  disagree; the resync also refuses while a spilled rotation (CON-849) is
+  pending — the backup family moved on and the reconcile paths own it
+  (folding the spill in first would erase both oracles via the profile
+  invalidation and let the profile's old family overwrite the newest
+  login — review r.1). Known third judge, left as is: the bootstrap's
+  `adopt_profile_family` (CON-1329) reads only the seed stamp, because
+  `setup_session` treats the stale marker itself (adopt, then wipe); the
+  two differ only on a stamp-less profile carrying a marker (profiles
+  older than the CON-849 stamp), where the resync side is the conservative
+  one (no write). Fleet-shaped (profiles are this fork's session mode); the
   typed refusal + TUI handoff could travel upstream with the session-mode
   work.
 
