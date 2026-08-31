@@ -52,6 +52,7 @@ from claude_swap.oauth import (
 )
 from claude_swap.session import (
     SEED_FINGERPRINT_FILE,
+    STALE_MARKER,
     delete_macos_keychain_entry,
     keychain_service_name,
     read_seed_fingerprint,
@@ -353,7 +354,16 @@ def heal_backup_before_activation(
     slots in a row). Outcomes:
 
     - ``BACKUP_CURRENT`` — no profile, a profile owned by another login, an
-      unusable profile credential, or the same lineage: nothing to heal.
+      unusable profile credential, the same lineage — or the BACKUP is the
+      newer generation: fingerprint inequality alone does not say who ran
+      ahead, so the two ordering oracles the codebase already keeps are
+      read first. ``STALE_MARKER`` (set by ``_post_backup_write`` when the
+      backup was rewritten under a live session — re-login/re-add, a
+      persisted rotation) means the profile copy is presumed stale; a seed
+      stamp that no longer matches the backup means the backup moved after
+      the profile was seeded. Either way the backup wins, and the superseded
+      profile copy is dropped when no session is live (what
+      ``setup_session`` would do on the next ``cswap run`` anyway).
     - ``RESYNCED`` — the profile's generation is fresh: adopted into the
       backup as-is (no POST, no grant consumed). The write invalidates the
       idle profile's credential material, so the family ends up with ONE
@@ -393,13 +403,34 @@ def heal_backup_before_activation(
     backup = switcher.read_account_credentials(account_num, email)
     if backup and credential_fingerprint(backup) == profile_fp:
         return out(BACKUP_CURRENT)
+    pids = switcher._live_session_pids(account_num, email)
+
+    # Who ran ahead? Inequality alone cannot tell (review r.1, CON-1579):
+    # a re-login/re-add or a persisted rotation rewrites the BACKUP under
+    # a live session and leaves the profile with its older family plus the
+    # stale marker; seeding stamps the generation both copies started from.
+    if (session_dir / STALE_MARKER).exists():
+        if not pids:
+            switcher._invalidate_session_credentials(account_num, email)
+        return out(
+            BACKUP_CURRENT,
+            "profile marked stale — the backup is the newer login",
+        )
+    seed = read_seed_fingerprint(session_dir)
+    if seed and backup and seed != credential_fingerprint(backup):
+        if not pids:
+            switcher._invalidate_session_credentials(account_num, email)
+        return out(
+            BACKUP_CURRENT,
+            "backup rewritten after the profile was seeded — the backup is newer",
+        )
+
     profile_oauth = extract_oauth_data(profile_creds)
     if not profile_oauth or not (
         profile_oauth.get("accessToken") and profile_oauth.get("refreshToken")
     ):
         # Not a full OAuth pair: nothing safer than the backup to offer.
         return out(BACKUP_CURRENT, "profile credential is not a full token pair")
-    pids = switcher._live_session_pids(account_num, email)
     if pids:
         return out(LIVE_SESSION, ", ".join(str(p) for p in pids))
 
@@ -410,7 +441,12 @@ def heal_backup_before_activation(
             # run`; here the generation is about to become the live login,
             # so the profile copy must not survive (one family, one copy).
             switcher._invalidate_session_credentials(account_num, email)
-        return report
+            return report
+        if report.outcome != FRESH:
+            return report
+        # FRESH: a concurrent refresh (its own lock) renewed the profile
+        # between our read and its lock — the backup still lags; adopt the
+        # now-fresh generation below instead of misreporting a failure.
 
     try:
         with FileLock(switcher.lock_file, timeout=_REFRESH_LOCK_TIMEOUT_S):

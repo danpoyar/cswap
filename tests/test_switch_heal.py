@@ -22,7 +22,7 @@ from claude_swap import oauth
 from claude_swap.exceptions import SwitchError
 from claude_swap.models import Platform
 from claude_swap.oauth import RefreshOutcome
-from claude_swap.session import SEED_FINGERPRINT_FILE
+from claude_swap.session import SEED_FINGERPRINT_FILE, STALE_MARKER
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 ACTIVE_NUM, ACTIVE_EMAIL = "1", "test@example.com"  # identity of mock_claude_config
@@ -252,3 +252,115 @@ class TestSwitchRefusesDeadLanding:
 
         assert "cswap refresh 2" in str(exc.value)
         assert _live_path(temp_home).read_text(encoding="utf-8") == live_before
+
+
+def _superseded_profile(s: ClaudeAccountSwitcher, profile_expires: int = FRESH_MS,
+                        marker: bool = True):
+    """Review r.1 shape: the BACKUP is the newer login. A re-add/re-login while
+    the profile's session was live rewrote the backup (B) and left the profile
+    with its older family (A) plus the stale marker; the seed stamp names the
+    generation both copies started from (neither A nor B)."""
+    seed = _creds("at-seed-2", "rt-seed-2", expires=EXPIRED_MS)
+    new_login = _creds("at-new-2", "rt-new-2")
+    s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, new_login)  # B
+    session_dir = s._session_dir(TARGET_NUM, TARGET_EMAIL)
+    session_dir.mkdir(parents=True)
+    old_family = _creds("at-old-2", "rt-old-2", expires=profile_expires)  # A
+    (session_dir / ".credentials.json").write_text(old_family, encoding="utf-8")
+    (session_dir / SEED_FINGERPRINT_FILE).write_text(
+        oauth.credential_fingerprint(seed), encoding="utf-8"
+    )
+    if marker:
+        (session_dir / STALE_MARKER).touch()
+    return new_login, old_family, session_dir
+
+
+class TestBackupNewerThanProfile:
+    """Fingerprint inequality alone does not say who ran ahead (review r.1)."""
+
+    def test_stale_marked_profile_never_overwrites_the_newer_backup(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        s = _make_switcher(temp_home)
+        new_login, _old, session_dir = _superseded_profile(s)
+
+        result = s.switch_to(TARGET_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert oauth.extract_access_token(
+            _live_path(temp_home).read_text(encoding="utf-8")
+        ) == "at-new-2"
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == new_login
+        no_network.assert_not_called()
+        assert not any("healed" in w for w in result["warnings"]), result["warnings"]
+        # The superseded copy is dropped (no live session) — setup_session's
+        # own rule, applied now: one family, one copy.
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / STALE_MARKER).exists()
+
+    def test_expired_stale_profile_does_not_refuse_the_fresh_backup(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        s = _make_switcher(temp_home)
+        new_login, _old, _dir = _superseded_profile(s, profile_expires=EXPIRED_MS)
+        no_network.return_value = RefreshOutcome(None, "invalid_grant")  # A is dead
+
+        result = s.switch_to(TARGET_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert oauth.extract_access_token(
+            _live_path(temp_home).read_text(encoding="utf-8")
+        ) == "at-new-2"
+        no_network.assert_not_called()  # the dead old family is never POSTed
+
+    def test_seed_stamp_moved_backup_is_newer_without_marker(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Marker gone (e.g. hand-cleaned) but the seed stamp != backup: the
+        backup moved after seeding — still the newer generation."""
+        s = _make_switcher(temp_home)
+        new_login, _old, session_dir = _superseded_profile(s, marker=False)
+
+        result = s.switch_to(TARGET_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert oauth.extract_access_token(
+            _live_path(temp_home).read_text(encoding="utf-8")
+        ) == "at-new-2"
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == new_login
+        no_network.assert_not_called()
+
+    def test_stale_marked_profile_with_live_session_keeps_its_copy(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Different families, no sharing: activate the backup, leave the live
+        session's copy alone (setup_session re-bootstraps it once idle)."""
+        s = _make_switcher(temp_home)
+        new_login, old_family, session_dir = _superseded_profile(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert oauth.extract_access_token(
+            _live_path(temp_home).read_text(encoding="utf-8")
+        ) == "at-new-2"
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == old_family
+        assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+
+class TestDriftNoticeOrdering:
+    def test_refusal_precedes_the_drift_notice(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """The advisory drift notice must not be emitted for a switch that is
+        refused: warnings never leak out of a raised SwitchError path, and in
+        human mode nothing is printed before the error."""
+        s = _make_switcher(temp_home)
+        _rotated_profile(s)
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            with patch("claude_swap.switcher.warning") as warn:
+                with pytest.raises(SwitchError):
+                    s.switch_to(TARGET_NUM, json_output=False)
+        warn.assert_not_called()

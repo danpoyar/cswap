@@ -199,7 +199,13 @@ read in one sitting.
   copy), and REFUSES when a live session owns the family (recipe:
   `cswap run N`) or the grant is rejected (recipe: `cswap add --slot N`) —
   the old warn-and-proceed drift notice stays only for the equal-lineage
-  case. `cswap refresh --all` never healed this shape on purpose: it judges
+  case. Fingerprint inequality alone does not say who ran ahead: the heal
+  reads the two ordering oracles first — the profile's stale marker (set by
+  `_post_backup_write` when the backup was rewritten under a live session:
+  re-login, re-add, persisted rotation) and the seed stamp (backup moved
+  after seeding) — and in both cases the BACKUP is the newer login: it is
+  activated as-is and the superseded profile copy is dropped when idle
+  (review r.1 of the fix caught the one-sided reading). `cswap refresh --all` never healed this shape on purpose: it judges
   the profile's freshness, and a fresh profile over a dead backup is FRESH.
   Fleet-shaped (profiles are this fork's session mode); offer upstream with
   the session-mode work.

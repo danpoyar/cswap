@@ -5284,10 +5284,11 @@ class ClaudeAccountSwitcher:
         on three slots in a row. The warn-and-proceed drift notice above did
         not stop it: a consumed generation is not a drift risk, it is a dead
         login. Outcomes map onto ``refresh.heal_backup_before_activation``:
-        nothing to heal → silent; healed → one notice; a live session owning
-        the family, a rejected grant or an unhealable store → ``SwitchError``
-        with the recipe (never a dead landing). Raising is safe here: nothing
-        has been mutated yet.
+        nothing to heal (incl. "the backup is the newer generation", judged by
+        the stale marker / seed stamp) → silent; healed → one notice; a live
+        session owning the family, a rejected grant or an unhealable store →
+        ``SwitchError`` with the recipe (never a dead landing). Raising is
+        safe here: nothing has been mutated yet.
         """
         from claude_swap.refresh import (
             ACTIVE_SLOT,
@@ -5388,6 +5389,16 @@ class ClaudeAccountSwitcher:
             pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
         )
         if pre_email:
+            # CON-1579: the slot backup may be a CONSUMED generation (its
+            # session profile rotated past it — nothing syncs back). Heal it
+            # from the profile or refuse, before it can become the live login
+            # — and before the drift notice below, which is advisory and must
+            # not precede a refusal. Pre-lock on purpose: the heal takes the
+            # store lock itself and may POST one refresh; nothing here runs
+            # while our locks are held.
+            self._heal_target_backup(
+                target_account, pre_email, pre_data, emit_output, warnings_out
+            )
             pids = self._live_session_pids(target_account, pre_email)
             if pids:
                 msg = (
@@ -5402,14 +5413,6 @@ class ClaudeAccountSwitcher:
                     warning(msg)
                 else:
                     warnings_out.append(msg)
-            # CON-1579: the slot backup may be a CONSUMED generation (its
-            # session profile rotated past it — nothing syncs back). Heal it
-            # from the profile or refuse, before it can become the live login.
-            # Pre-lock on purpose: the heal takes the store lock itself and may
-            # POST one refresh; nothing here runs while our locks are held.
-            self._heal_target_backup(
-                target_account, pre_email, pre_data, emit_output, warnings_out
-            )
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch
