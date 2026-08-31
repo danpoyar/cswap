@@ -5467,6 +5467,94 @@ class ClaudeAccountSwitcher:
         )
         return entry_id
 
+    def _heal_target_backup(
+        self,
+        account_num: str,
+        email: str,
+        data: dict,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> None:
+        """Refuse or heal a target whose stored backup lags its session profile.
+
+        Live incident 2026-08-31 (CON-1579): a hand switch onto slots whose
+        `cswap run` sessions had rotated the token family activated each
+        slot's consumed backup generation — Claude Code's refresh was
+        rejected and the terminal printed "Login expired · Please run /login"
+        on three slots in a row. The warn-and-proceed drift notice above did
+        not stop it: a consumed generation is not a drift risk, it is a dead
+        login. Outcomes map onto ``refresh.heal_backup_before_activation``:
+        nothing to heal (incl. "the backup is the newer generation", judged by
+        the stale marker / seed stamp) → silent; healed → one notice; a live
+        session owning the family, a rejected grant or an unhealable store →
+        ``SwitchError`` with the recipe (never a dead landing). Raising is
+        safe here: nothing has been mutated yet.
+        """
+        from claude_swap.refresh import (
+            ACTIVE_SLOT,
+            API_KEY,
+            BACKUP_CURRENT,
+            LIVE_SESSION,
+            NO_CREDENTIALS,
+            REFRESHED,
+            RELOGIN_REQUIRED,
+            RESYNCED,
+            heal_backup_before_activation,
+        )
+
+        org_uuid = (
+            data.get("accounts", {}).get(account_num, {}).get("organizationUuid", "")
+            or ""
+        )
+        report = heal_backup_before_activation(self, account_num, email, org_uuid)
+        outcome = report.outcome
+        if outcome in (BACKUP_CURRENT, API_KEY, ACTIVE_SLOT, NO_CREDENTIALS):
+            # Nothing lagged, or the normal path reports the missing backup
+            # with its own re-add recipe.
+            return
+        if outcome in (RESYNCED, REFRESHED):
+            how = (
+                "adopted its fresh generation"
+                if outcome == RESYNCED
+                else "refreshed its expired generation"
+            )
+            msg = (
+                f"Account-{account_num}'s stored login was a consumed "
+                f"generation (its session profile rotated past it); healed "
+                f"from the profile before activation ({how})."
+            )
+            self._logger.info(msg)
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+            return
+        if outcome == LIVE_SESSION:
+            raise SwitchError(
+                f"Account-{account_num} ({email}) has a live session-mode Claude "
+                f"instance (PID {report.detail}) that rotated the token family "
+                "past the stored backup — activating the stored copy would land "
+                "a dead login (Login expired), and sharing the session's copy "
+                "would kill one of the two at the next refresh. For a terminal "
+                f"on this slot run: cswap run {account_num} (shares the session "
+                "profile under Claude Code's own lock); or switch to a slot "
+                "without a live session."
+            )
+        if outcome == RELOGIN_REQUIRED:
+            raise SwitchError(
+                f"Account-{account_num} ({email}) cannot be activated: its "
+                f"stored login is a consumed generation and the session "
+                f"profile's grant was rejected ({report.detail}) — only a "
+                f"re-login helps. Log in as it and run: cswap add --slot "
+                f"{account_num}"
+            )
+        raise SwitchError(
+            f"Account-{account_num} ({email}) cannot be activated right now: "
+            f"its stored login is a consumed generation and healing it from "
+            f"the session profile failed ({report.detail or outcome}). Retry, "
+            f"or run first: cswap refresh {account_num}"
+        )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -5501,6 +5589,16 @@ class ClaudeAccountSwitcher:
             pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
         )
         if pre_email:
+            # CON-1579: the slot backup may be a CONSUMED generation (its
+            # session profile rotated past it — nothing syncs back). Heal it
+            # from the profile or refuse, before it can become the live login
+            # — and before the drift notice below, which is advisory and must
+            # not precede a refusal. Pre-lock on purpose: the heal takes the
+            # store lock itself and may POST one refresh; nothing here runs
+            # while our locks are held.
+            self._heal_target_backup(
+                target_account, pre_email, pre_data, emit_output, warnings_out
+            )
             pids = self._live_session_pids(target_account, pre_email)
             if pids:
                 msg = (

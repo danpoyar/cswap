@@ -53,6 +53,7 @@ from claude_swap.oauth import (
 )
 from claude_swap.session import (
     SEED_FINGERPRINT_FILE,
+    STALE_MARKER,
     delete_macos_keychain_entry,
     keychain_service_name,
     read_seed_fingerprint,
@@ -82,6 +83,9 @@ TRANSIENT_ERROR = "transient-error"  # network blip; safe to retry later
 DEFERRED = "deferred"  # unsafe to act now (locks, unreadable keychain)
 NO_CREDENTIALS = "no-credentials"
 API_KEY = "api-key"  # API-key slots have no OAuth family to refresh
+# Pre-activation heal outcomes (CON-1579; ``heal_backup_before_activation``).
+BACKUP_CURRENT = "backup-current"  # backup is the slot's newest generation (or no profile)
+RESYNCED = "resynced"  # backup adopted the profile's FRESH generation — no grant consumed
 
 
 @dataclass(frozen=True)
@@ -346,3 +350,137 @@ def refresh_accounts(
     """Refresh several slots sequentially (one POST at a time — the token
     endpoint has per-token budgets, and slot locks are independent)."""
     return [refresh_account(switcher, ident) for ident in identifiers]
+
+
+def heal_backup_before_activation(
+    switcher: ClaudeAccountSwitcher,
+    account_num: str,
+    email: str,
+    org_uuid: str,
+) -> RefreshReport:
+    """Make a slot's stored backup activatable when its session profile has
+    rotated past it (CON-1579).
+
+    ``switch`` activates the slot BACKUP. Once a ``cswap run`` session has run
+    on the slot, its claude rotates the token family inside the profile and
+    nothing syncs it back — the backup is then a CONSUMED generation, and
+    activating it lands the default login dead on arrival ("Login expired ·
+    Please run /login" on the first request; live incident 2026-08-31, three
+    slots in a row). Outcomes:
+
+    - ``BACKUP_CURRENT`` — no profile, a profile owned by another login, an
+      unusable profile credential, the same lineage — or the BACKUP is the
+      newer generation: fingerprint inequality alone does not say who ran
+      ahead, so the two ordering oracles the codebase already keeps are
+      read first. ``STALE_MARKER`` (set by ``_post_backup_write`` when the
+      backup was rewritten under a live session — re-login/re-add, a
+      persisted rotation) means the profile copy is presumed stale; a seed
+      stamp that no longer matches the backup means the backup moved after
+      the profile was seeded. Either way the backup wins, and the superseded
+      profile copy is dropped when no session is live (what
+      ``setup_session`` would do on the next ``cswap run`` anyway).
+    - ``RESYNCED`` — the profile's generation is fresh: adopted into the
+      backup as-is (no POST, no grant consumed). The write invalidates the
+      idle profile's credential material, so the family ends up with ONE
+      copy — the one about to go live.
+    - ``REFRESHED`` — the profile's generation is expired: one refresh POST
+      with the PROFILE's grant via the parked-slot refresh path, successor
+      persisted; the reseeded profile copy is then dropped for the same
+      one-copy reason.
+    - ``LIVE_SESSION`` — a live claude owns the family (detail: its PIDs).
+      Handing out either copy would put one rotating refresh token in two
+      config dirs with a running writer on the other side; the caller must
+      refuse, not warn.
+    - ``RELOGIN_REQUIRED`` / ``TRANSIENT_ERROR`` / ``DEFERRED`` /
+      ``NO_CREDENTIALS`` — as ``refresh_account``; the caller refuses the
+      activation rather than landing a dead login.
+
+    The freshest-generation read follows ``_read_profile_credentials`` (an
+    existing-but-unreadable keychain entry is DEFERRED, never a fall-back to
+    the plaintext seed — that seed is the consumed generation).
+    """
+    def out(outcome: str, detail: str | None = None) -> RefreshReport:
+        return RefreshReport(account_num, email, outcome, detail)
+
+    if switcher._account_kind(account_num) == "api_key":
+        return out(API_KEY)
+    session_dir = switcher._session_dir(account_num, email)
+    if not session_dir.is_dir():
+        return out(BACKUP_CURRENT, "no session profile")
+    if session_identity_drifted(session_dir, email, org_uuid):
+        return out(BACKUP_CURRENT, "profile is logged in as another account")
+    profile_creds, err = _read_profile_credentials(session_dir)
+    if profile_creds is None:
+        if err is not None:
+            return out(DEFERRED, err)
+        return out(BACKUP_CURRENT, "profile holds no credential")
+    profile_fp = credential_fingerprint(profile_creds)
+    backup = switcher.read_account_credentials(account_num, email)
+    if backup and credential_fingerprint(backup) == profile_fp:
+        return out(BACKUP_CURRENT)
+    pids = switcher._live_session_pids(account_num, email)
+
+    # Who ran ahead? Inequality alone cannot tell (review r.1, CON-1579):
+    # a re-login/re-add or a persisted rotation rewrites the BACKUP under
+    # a live session and leaves the profile with its older family plus the
+    # stale marker; seeding stamps the generation both copies started from.
+    if (session_dir / STALE_MARKER).exists():
+        if not pids:
+            switcher._invalidate_session_credentials(account_num, email)
+        return out(
+            BACKUP_CURRENT,
+            "profile marked stale — the backup is the newer login",
+        )
+    seed = read_seed_fingerprint(session_dir)
+    if seed and backup and seed != credential_fingerprint(backup):
+        if not pids:
+            switcher._invalidate_session_credentials(account_num, email)
+        return out(
+            BACKUP_CURRENT,
+            "backup rewritten after the profile was seeded — the backup is newer",
+        )
+
+    profile_oauth = extract_oauth_data(profile_creds)
+    if not profile_oauth or not (
+        profile_oauth.get("accessToken") and profile_oauth.get("refreshToken")
+    ):
+        # Not a full OAuth pair: nothing safer than the backup to offer.
+        return out(BACKUP_CURRENT, "profile credential is not a full token pair")
+    if pids:
+        return out(LIVE_SESSION, ", ".join(str(p) for p in pids))
+
+    if is_oauth_token_expired(profile_oauth.get("expiresAt")):
+        report = _refresh_resolved(switcher, account_num, email, org_uuid)
+        if report.outcome == REFRESHED:
+            # The parked-slot path reseeds the profile for a future `cswap
+            # run`; here the generation is about to become the live login,
+            # so the profile copy must not survive (one family, one copy).
+            switcher._invalidate_session_credentials(account_num, email)
+            return report
+        if report.outcome != FRESH:
+            return report
+        # FRESH: a concurrent refresh (its own lock) renewed the profile
+        # between our read and its lock — the backup still lags; adopt the
+        # now-fresh generation below instead of misreporting a failure.
+
+    try:
+        with FileLock(switcher.lock_file, timeout=_REFRESH_LOCK_TIMEOUT_S):
+            # Re-judged under the lock: a `cswap run` bootstrap or a claude
+            # landing on the profile since the pre-lock read owns the family.
+            pids = switcher._live_session_pids(account_num, email)
+            if pids:
+                return out(LIVE_SESSION, ", ".join(str(p) for p in pids))
+            fresh, err = _read_profile_credentials(session_dir)
+            if fresh is None:
+                return out(DEFERRED, err or "profile credential vanished")
+            fresh_oauth = extract_oauth_data(fresh)
+            if not fresh_oauth or not (
+                fresh_oauth.get("accessToken") and fresh_oauth.get("refreshToken")
+            ):
+                return out(DEFERRED, "profile credential changed under the lock")
+            # write_account_credentials expects the held lock; its
+            # post-write hook drops the idle profile's credential copy.
+            switcher.write_account_credentials(account_num, email, fresh)
+    except LockError:
+        return out(DEFERRED, "credential locks held elsewhere")
+    return out(RESYNCED)
