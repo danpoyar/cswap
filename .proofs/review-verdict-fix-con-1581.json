@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-1581",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "c69a90b0af2ae99a2ee222a1c32b7618e6af87d4",
+  "summary": "р1-находки (1 minor, 2 нита) починены c69a90b: порог тик-снапшотом параметром, тест model=all, PR-текст о красноте честный; новых находок нет, можно принимать; альтернативы: judged",
+  "findings": []
+}
