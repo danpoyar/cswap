@@ -1143,7 +1143,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     parser.add_argument(
         "--token-status",
         action="store_true",
-        help="Show source-labelled OAuth token diagnostics (use with 'list')",
+        help=(
+            "Show source-labelled OAuth token diagnostics (use with 'list'; "
+            "with --json adds the per-account tokenFamily field)"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -1359,10 +1362,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
 
-    if args.json and args.token_status:
-        # Token status is not part of the JSON v1 schema; reject rather than
-        # silently ignore it (a future additive field can add it).
-        parser.error("--token-status cannot be combined with --json")
+    # `--json --token-status` (CON-1595): the token diagnostics ride as the
+    # additive per-account `tokenFamily` field — opt-in, because computing it
+    # reads every slot's backup and profile credential (Keychain) and probes
+    # live sessions; the plain `list --json` contract is unchanged.
 
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")

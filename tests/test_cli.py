@@ -786,12 +786,20 @@ class TestJsonOutputCli:
         assert excinfo.value.code == 2
         assert "--json can only be used with" in capsys.readouterr().err
 
-    def test_token_status_with_json_rejected(self, capsys):
-        with patch.object(sys, "argv", ["claude-swap", "--list", "--token-status", "--json"]):
-            with pytest.raises(SystemExit) as excinfo:
-                cli.main()
-        assert excinfo.value.code == 2
-        assert "--token-status cannot be combined with --json" in capsys.readouterr().err
+    def test_token_status_with_json_adds_the_family_field(self, capsys):
+        """CON-1595: the combination used to be rejected; now the diagnostics
+        ride as the additive ``tokenFamily`` field (see test_token_family_heal)."""
+        payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--list", "--token-status", "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=True, json_output=True,
+        )
+        assert json.loads(capsys.readouterr().out) == payload
 
     def test_list_json_serialized_to_stdout(self, capsys):
         payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}

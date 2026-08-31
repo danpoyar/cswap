@@ -18,6 +18,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    LiveSessionRefusal,
     LockError,
     SessionError,
     SwitchError,
@@ -234,6 +235,21 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     if status.startswith(prefix):
         return f"{source}: {status.removeprefix(prefix)}"
     return f"{source}: {status}"
+
+
+def _token_state(credentials: str) -> str:
+    """One-word OAuth token state for the ``tokenFamily`` JSON field:
+    ``fresh`` / ``expired`` / ``missing`` (no usable pair) /
+    ``unknown-expiry`` — the same judgement ``build_token_status`` prints."""
+    if not credentials:
+        return "missing"
+    data = oauth.extract_oauth_data(credentials)
+    if not data or not data.get("accessToken"):
+        return "missing"
+    expires_at = data.get("expiresAt")
+    if not isinstance(expires_at, (int, float)):
+        return "unknown-expiry"
+    return "expired" if oauth.is_oauth_token_expired(expires_at) else "fresh"
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -1886,6 +1902,52 @@ class ClaudeAccountSwitcher:
         if backup_line is not None:
             lines.append(backup_line)
         return lines + token_lines
+
+    def _token_family_fields(
+        self, account_info: tuple[int, str, str, str, bool, str, str]
+    ) -> dict | None:
+        """The ``tokenFamily`` field of ``list --json --token-status`` (CON-1595).
+
+        Machine-readable twin of :meth:`_token_status_lines` — the signal the
+        human output printed for a day before the 2026-08-31 incident
+        ("session profile: fresh / stored backup: expired") and nobody read.
+        Parked slot: ``backup`` and ``profile`` states (``fresh`` / ``expired``
+        / ``missing`` / ``unknown-expiry``; ``profile`` also ``ignored`` when
+        the profile is logged in as another account), plus — when both copies
+        exist — ``diverged`` (different token lineages: the profile's claude
+        rotated past the backup, or a re-login moved the backup) and
+        ``liveSession`` (a ``cswap run`` claude owns the profile: the divergence
+        is expected and ``switch`` refuses; without one, ``switch``/auto heal
+        it on activation and ``cswap refresh N`` resyncs it by hand). Active
+        slot: ``{"active": state}`` — its live login is Claude Code's store,
+        not a copy to compare. API-key slots carry no field.
+        """
+        num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        if looks_like_api_key(creds):
+            return None
+        if is_active:
+            return {"active": _token_state(creds)}
+        from claude_swap.session import (
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        family: dict = {"backup": _token_state(creds)}
+        session_dir = self._session_dir(str(num), email)
+        session_creds = read_session_credentials(session_dir)
+        if not session_creds:
+            family["profile"] = "missing"
+            return family
+        if session_identity_drifted(session_dir, email, org_uuid):
+            family["profile"] = "ignored"
+            return family
+        family["profile"] = _token_state(session_creds)
+        if creds:
+            family["diverged"] = oauth.credential_fingerprint(
+                creds
+            ) != oauth.credential_fingerprint(session_creds)
+        family["liveSession"] = bool(self._live_session_pids(str(num), email))
+        return family
 
     def _live_session_pids(self, account_num: str, email: str) -> list[int]:
         """PIDs of Claude instances running against an account's session profile."""
@@ -4327,12 +4389,19 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry],
+        token_status: bool = False,
     ) -> dict:
-        """Build the ``--list --json`` payload from gathered account + usage data."""
+        """Build the ``--list --json`` payload from gathered account + usage data.
+
+        ``token_status`` (``--token-status``, CON-1595) adds the additive
+        per-account ``tokenFamily`` field — opt-in because it reads every
+        slot's backup and profile credential and probes live sessions.
+        """
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
-        for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        for info in accounts_info:
+            num, email, org_name, org_uuid, is_active, _, alias = info
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -4340,22 +4409,25 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
-            accounts.append(
-                account_row(
-                    num, email, org_name, org_uuid, is_active,
-                    entry.decision_value(),
-                    usage_fetched_at=entry.fetched_at,
-                    usage_age_s=entry.age_s,
-                    last_good_usage=entry.last_good,
-                    last_error=entry.last_error,
-                    consecutive_failures=entry.consecutive_failures,
-                    alias=alias,
-                    disabled=self._disabled_from_data(seq_data, str(num)),
-                    next_poll_at=entry.next_poll_at,
-                    token_expired_at=entry.token_expired_at,
-                    inference_token=self.has_inference_token(email),
-                )
+            row = account_row(
+                num, email, org_name, org_uuid, is_active,
+                entry.decision_value(),
+                usage_fetched_at=entry.fetched_at,
+                usage_age_s=entry.age_s,
+                last_good_usage=entry.last_good,
+                last_error=entry.last_error,
+                consecutive_failures=entry.consecutive_failures,
+                alias=alias,
+                disabled=self._disabled_from_data(seq_data, str(num)),
+                next_poll_at=entry.next_poll_at,
+                token_expired_at=entry.token_expired_at,
+                inference_token=self.has_inference_token(email),
             )
+            if token_status:
+                family = self._token_family_fields(info)
+                if family is not None:
+                    row["tokenFamily"] = family
+            accounts.append(row)
         payload = {
             "schemaVersion": SCHEMA_VERSION,
             "activeAccountNumber": active_num,
@@ -4406,7 +4478,9 @@ class ClaudeAccountSwitcher:
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
 
         if json_output:
-            return self._build_list_payload(accounts_info, entries)
+            return self._build_list_payload(
+                accounts_info, entries, token_status=show_token_status
+            )
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
@@ -5530,7 +5604,12 @@ class ClaudeAccountSwitcher:
                 warnings_out.append(msg)
             return
         if outcome == LIVE_SESSION:
-            raise SwitchError(
+            # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
+            # menu bar shows it with a copy button — instead of a failed action.
+            pids = [
+                int(p) for p in (report.detail or "").split(",") if p.strip().isdigit()
+            ]
+            raise LiveSessionRefusal(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {report.detail}) that rotated the token family "
                 "past the stored backup — activating the stored copy would land "
@@ -5538,7 +5617,10 @@ class ClaudeAccountSwitcher:
                 "would kill one of the two at the next refresh. For a terminal "
                 f"on this slot run: cswap run {account_num} (shares the session "
                 "profile under Claude Code's own lock); or switch to a slot "
-                "without a live session."
+                "without a live session.",
+                account_num=account_num,
+                email=email,
+                pids=pids,
             )
         if outcome == RELOGIN_REQUIRED:
             raise SwitchError(

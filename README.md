@@ -204,6 +204,7 @@ cswap auto                      # Auto-switch when nearing rate limits (see abov
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
+cswap list --json --token-status  # …machine-readable: per-account "tokenFamily"
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias

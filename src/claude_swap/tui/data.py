@@ -31,6 +31,15 @@ from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RunHandoff:
+    """The app's exit result when the user took a refused switch's recipe
+    (CON-1595): ``cswap run <number>`` — executed by :func:`claude_swap.tui.run`
+    once Textual has released the terminal, in that same terminal."""
+
+    number: str
+
+
 @dataclass
 class ActionResult:
     """Outcome of a captured switcher action."""
@@ -38,6 +47,9 @@ class ActionResult:
     ok: bool
     output: str  # captured stdout+stderr, ANSI-colored (render with Text.from_ansi)
     payload: dict | None = None  # structured result for json-capable actions
+    # The captured exception of a failed action: typed refusals carry their
+    # recipe as data (``LiveSessionRefusal``), so the UI can offer it.
+    error: ClaudeSwitchError | None = None
 
     @property
     def first_line(self) -> str:
@@ -72,7 +84,7 @@ def run_action(fn: Callable[[], dict | None]) -> ActionResult:
                 payload = fn()
             except ClaudeSwitchError as e:
                 print(f"Error: {e}")
-                return ActionResult(False, buf.getvalue())
+                return ActionResult(False, buf.getvalue(), error=e)
             except EOFError:
                 print("Error: interactive input is not available here.")
                 return ActionResult(False, buf.getvalue())
@@ -180,6 +192,7 @@ def clock_stamp() -> str:
 
 __all__ = [
     "ActionResult",
+    "RunHandoff",
     "SnapshotSource",
     "format_age",
     "format_duration",

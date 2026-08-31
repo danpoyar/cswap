@@ -1147,6 +1147,38 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
+        # CON-1595: the backup may be a CONSUMED generation — a `cswap run`
+        # session on this slot rotated the family inside its profile and
+        # nothing synced it back (CON-1579). Freshening from that backup
+        # POSTs a consumed grant, the server answers invalid_grant, and an
+        # alive slot got quarantined (one rotation candidate fewer, for a
+        # dead-lineage verdict that was false). Same judge as `switch`: heal
+        # the backup from the profile first (adopt a fresh generation without
+        # a POST, refresh an expired one with the PROFILE's grant), then judge
+        # expiry off the healed copy. Lazy import: refresh imports session,
+        # which the switcher import chain already loads.
+        from claude_swap.refresh import (
+            DEFERRED,
+            LIVE_SESSION,
+            NO_CREDENTIALS,
+            RELOGIN_REQUIRED,
+            TRANSIENT_ERROR,
+            heal_backup_before_activation,
+        )
+
+        report = heal_backup_before_activation(
+            self.switcher, number, email,
+            self.switcher.account_identity(number).get("organizationUuid", ""),
+        )
+        if report.outcome == LIVE_SESSION:
+            # A session appeared between the check above and the heal's own.
+            return "skip-live-session"
+        if report.outcome == RELOGIN_REQUIRED:
+            # The profile's grant — the family's newest — was rejected: the
+            # lineage really is dead, quarantine is the truthful verdict.
+            return "invalid_grant"
+        if report.outcome in (TRANSIENT_ERROR, DEFERRED, NO_CREDENTIALS):
+            return "transient"
         creds = self.switcher.read_account_credentials(number, email)
         # A pending spilled rotation (CON-849) supersedes the stored bytes:
         # the backup holds the consumed predecessor, and refreshing or

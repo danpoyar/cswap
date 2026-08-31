@@ -39,5 +39,22 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
         drain_stdin()
     except Exception:
         pass
-    app.run()
+    result = app.run()
+    from claude_swap.tui.data import RunHandoff
+
+    if isinstance(result, RunHandoff):
+        # CON-1595: the user took a refused switch's recipe (a live `cswap
+        # run` session owns the slot's token family). Textual has released
+        # the terminal — exec `cswap run N` right here, where the operator
+        # already is. SessionManager.run execs claude and never returns; a
+        # launch failure is reported the way the CLI reports it.
+        from claude_swap.exceptions import ClaudeSwitchError
+        from claude_swap.printer import error
+        from claude_swap.session import SessionManager
+
+        try:
+            SessionManager(switcher).run(result.number, [])
+        except ClaudeSwitchError as e:
+            error(str(e))
+            return 1
     return app.return_code or 0

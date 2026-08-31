@@ -18,13 +18,20 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.exceptions import LiveSessionRefusal
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
-from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
+from claude_swap.tui.data import (
+    ActionResult,
+    RunHandoff,
+    SnapshotSource,
+    format_duration,
+    run_action,
+)
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
@@ -258,6 +265,9 @@ class CswapApp(App):
         self.busy = False
         self.request_refresh()
         if not result.ok:
+            if isinstance(result.error, LiveSessionRefusal):
+                self._offer_run_handoff(result.error)
+                return
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
         payload = result.payload or {}
@@ -274,6 +284,37 @@ class CswapApp(App):
             self.push_screen(OutputModal(label, result.output))
         elif result.first_line:
             self.notify(result.first_line)
+
+    def _offer_run_handoff(self, refusal: LiveSessionRefusal) -> None:
+        """A switch refused because a live ``cswap run`` session owns the slot's
+        token family (CON-1579): offer the recipe instead of a failed action
+        (CON-1595). On yes the app exits with a :class:`RunHandoff` and
+        :func:`claude_swap.tui.run` execs ``cswap run N`` in this terminal —
+        Textual owns the terminal while the app runs, so the exec can only
+        happen after it releases it."""
+        pids = ", ".join(str(p) for p in refusal.pids) or "unknown"
+        self.push_screen(
+            ConfirmModal(
+                f"Account {refusal.account_num} ({refusal.email}) is running a "
+                f"live agent session (PID {pids}) that rotated its login past the "
+                "stored copy. Switching the default login onto it would land a "
+                "dead login (Login expired).\n\n"
+                "Open a terminal on this slot instead? claude-swap exits and "
+                f"runs:\n\n    {refusal.command}",
+                title=f"Live session on account {refusal.account_num}",
+                yes_label="Run it",
+            ),
+            partial(self._on_run_handoff, refusal.account_num),
+        )
+
+    def _on_run_handoff(self, number: str, confirmed: bool | None) -> None:
+        if confirmed:
+            self.exit(RunHandoff(number=number))
+        else:
+            self.notify(
+                f"Switch cancelled — account {number} keeps its live session",
+                severity="warning",
+            )
 
     # -- account operations ----------------------------------------------------
 

@@ -37,6 +37,32 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class LiveSessionRefusal(SwitchError):
+    """A switch refused because a live ``cswap run`` session owns the slot's
+    token family (CON-1579/CON-1595).
+
+    The session's claude rotated the family past the stored backup, so
+    activating the backup would land a dead login and sharing the session's
+    copy would kill one of the two at the next refresh. The safe path to a
+    terminal on that slot is ``cswap run N`` — carried here as data so a UI
+    (TUI, menu bar) can offer or perform it instead of printing the text.
+    Still a :class:`SwitchError`: every existing handler keeps catching it.
+    """
+
+    def __init__(
+        self, message: str, *, account_num: str, email: str, pids: list[int]
+    ) -> None:
+        super().__init__(message)
+        self.account_num = account_num
+        self.email = email
+        self.pids = list(pids)
+
+    @property
+    def command(self) -> str:
+        """The recipe: a terminal on the slot, sharing the session profile."""
+        return f"cswap run {self.account_num}"
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 
