@@ -311,6 +311,31 @@ read in one sitting.
   `adopt-real-login` event with both numbers. Fleet-shaped policy; the
   record reconciliation could travel upstream on its own.
 
+- Bootstrap never POSTs the backup's consumed grant over a live profile
+  family (CON-1740; live incident on this fleet, 2026-09-02, slot 29: a
+  `cswap run` under machine overload failed its reuse probe on Keychain
+  timeouts, re-bootstrapped and POSTed the backup grant the live session had
+  already rotated past — `invalid_grant`, lineage condemned, five spawns
+  refused as "condemned" and a P1 "re-login by hand" ticket for a working
+  slot). Now a run whose `claude auth status` probe is inconclusive JOINS the
+  profile when a live claude runs on it (that claude owns the family; a second
+  reader of the same store is what joining a valid profile does anyway),
+  adopts an idle profile's newer generation into the backup before seeding
+  (the one bootstrap POST consumes the family's newest grant), and refuses
+  transiently when the profile's Keychain entry cannot be read over a backup
+  that still equals the seed. `heal_backup_before_activation` reads the
+  profile with `get_password` alone — `item_exists` swallowed a timeout as
+  "absent" and fell through to the consumed plaintext seed, which the heal then
+  judged "backup-current" and `_freshen_target` POSTed. The collector's
+  quarantine parole judges the PROFILE generation too (one read-only usage
+  fetch with the profile credential), so a condemned backup under a fresh
+  live profile heals in one pass instead of after the session exits. A
+  token-seeded profile (`attach-token`) reuses on its seed without spawning
+  `claude auth status` (the probe drops `CLAUDE_CODE_OAUTH_TOKEN` from its env
+  and hangs on the Keychain under overload). Fleet-shaped by construction
+  (profile layout, Keychain timeouts, the CON-1329 token hybrid); offer
+  upstream after it survives the fleet.
+
 ## Syncing with upstream
 
 ```
