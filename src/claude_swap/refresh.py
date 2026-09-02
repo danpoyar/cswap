@@ -39,12 +39,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from claude_swap import macos_keychain
 from claude_swap.claude_locks import CREDENTIALS_STALENESS_S, proper_lockfile
 from claude_swap.exceptions import LockError
 from claude_swap.inference_token import is_inference_token_credentials
 from claude_swap.locking import FileLock
-from claude_swap.models import Platform
 from claude_swap.oauth import (
     credential_fingerprint,
     extract_oauth_data,
@@ -55,7 +53,7 @@ from claude_swap.session import (
     SEED_FINGERPRINT_FILE,
     STALE_MARKER,
     delete_macos_keychain_entry,
-    keychain_service_name,
+    read_profile_generation,
     read_seed_fingerprint,
     session_identity_drifted,
 )
@@ -110,28 +108,11 @@ def _read_profile_credentials(
     when a hashed keychain entry EXISTS but cannot be read, the plaintext
     below it is a consumed predecessor — POSTing it risks the documented
     reuse reaction (whole-login revocation), so the caller must defer
-    rather than fall back.
+    rather than fall back. One reader for every such caller (CON-1740,
+    review r.1): ``session.read_profile_generation``; the old name stays
+    for this module.
     """
-    if not session_dir.is_dir():
-        return None, None
-    if Platform.detect() == Platform.MACOS:
-        service = keychain_service_name(session_dir)
-        account = macos_keychain.keychain_account_name()
-        try:
-            if macos_keychain.item_exists(service, account):
-                creds = macos_keychain.get_password(service, account)
-                if not creds:
-                    return None, "keychain entry unreadable"
-                return creds, None
-        except macos_keychain.KeychainError:
-            return None, "keychain unavailable"
-    try:
-        return (
-            (session_dir / ".credentials.json").read_text(encoding="utf-8"),
-            None,
-        )
-    except (OSError, ValueError):
-        return None, None
+    return read_profile_generation(session_dir)
 
 
 def _reseed_profile(session_dir: Path, credentials: str) -> None:

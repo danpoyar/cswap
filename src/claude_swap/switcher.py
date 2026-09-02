@@ -3035,7 +3035,13 @@ class ClaudeAccountSwitcher:
         return bool(email) and read_inference_token(self.backup_dir, email) is not None
 
     def adopt_profile_family(
-        self, account_num: str, email: str, org_uuid: str, *, locked: bool = False
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        *,
+        locked: bool = False,
+        profile_read: tuple[str | None, str | None] | None = None,
     ) -> bool:
         """Fold the session profile's login family back into backup before the
         profile is wiped or re-seeded with the inference token (CON-1329,
@@ -3058,6 +3064,11 @@ class ClaudeAccountSwitcher:
 
         ``locked=True`` — caller holds ``self.lock_file`` (bootstrap paths):
         writes through the lock-free wrapper; otherwise the locking persist.
+        ``profile_read`` — the caller's ONE ``read_profile_generation`` result
+        (CON-1740, review r.1): a bootstrap that also guards the seed must
+        adopt off the same read, or an intermittent Keychain timeout skips
+        the adoption here and passes the guard there. Without it the profile
+        is read best-effort (``read_session_credentials``).
         Returns True when a generation was adopted.
         """
         from claude_swap.session import (
@@ -3072,7 +3083,10 @@ class ClaudeAccountSwitcher:
             session_dir, email, org_uuid
         ):
             return False
-        profile = read_session_credentials(session_dir)
+        if profile_read is not None:
+            profile = profile_read[0]
+        else:
+            profile = read_session_credentials(session_dir)
         if not profile or is_inference_token_credentials(profile):
             return False
         profile_oauth = oauth.extract_oauth_data(profile)
@@ -3965,6 +3979,42 @@ class ClaudeAccountSwitcher:
         with ThreadPoolExecutor() as executor:
             return dict(executor.map(fetch_one, enumerate(infos)))
 
+    def _parole_candidate(
+        self, info: tuple[int, str, str, str, bool, str, str]
+    ) -> str:
+        """The credential generation a parole probe would actually fetch with.
+
+        For a parked slot whose session profile holds this slot's login
+        family, the collector fetches with the PROFILE credential (read-only;
+        see ``_fetch_account_usage``) — so that generation, not the backup,
+        is the candidate the quarantine must be judged against. A condemned
+        backup under a live session's fresh profile otherwise reads
+        "re-login needed" for as long as the session lives, although one
+        read-only fetch with the profile credential proves the family alive
+        (CON-1740, live incident 2026-09-02: 86 minutes of false alarm and a
+        P1 "re-login by hand" ticket for a working slot). Falls back to the
+        backup bytes for the active slot, a drifted or token-seeded profile,
+        or a profile without a full token pair.
+        """
+        num, email, _org_name, org_uuid, is_active, creds, _alias = info
+        if is_active:
+            return creds
+        from claude_swap.session import (
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(str(num), email)
+        profile = read_session_credentials(session_dir)
+        if not profile or is_inference_token_credentials(profile):
+            return creds
+        if session_identity_drifted(session_dir, email, org_uuid):
+            return creds
+        data = oauth.extract_oauth_data(profile)
+        if not data or not data.get("accessToken") or not data.get("refreshToken"):
+            return creds
+        return profile
+
     @staticmethod
     def _parole_eligible(entry: UsageEntry, creds: str) -> bool:
         """Whether a quarantined slot's candidate credential is a generation
@@ -4043,7 +4093,7 @@ class ClaudeAccountSwitcher:
             for num, info in info_by_num.items()
             if num not in sentinels
             and entries[num].token_dead()
-            and self._parole_eligible(entries[num], info[5])
+            and self._parole_eligible(entries[num], self._parole_candidate(info))
         }
         requested = [
             num
