@@ -682,6 +682,37 @@ class SessionManager:
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
+        # CON-1740: a token-seeded profile (CON-1329) holds the attached
+        # inference token, not a login family — there is nothing for
+        # `claude auth status` to judge that the seed itself does not say,
+        # and the probe drops CLAUDE_CODE_OAUTH_TOKEN from its env and hangs
+        # on the Keychain under overload. Reuse on the seed: the session
+        # authenticates by env precedence (authentication docs, 5 over 7).
+        if not stale and self._token_profile_reusable(
+            session_dir, account_num, email, org_uuid
+        ):
+            self._sync_sharing(session_dir, share, share_history)
+            return session_dir, account_num, email
+
+        # CON-1740 (live incident 2026-09-02, slot 29): the probe fails for
+        # reasons that are not "logged out" — `claude auth status` timing
+        # out or its Keychain read timing out under machine overload. A
+        # re-bootstrap over a LIVE session's profile then POSTs the backup's
+        # grant, which that session already rotated past (the backup is the
+        # consumed seed generation): invalid_grant, the lineage condemned,
+        # every later spawn refused as "condemned" — while the live claude
+        # keeps working on the family the whole time. The live claude owns
+        # the family; a second process reading the same store is exactly
+        # what a second `cswap run` joining a valid profile does anyway.
+        if not stale and self._joinable_live_profile(session_dir, email, org_uuid):
+            self._logger.warning(
+                f"Account-{account_num}: reuse probe inconclusive under a live "
+                "session — joining the profile instead of re-bootstrapping "
+                "(a bootstrap would POST the backup grant its claude already "
+                "rotated past; CON-1740)"
+            )
+            self._sync_sharing(session_dir, share, share_history)
+            return session_dir, account_num, email
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
@@ -700,7 +731,13 @@ class SessionManager:
                 )
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
-            if self._is_session_valid(session_dir, email, org_uuid):
+            if self._is_session_valid(session_dir, email, org_uuid) or (
+                self._token_profile_reusable(session_dir, account_num, email, org_uuid)
+            ):
+                self._sync_sharing(session_dir, share, share_history)
+                return session_dir, account_num, email
+            # Re-judged under the lock: a session may have landed meanwhile.
+            if self._joinable_live_profile(session_dir, email, org_uuid):
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
@@ -743,6 +780,15 @@ class SessionManager:
                 "attached inference token (login kept for quota)"
             )
         else:
+            # CON-1740: whatever generation the idle profile still holds may
+            # be NEWER than the backup (its claude rotated the family and
+            # nothing synced it back — CON-1579). Fold it into the backup
+            # first, so the one bootstrap POST below consumes the family's
+            # newest grant and never the consumed seed. Same call the
+            # stale-marker path makes; lock is held here.
+            self.switcher.adopt_profile_family(
+                account_num, email, org_uuid, locked=True
+            )
             creds = self._seed_credentials_from_backup(account_num, email, org_uuid)
 
         # CON-1432 access parity: seed the profile with the machine's CURRENT
@@ -853,6 +899,30 @@ class SessionManager:
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
+            )
+
+        # CON-1740: a backup that still equals the generation this profile
+        # was seeded with is the profile family's consumed predecessor as
+        # soon as the profile rotated once (CON-849 seed guard — the same
+        # rule the collector and `cswap refresh` apply). The adoption above
+        # folds a READABLE newer generation in; when the profile's own copy
+        # cannot be read (Keychain busy under overload — the incident
+        # shape), nothing says whether the backup is consumed, and POSTing
+        # it is the account-death shape. Refuse transiently instead.
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        seed = read_seed_fingerprint(session_dir)
+        if (
+            seed
+            and seed == credential_fingerprint(creds)
+            and self._profile_generation_unreadable(session_dir)
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}): the profile's own credential "
+                "cannot be read right now (Keychain busy) and the stored backup "
+                "is the generation that seeded it — it may already be consumed "
+                "by the profile's claude. Not POSTing it (a consumed grant "
+                "replayed is the documented reuse signal). Retry shortly; the "
+                "profile keeps its generation (CON-1740)."
             )
 
         # One refresh so the profile starts with a fresh access token; persist
@@ -1030,6 +1100,73 @@ class SessionManager:
         discard_profile_dir(session_dir, self._logger)
 
     # -- validation ------------------------------------------------------
+
+    def _token_profile_reusable(
+        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+    ) -> bool:
+        """Whether the profile is seeded with the slot's CURRENT attached
+        inference token (plaintext seed equals the token credential) and still
+        carries this slot's identity — valid without spawning claude."""
+        token = self.switcher.inference_token_for(account_num, email)
+        if not token or not session_dir.is_dir():
+            return False
+        try:
+            seed = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return False
+        if seed != inference_token_credentials(token):
+            return False
+        return not session_identity_drifted(session_dir, email, org_uuid)
+
+    def _joinable_live_profile(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> bool:
+        """Whether a run may join the profile as-is although the reuse probe
+        did not say "valid" (CON-1740).
+
+        True when a live claude runs against the profile, the profile is
+        still this slot's identity, and its credential is either unreadable
+        right now (Keychain busy — the live claude reads it at its own pace)
+        or a full OAuth token pair. A readable credential WITHOUT a token
+        pair is claude's invalid_grant wipe: the family is dead in the
+        profile and only the backup grant can judge the slot — bootstrap.
+        """
+        if not session_dir.is_dir() or not live_sessions_for(session_dir):
+            return False
+        if session_identity_drifted(session_dir, email, org_uuid):
+            return False
+        if Platform.detect() == Platform.MACOS:
+            try:
+                creds = macos_keychain.get_password(
+                    keychain_service_name(session_dir), _keychain_account_name()
+                )
+            except KeychainError:
+                return True  # unreadable now — the live claude owns it
+            if creds is None:
+                creds = read_session_credentials(session_dir)
+        else:
+            creds = read_session_credentials(session_dir)
+        if not creds:
+            return False
+        from claude_swap.oauth import extract_oauth_data
+
+        data = extract_oauth_data(creds)
+        return bool(data and data.get("accessToken") and data.get("refreshToken"))
+
+    @staticmethod
+    def _profile_generation_unreadable(session_dir: Path) -> bool:
+        """Whether the profile's newest generation exists but cannot be read
+        (macOS hashed Keychain entry: a timeout / locked keychain). A missing
+        entry is not "unreadable" — the plaintext seed is then the truth."""
+        if not session_dir.is_dir() or Platform.detect() != Platform.MACOS:
+            return False
+        try:
+            macos_keychain.get_password(
+                keychain_service_name(session_dir), _keychain_account_name()
+            )
+        except KeychainError:
+            return True
+        return False
 
     def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
         """Whether claude sees the profile as logged in with the right identity.

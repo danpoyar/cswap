@@ -117,14 +117,20 @@ def _read_profile_credentials(
     if Platform.detect() == Platform.MACOS:
         service = keychain_service_name(session_dir)
         account = macos_keychain.keychain_account_name()
+        # ``get_password`` alone (CON-1740): ``item_exists`` swallows a
+        # timeout as "absent", and under machine overload that false
+        # "absent" fell through to the plaintext seed — the CONSUMED
+        # generation — which the heal then judged "backup-current" and the
+        # auto-switch engine POSTed (live incident 2026-09-02, slot 29). A
+        # genuine miss is rc 44 → None; anything else raises.
         try:
-            if macos_keychain.item_exists(service, account):
-                creds = macos_keychain.get_password(service, account)
-                if not creds:
-                    return None, "keychain entry unreadable"
-                return creds, None
+            creds = macos_keychain.get_password(service, account)
         except macos_keychain.KeychainError:
             return None, "keychain unavailable"
+        if creds is not None:
+            if not creds:
+                return None, "keychain entry unreadable"
+            return creds, None
     try:
         return (
             (session_dir / ".credentials.json").read_text(encoding="utf-8"),
