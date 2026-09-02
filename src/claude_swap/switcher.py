@@ -3035,7 +3035,13 @@ class ClaudeAccountSwitcher:
         return bool(email) and read_inference_token(self.backup_dir, email) is not None
 
     def adopt_profile_family(
-        self, account_num: str, email: str, org_uuid: str, *, locked: bool = False
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        *,
+        locked: bool = False,
+        profile_read: tuple[str | None, str | None] | None = None,
     ) -> bool:
         """Fold the session profile's login family back into backup before the
         profile is wiped or re-seeded with the inference token (CON-1329,
@@ -3058,6 +3064,11 @@ class ClaudeAccountSwitcher:
 
         ``locked=True`` — caller holds ``self.lock_file`` (bootstrap paths):
         writes through the lock-free wrapper; otherwise the locking persist.
+        ``profile_read`` — the caller's ONE ``read_profile_generation`` result
+        (CON-1740, review r.1): a bootstrap that also guards the seed must
+        adopt off the same read, or an intermittent Keychain timeout skips
+        the adoption here and passes the guard there. Without it the profile
+        is read best-effort (``read_session_credentials``).
         Returns True when a generation was adopted.
         """
         from claude_swap.session import (
@@ -3072,7 +3083,10 @@ class ClaudeAccountSwitcher:
             session_dir, email, org_uuid
         ):
             return False
-        profile = read_session_credentials(session_dir)
+        if profile_read is not None:
+            profile = profile_read[0]
+        else:
+            profile = read_session_credentials(session_dir)
         if not profile or is_inference_token_credentials(profile):
             return False
         profile_oauth = oauth.extract_oauth_data(profile)

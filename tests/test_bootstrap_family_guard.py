@@ -46,14 +46,17 @@ import pytest
 from claude_swap import macos_keychain, oauth
 from claude_swap import session as session_mod
 from claude_swap.exceptions import SessionError
+from claude_swap.inference_token import inference_token_credentials
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.refresh import DEFERRED, heal_backup_before_activation
 from claude_swap.session import (
     SEED_FINGERPRINT_FILE,
+    STALE_MARKER,
     SessionManager,
     keychain_service_name,
+    mark_session_stale,
     session_dir_for,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -213,6 +216,30 @@ def _busy_keychain(session_dir: Path):
     return patch.object(macos_keychain, "get_password", busy_get)
 
 
+def _flaky_keychain(session_dir: Path, failures: int):
+    """The profile's hashed entry times out for the first ``failures`` reads
+    and reads fine afterwards — the intermittent-overload shape (review r.1
+    repro: a swallowed adoption read followed by a successful guard read)."""
+    service = keychain_service_name(session_dir)
+    real_get = macos_keychain.get_password
+    seen = {"n": 0}
+
+    def flaky_get(svc, account):
+        if svc == service:
+            seen["n"] += 1
+            if seen["n"] <= failures:
+                raise KeychainError("security find-generic-password timed out after 5.0s")
+        return real_get(svc, account)
+
+    return patch.object(macos_keychain, "get_password", flaky_get)
+
+
+def _profile_entry(block_real_keychain, session_dir: Path):
+    return block_real_keychain.get_password(
+        keychain_service_name(session_dir), macos_keychain.keychain_account_name()
+    )
+
+
 def _entry(switcher):
     identity = {ACCOUNT_NUM: (ACCOUNT_EMAIL, ORG_UUID)}
     return switcher._usage_store.entries(identity)[ACCOUNT_NUM]
@@ -294,28 +321,99 @@ class TestSetupSessionOverRotatedProfile:
 
 
 class TestTokenProfileReuseWithoutProbe:
-    def test_token_seeded_profile_is_valid_without_spawning_claude(
-        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
-    ):
-        """A slot on the year-long inference token: the profile holds the
-        token credential, not a login family — nothing to probe with
-        ``claude auth status`` (which drops the token from its env and, under
-        overload, hangs on the Keychain). Reuse on the seed alone; the
-        session authenticates by env precedence (CON-1740, K2)."""
-        from claude_swap.inference_token import inference_token_credentials
+    TOKEN = "sk-ant-oat01-" + "x" * 96
 
-        token = "sk-ant-oat01-" + "x" * 96
-        with patch.object(switcher, "inference_token_for", return_value=token):
-            (rotated_profile / ".credentials.json").write_text(
-                inference_token_credentials(token), encoding="utf-8"
-            )
+    def test_token_seeded_profile_is_valid_without_spawning_claude(
+        self, manager, switcher, rotated_profile, post_spy,
+    ):
+        """RED on main (review r.1): the probe `claude auth status` spawned
+        FIRST; a slot on the year-long inference token has nothing for it to
+        judge, and under overload it hangs on the Keychain. Reuse on the seed
+        alone; the session authenticates by env precedence (CON-1740, K2)."""
+        creds = inference_token_credentials(self.TOKEN)
+        (rotated_profile / ".credentials.json").write_text(creds, encoding="utf-8")
+        with (
+            patch.object(switcher, "inference_token_for", return_value=self.TOKEN),
+            patch.object(
+                session_mod.subprocess, "run",
+                side_effect=AssertionError("claude auth status spawned for a token profile"),
+            ),
+        ):
             session_dir, _, _ = manager.setup_session("2", share=False)
 
         assert session_dir == rotated_profile
         assert post_spy == []
-        assert (rotated_profile / ".credentials.json").read_text(
+        assert (rotated_profile / ".credentials.json").read_text(encoding="utf-8") == creds
+
+    def test_token_profile_after_claude_moved_the_seed_reuses_without_probe(
+        self, manager, switcher, rotated_profile, post_spy, block_real_keychain,
+    ):
+        """The fleet shape (review r.1: 19 of 19 profiles carry no plaintext):
+        claude moved the seed into the hashed keychain entry; on disk only the
+        seed stamp and the identity remain. Judged by the stamp — no probe,
+        no Keychain read (the entry is busy here and it must not matter)."""
+        creds = inference_token_credentials(self.TOKEN)
+        (rotated_profile / ".credentials.json").unlink()
+        (rotated_profile / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(creds), encoding="utf-8"
+        )
+        block_real_keychain.set_password(
+            keychain_service_name(rotated_profile),
+            macos_keychain.keychain_account_name(),
+            creds,
+        )
+        with (
+            patch.object(switcher, "inference_token_for", return_value=self.TOKEN),
+            patch.object(
+                session_mod.subprocess, "run",
+                side_effect=AssertionError("claude auth status spawned for a token profile"),
+            ),
+            _busy_keychain(rotated_profile),
+        ):
+            session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert session_dir == rotated_profile
+        assert post_spy == []
+        assert not (rotated_profile / ".credentials.json").exists()
+
+    def test_token_profile_seeded_with_another_token_is_reseeded(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """A different token attached since (detach/attach): the stamp no
+        longer matches — the ordinary path re-seeds with the CURRENT token and
+        stamps the bare token credential's fingerprint (before the
+        shared-fields compose), so the next run reuses it by the stamp."""
+        old = inference_token_credentials("sk-ant-oat01-" + "o" * 96)
+        new_token = "sk-ant-oat01-" + "n" * 96
+        (rotated_profile / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(old), encoding="utf-8"
+        )
+        block_real_keychain.set_password(
+            keychain_service_name(rotated_profile),
+            macos_keychain.keychain_account_name(),
+            old,
+        )
+        with patch.object(switcher, "inference_token_for", return_value=new_token):
+            session_dir, _, _ = manager.setup_session("2", share=False)
+
+        plaintext = json.loads(
+            (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        )
+        assert plaintext["claudeAiOauth"]["accessToken"] == new_token
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
             encoding="utf-8"
-        ) == inference_token_credentials(token)
+        ) == oauth.credential_fingerprint(inference_token_credentials(new_token))
+        assert post_spy == []  # a token seed never POSTs a family grant
+        with (
+            patch.object(switcher, "inference_token_for", return_value=new_token),
+            patch.object(
+                session_mod.subprocess, "run",
+                side_effect=AssertionError("re-seeded token profile still probed"),
+            ),
+        ):
+            again, _, _ = manager.setup_session("2", share=False)
+        assert again == session_dir
 
 
 class TestHealDefersOnUnknownKeychain:
@@ -398,3 +496,62 @@ class TestParoleByProfileGeneration:
 
         fetch.assert_not_called()
         assert entries[ACCOUNT_NUM].sentinel == USAGE_RELOGIN_REQUIRED
+
+
+class TestOneReadFeedsAdoptionAndGuard:
+    """Review r.1, Critical: the adoption and the seed guard judged two
+    DIFFERENT Keychain reads — an intermittent timeout skipped the adoption
+    (swallowed → plaintext seed == backup → nothing to adopt) and passed the
+    guard (second read fine) → the consumed backup was POSTed after all."""
+
+    def test_intermittent_timeout_never_posts_the_seed(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """RED before r.1: `POSTed grants: ['BACKUP']`, lineage condemned."""
+        with _flaky_keychain(rotated_profile, failures=1), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert not _entry(switcher).token_dead()
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+
+    def test_stale_marker_over_unreadable_profile_keeps_the_family(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """RED before r.1: the stale-marker path adopted off a swallowed read,
+        invalidated the profile (newest generation and seed stamp destroyed)
+        and the bootstrap POSTed the consumed backup. Now the marker is kept
+        for a later run and nothing is touched."""
+        mark_session_stale(rotated_profile)
+
+        with _busy_keychain(rotated_profile), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert (rotated_profile / STALE_MARKER).exists()  # deferred, not lost
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert not _entry(switcher).token_dead()
+
+    def test_stale_marker_over_readable_profile_adopts_then_reseeds(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+    ):
+        """Readable: the stale path adopts the profile generation, invalidates,
+        and the bootstrap POSTs the ADOPTED grant — never the seed."""
+        mark_session_stale(rotated_profile)
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert post_spy == [PROFILE_GEN]
+        assert not (session_dir / STALE_MARKER).exists()
+        rotated = _creds("at-rotated", "rt-rotated")
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == rotated
+        assert not _entry(switcher).token_dead()
