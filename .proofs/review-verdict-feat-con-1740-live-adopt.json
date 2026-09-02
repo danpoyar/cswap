@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-1740",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "c834fb9d05de850e4bfd69329b0238be07581b9e",
+  "summary": "раунд 2: Important-находки р.1 закрыты — одно чтение read_profile_generation питает адопцию и страж (репро р.1: reads=['read_profile_generation'], POSTed=[]; 6 паттернов стейл+бутстрап с перемежающимися таймаутами — seed не POST-ится ни разу), токен-профиль судится штампом до пробы (spawns=[]); 565 passed в пяти сьютах, полный сьют 2032 passed rc=0, краснота новых тестов на 40ab62b подтверждена (5 failed / 8 passed); фактических нет, можно принимать; альтернативы: judged",
+  "findings": []
+}
