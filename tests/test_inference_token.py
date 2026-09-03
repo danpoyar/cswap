@@ -16,7 +16,10 @@ Contract (one case per letter, mirrored in the fleet ticket):
       token with zero refresh attempts;
   (g) without a token the launch env carries no ``CLAUDE_CODE_OAUTH_TOKEN``
       and the profile is seeded from the login as before;
-  (h) the active-login fast path never injects the token;
+  (h) the active-login fast path is skipped when a token is attached: the
+      slot runs in session mode on the token (CON-1971) — a detach between
+      that decision and the seed refuses the launch instead of seeding the
+      login's family; without a token the fast path is unchanged;
   (i) attaching invalidates an already-seeded profile so the next run
       re-seeds it with the token;
   (j) CLI: ``attach-token N -`` reads stdin and dispatches, ``detach-token N``
@@ -405,15 +408,74 @@ class TestRun:
         assert (session_dir / ".credentials.json").read_text() == ROTATED
         assert len(refresh_calls) == 1
 
-    def test_fast_path_never_injects(
+    def test_token_slot_on_active_login_takes_session_mode(
+        self,
+        manager,
+        switcher,
+        capture_exec,
+        monkeypatch,
+        capsys,
+        auth_status_tracks_seed,
+        dead_family,
+    ):
+        # CON-1971: the same-account fast path exists so that no second copy
+        # of the login's refresh family is ever made; a slot with an attached
+        # inference token seeds its profile with the token instead, so the
+        # ACTIVE login's slot runs in session mode too — a background agent
+        # landed on the terminal's account lives in its own profile (a global
+        # switch does not move it) and never rotates the family under the
+        # terminal. Zero POSTs of the login's grant along the way.
+        switcher.attach_inference_token(NUM, TOKEN)
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: (EMAIL, ORG))
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(NUM, [])
+        session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+        assert exc.value.env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+        seeded = json.loads((session_dir / ".credentials.json").read_text())
+        assert seeded["claudeAiOauth"]["accessToken"] == TOKEN
+        assert dead_family == []
+        out = capsys.readouterr().out
+        assert "inference token is attached — session mode" in out
+        assert "launching claude directly" not in out
+
+    def test_fast_path_without_token_unchanged(
         self, manager, switcher, capture_exec, monkeypatch, capsys
     ):
-        switcher.attach_inference_token(NUM, TOKEN)
+        # No token attached — the same-account fast path is exactly as before:
+        # plain claude on the untouched environment.
         monkeypatch.setattr(switcher, "_get_current_account", lambda: (EMAIL, ORG))
         with pytest.raises(_ExecCalled) as exc:
             manager.run(NUM, [])
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in exc.value.env
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "launching claude directly" in capsys.readouterr().out
+
+    def test_token_detached_after_session_mode_decision_refuses_family_seed(
+        self,
+        manager,
+        switcher,
+        capture_exec,
+        monkeypatch,
+        capsys,
+        auth_status_tracks_seed,
+        refresh_calls,
+    ):
+        # CON-1971 (review r.1, Minor): the session-mode decision reads the
+        # token outside the lock, the seed reads it again under the lock. A
+        # detach in between must NOT fall through to the family seed — that
+        # would POST the ACTIVE login's refresh family under the terminal
+        # (the CON-1579 harm class). The launch refuses instead, with zero
+        # POSTs and no profile credentials written.
+        switcher.attach_inference_token(NUM, TOKEN)
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: (EMAIL, ORG))
+        monkeypatch.setattr(switcher, "inference_token_for", lambda *a, **k: None)
+        with pytest.raises(SessionError, match="detached"):
+            manager.run(NUM, [])
+        assert refresh_calls == []
+        session_dir = session_dir_for(switcher.backup_dir, NUM, EMAIL)
+        assert not (session_dir / ".credentials.json").exists()
+        assert "launching claude directly" not in capsys.readouterr().out
 
     def test_attach_reseeds_existing_profile(
         self, manager, switcher, capture_exec, auth_status_tracks_seed, refresh_calls

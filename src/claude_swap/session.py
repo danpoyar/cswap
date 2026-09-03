@@ -560,6 +560,10 @@ class SessionManager:
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
 
+        # CON-1971: set when the same-account fast path was skipped BECAUSE
+        # of an attached token — the seed under the lock must then find the
+        # token too (see _bootstrap), never fall back to the login's family.
+        token_session = False
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
@@ -576,13 +580,34 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
+                if self.switcher.has_inference_token(email):
+                    token_session = True
+                    # CON-1971: an attached inference token makes the fast
+                    # path's reason moot — the profile is seeded with the
+                    # token (see _bootstrap), not with a second copy of the
+                    # login's refresh family, so a session of the ACTIVE
+                    # account can live in its own CLAUDE_CONFIG_DIR: a global
+                    # switch does not move it, and it never rotates the
+                    # family under the terminal that owns the login. Before
+                    # this branch a fleet door landing an agent on the
+                    # active slot got plain claude on the terminal's login.
+                    print(
+                        muted(
+                            f"Account-{account_num} ({email}) is the active "
+                            "default login, but an inference token is "
+                            "attached — session mode (the profile runs on "
+                            "the token; no second copy of the login's "
+                            "family is made)."
+                        )
                     )
-                )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                else:
+                    print(
+                        dimmed(
+                            f"Account-{account_num} ({email}) is already the "
+                            "active default login — launching claude directly."
+                        )
+                    )
+                    self._exec(claude_bin, claude_args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -592,7 +617,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, token_session=token_session
         )
 
         print(
@@ -671,9 +696,18 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        token_session: bool = False,
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        ``token_session`` (CON-1971): the caller skipped the same-account fast
+        path because a token was attached — the seed must run on that token
+        or refuse; it must never fall back to the active login's family.
+        """
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
@@ -802,7 +836,9 @@ class SessionManager:
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
-            self._bootstrap(session_dir, account_num, email, org_uuid)
+            self._bootstrap(
+                session_dir, account_num, email, org_uuid, token_session=token_session
+            )
             self._sync_sharing(session_dir, share, share_history)
 
             # A token seed is judged by its stamp, not by a probe that hangs
@@ -822,10 +858,27 @@ class SessionManager:
         return session_dir, account_num, email
 
     def _bootstrap(
-        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+        self,
+        session_dir: Path,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        token_session: bool = False,
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
         token = self.switcher.inference_token_for(account_num, email)
+        if token_session and not token:
+            # CON-1971 (review r.1): the session-mode decision read the token
+            # outside the lock; a detach in between must not fall through to
+            # the family seed — that would POST the ACTIVE login's refresh
+            # family under the terminal that owns it (CON-1579 class).
+            raise SessionError(
+                f"Account-{account_num} ({email}) is the active default login "
+                "and its inference token was detached while this launch was "
+                "starting — seeding the profile from the login's family would "
+                "rotate it under the terminal. Re-attach the token "
+                f"(cswap attach-token {account_num} ...) or run claude directly."
+            )
         # CON-1740 (review r.1): ONE read of the profile's newest generation
         # per bootstrap — the adoption and the seed guard below judge the
         # same bytes and the same "unreadable now" verdict.
