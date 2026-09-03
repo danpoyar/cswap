@@ -576,13 +576,33 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
+                if self.switcher.has_inference_token(email):
+                    # CON-1971: an attached inference token makes the fast
+                    # path's reason moot — the profile is seeded with the
+                    # token (see _bootstrap), not with a second copy of the
+                    # login's refresh family, so a session of the ACTIVE
+                    # account can live in its own CLAUDE_CONFIG_DIR: a global
+                    # switch does not move it, and it never rotates the
+                    # family under the terminal that owns the login. Before
+                    # this branch a fleet door landing an agent on the
+                    # active slot got plain claude on the terminal's login.
+                    print(
+                        muted(
+                            f"Account-{account_num} ({email}) is the active "
+                            "default login, but an inference token is "
+                            "attached — session mode (the profile runs on "
+                            "the token; no second copy of the login's "
+                            "family is made)."
+                        )
                     )
-                )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                else:
+                    print(
+                        dimmed(
+                            f"Account-{account_num} ({email}) is already the "
+                            "active default login — launching claude directly."
+                        )
+                    )
+                    self._exec(claude_bin, claude_args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
