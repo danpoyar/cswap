@@ -147,6 +147,23 @@ read in one sitting.
   moves and same-identity re-logins. Fleet-shaped by construction (the
   fleet's quota gauge is `cswap list --json`); offer upstream only the
   attach/detach + env-injection core once it survives here.
+- A token slot never takes the same-account fast path (CON-1971,
+  2026-09-03): `run` on the slot that IS the active default login used to
+  exec plain claude on the terminal's own login — the fast path exists so
+  that no second copy of the login's refresh family is ever made (a
+  server-side rotation would strand one copy; live incident 2026-08-31,
+  CON-1579). With an inference token attached that reason is moot: the
+  profile is seeded with the token, not with the family, so the active
+  account's slot runs in session mode like every other slot — a fleet
+  agent landed on the terminal's account lives in its own
+  `CLAUDE_CONFIG_DIR`, a global switch does not move it, and the family
+  under the terminal is never rotated by it. Without a token the fast path
+  is exactly as before. Test `test_fast_path_never_injects` (CON-1329)
+  asserted the old behaviour on purpose and was replaced by
+  `test_token_slot_on_active_login_takes_session_mode` +
+  `test_fast_path_without_token_unchanged`. The fleet door presets
+  `CLAUDE_CONFIG_DIR` for such a slot as well (works on either binary);
+  this branch covers every other `cswap run` caller in the fleet.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a
