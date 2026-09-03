@@ -163,7 +163,10 @@ read in one sitting.
   `test_token_slot_on_active_login_takes_session_mode` +
   `test_fast_path_without_token_unchanged`. The fleet door presets
   `CLAUDE_CONFIG_DIR` for such a slot as well (works on either binary);
-  this branch covers every other `cswap run` caller in the fleet.
+  this branch covers every other `cswap run` caller in the fleet. Review
+  r.1: the session-mode decision reads the token outside the lock and the
+  seed reads it again under it — a detach in between refuses the launch
+  (`SessionError`) instead of falling through to the family seed.
 - `list --json` also reports `lastError` + `consecutiveFailures` on a slot
   with an open failure streak (`json_output.fetch_failure_fields`). Upstream
   exposes the last-good measurement but not WHY it stopped moving, so a
