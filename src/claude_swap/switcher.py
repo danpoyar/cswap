@@ -5769,21 +5769,33 @@ class ClaudeAccountSwitcher:
         - the profile is logged in as another account
           (``session_identity_drifted``): it no longer holds this slot's
           family;
-        - the profile holds a full OAuth credential of a DIFFERENT lineage:
-          the heal already judged who ran ahead (the profile ran ahead → it
-          refused with ``LIVE_SESSION``; the backup is newer → a superseded
-          family the session keeps for itself) — nothing shared.
+        - the profile holds a full OAuth credential of a DIFFERENT generation
+          AND the backup moved after the profile was seeded (the seed stamp
+          no longer matches the backup): a re-login/re-add, or the same
+          family's newer generation written on the way out — the profile
+          copy is superseded, nothing is shared.
 
         Equal refresh-token fingerprints = one family about to live in two
-        stores (the heal's "same lineage" outcome) → shared. Anything that
-        cannot be judged (no readable profile credential, no backup to
-        compare against) reads as shared: the callers are a refusal with an
-        explicit override and a daemon skip, and over-reporting defers a
-        destructive activation instead of forking a live family.
+        stores (the heal's "same lineage" outcome) → shared. A differing
+        generation over an UNMOVED backup (seed stamp == backup) means the
+        session rotated the family past the backup: it owns the newest
+        generation → shared. The stale marker is deliberately NOT an oracle
+        here (review r.1 of CON-2030): ``_post_backup_write`` sets it on the
+        live profile at every backup rewrite, including leaving the slot
+        with the same family at the same generation after an
+        ``--even-if-live`` visit — from then on it lies, and the heal's
+        ``_backup_is_newer`` (marker first) would call the consumed backup
+        "newer"; trusting it, the daemon (no blanket PID skip any more)
+        would POST the consumed grant under the live session. Anything that
+        cannot be judged (no readable profile credential, no backup, no seed
+        stamp) reads as shared: the callers are a refusal with an explicit
+        override and a daemon skip, and over-reporting defers a destructive
+        activation instead of forking a live family.
         """
         if self._account_kind(account_num) == "api_key":
             return False
         from claude_swap.session import (
+            read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -5804,9 +5816,13 @@ class ClaudeAccountSwitcher:
         backup = self._read_account_credentials(account_num, email)
         if not backup:
             return True
-        return oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(
-            backup
-        )
+        fp_backup = oauth.credential_fingerprint(backup)
+        if oauth.credential_fingerprint(profile) == fp_backup:
+            return True
+        seed = read_seed_fingerprint(session_dir)
+        # Backup unmoved since seeding (or no stamp to prove it moved): the
+        # profile ran ahead — the live session owns the family.
+        return seed is None or seed == fp_backup
 
     def _perform_switch(
         self,
@@ -5885,7 +5901,8 @@ class ClaudeAccountSwitcher:
                         "the default login there would put one rotating refresh "
                         "token in two stores and kill that session at the next "
                         f"rotation. Use 'cswap run {target_account}' to work under "
-                        "this account, or pass --even-if-live to switch anyway.",
+                        f"this account, or 'cswap switch {target_account} "
+                        "--even-if-live' to switch anyway.",
                         account_num=target_account,
                         email=pre_email,
                         pids=pids,

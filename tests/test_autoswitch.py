@@ -1769,8 +1769,11 @@ class TestFreshening:
         assert any(isinstance(e, ErrorEvent) for e in h.events)
 
     def test_live_session_target_is_skipped_even_with_fresh_token(self, temp_home):
-        # Auto never activates an account that has a live `cswap run` session:
-        # dual refresh-token ownership with nobody reading the warning.
+        # A live `cswap run` session whose profile cannot be shown to run on
+        # something other than the login family holds the slot (CON-2030: no
+        # profile credential here → `_live_session_shares_login` reads
+        # "shared", conservatively): dual refresh-token ownership with nobody
+        # reading the warning.
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
@@ -5742,6 +5745,38 @@ class TestLiveSessionSkipJudgesLoginFamily:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_login_slot_whose_profile_ran_ahead_under_a_lying_marker_is_skipped(
+        self, temp_home
+    ):
+        """Review r.1 (major): leaving a slot after an `--even-if-live` visit
+        rewrites its backup with the same generation and marks the LIVE
+        profile stale (`_post_backup_write`); when that session rotates next,
+        the backup is a consumed generation but the heal's oracle reads the
+        marker first. Without the blanket PID skip the daemon would POST the
+        consumed grant (invalid_grant → quarantine, and the reuse reaction on
+        a live family). The judge trusts the seed stamp instead: backup
+        unmoved since seeding + profile differs → the session owns the
+        family → skip, no POST. RED before the fix."""
+        from claude_swap.session import STALE_MARKER
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)  # consumed generation, long expired
+        h.make_live("a@example.com", 1)
+        session_dir = self._seed_profile(
+            h, 2, "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2-next", "refreshToken": "rt-2-next",
+                "expiresAt": int(h.clock() * 1000) + 3_600_000,
+            }}),
+        )
+        (session_dir / STALE_MARKER).touch()
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]), \
+             patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as post, \
+             patch("claude_swap.refresh.try_refresh_oauth_credentials", post):
+            assert h.engine._freshen_target("2", "b@example.com") == "skip-live-session"
+        post.assert_not_called()
 
     def test_live_api_key_last_resort_still_activates(self, temp_home):
         """Unchanged: an API-key session runs on the static key — no OAuth

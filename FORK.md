@@ -316,8 +316,16 @@ read in one sitting.
   morning (12.5 h mute). Now `_perform_switch` raises the typed
   `LiveSessionRefusal` (PIDs + recipe `cswap run N`; JSON: the error
   envelope) when `_live_session_shares_login` says the profile runs on the
-  slot's own login family: equal refresh-token fingerprints, or a profile
-  that cannot be read at all. Proven-independent sessions keep the old
+  slot's own login family: equal refresh-token fingerprints, a differing
+  generation over a backup the seed stamp says never moved (the session
+  rotated past it), or a profile that cannot be read at all. The judge reads
+  the SEED STAMP, not the stale marker (review r.1): `_post_backup_write`
+  marks a live profile stale on every backup rewrite — leaving the slot
+  after an `--even-if-live` visit included — so the marker lies once the
+  session rotates next, and `_backup_is_newer` would call the consumed
+  backup "newer"; with the daemon's blanket PID skip gone that would have
+  POSTed the consumed grant under the live session. Proven-independent
+  sessions keep the old
   warn-and-proceed: an API-key slot, a token-seeded profile
   (`is_inference_token_credentials` — "holds no login family", CON-1329), a
   profile logged in as another account, or a DIFFERENT family (the heal
