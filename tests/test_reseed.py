@@ -504,12 +504,12 @@ class TestRefusals:
         Claude Code's credential locks for that config dir are held."""
         from contextlib import contextmanager
 
-        from claude_swap import reseed
+        from claude_swap import claude_locks, reseed
 
         s = _make_switcher()
         _incident_slot(s)
         events: list[str] = []
-        real_lock = reseed.proper_lockfile
+        real_lock = claude_locks.proper_lockfile
         real_read = reseed.read_profile_generation
 
         @contextmanager
@@ -523,7 +523,7 @@ class TestRefusals:
             return real_read(session_dir)
 
         with (
-            patch.object(reseed, "proper_lockfile", recording_lock),
+            patch.object(claude_locks, "proper_lockfile", recording_lock),
             patch.object(reseed, "read_profile_generation", recording_read),
         ):
             report = reseed.reseed_account(s, NUM)

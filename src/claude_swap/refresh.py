@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from claude_swap.claude_locks import CREDENTIALS_STALENESS_S, proper_lockfile
+from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.exceptions import LockError
 from claude_swap.inference_token import is_inference_token_credentials
 from claude_swap.locking import FileLock
@@ -289,16 +289,7 @@ def _refresh_resolved(
                     # backup (no POST, no grant consumed) and reseed the
                     # profile bootstrap-shaped, exactly like REFRESHED does —
                     # the hand recipe behind the TOKEN-DRIFT sensor line.
-                    with (
-                        proper_lockfile(
-                            session_dir / ".oauth_refresh.lock",
-                            staleness=CREDENTIALS_STALENESS_S,
-                        ),
-                        proper_lockfile(
-                            session_dir.parent / (session_dir.name + ".lock"),
-                            staleness=CREDENTIALS_STALENESS_S,
-                        ),
-                    ):
+                    with claude_credentials_lock(config_home=session_dir):
                         switcher.write_account_credentials(
                             account_num, email, profile_creds
                         )
@@ -316,14 +307,9 @@ def _refresh_resolved(
             # Exclude a claude pointed at this profile outside cswap: same
             # two locks, same order, as its own refresh path.
             with (
-                proper_lockfile(
-                    session_dir / ".oauth_refresh.lock",
-                    staleness=CREDENTIALS_STALENESS_S,
-                ) if profile_owned else nullcontext(),
-                proper_lockfile(
-                    session_dir.parent / (session_dir.name + ".lock"),
-                    staleness=CREDENTIALS_STALENESS_S,
-                ) if profile_owned else nullcontext(),
+                claude_credentials_lock(config_home=session_dir)
+                if profile_owned
+                else nullcontext()
             ):
                 result = try_refresh_oauth_credentials(
                     candidate, timeout_s=_REFRESH_POST_TIMEOUT_S

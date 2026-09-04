@@ -156,6 +156,58 @@ class TestCcRefreshLockProtocol:
         assert not (temp_home / ".claude" / ".oauth_refresh.lock").exists()
         assert legacy.is_dir()
 
+    def test_credentials_lock_for_config_home_takes_the_profile_pair(
+        self, temp_home, monkeypatch
+    ):
+        """CON-2053: the SAME pair for another config dir (a cswap session
+        profile) comes from the one owner — ``<dir>/.oauth_refresh.lock``
+        then legacy ``<dir>.lock`` — and never touches the global home's."""
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        profile = temp_home / "sessions" / "1-user"
+        profile.mkdir(parents=True)
+        primary = profile / ".oauth_refresh.lock"
+        legacy = temp_home / "sessions" / "1-user.lock"
+        assert claude_locks.oauth_refresh_lock_dir(profile) == primary
+        assert claude_locks.credentials_lock_dir(profile) == legacy
+        with claude_credentials_lock(config_home=profile):
+            assert primary.is_dir(), "profile primary .oauth_refresh.lock not held"
+            assert legacy.is_dir(), "profile legacy <dir>.lock not held"
+            assert not (temp_home / ".claude" / ".oauth_refresh.lock").exists()
+            assert not (temp_home / ".claude.lock").exists()
+        assert not primary.exists()
+        assert not legacy.exists()
+
+    def test_credentials_lock_for_config_home_keeps_cc_order_and_staleness(
+        self, temp_home, monkeypatch
+    ):
+        """The profile pair keeps CC's order (primary → legacy), the 60s
+        credential staleness and the deferred timeout (``None`` → the
+        per-lock ``DEFAULT_TIMEOUT_S`` resolved at call time, review r.1
+        nit) — what refresh/reseed spelled out by hand."""
+        from contextlib import contextmanager
+
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        events: list[tuple[str, float | None, float | None]] = []
+        real = claude_locks.proper_lockfile
+
+        @contextmanager
+        def recording(lock_dir, **kwargs):
+            events.append(
+                (lock_dir.name, kwargs.get("staleness"), kwargs.get("timeout"))
+            )
+            with real(lock_dir, **kwargs):
+                yield
+
+        monkeypatch.setattr(claude_locks, "proper_lockfile", recording)
+        profile = temp_home / "p"
+        profile.mkdir()
+        with claude_credentials_lock(config_home=profile):
+            pass
+        assert events == [
+            (".oauth_refresh.lock", claude_locks.CREDENTIALS_STALENESS_S, None),
+            ("p.lock", claude_locks.CREDENTIALS_STALENESS_S, None),
+        ], events
+
     def test_credentials_staleness_is_60s_not_10s(self, temp_home, monkeypatch):
         """A 30s-old credential lock belongs to a live CC (its budget is 60s)
         and must NOT be stolen — the old 10s staleness stole it."""

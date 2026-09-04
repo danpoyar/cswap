@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2053",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "d9149c0810989196e9cc8e691bb2f3180a59776b",
+  "summary": "р.2: нит р.1 (timeout не закреплён записывающим тестом) починен — дифф 393a522..d9149c0 только tests/test_claude_locks.py: кортеж событий несёт kwargs.get(\"timeout\"), ожидание None у обоих замков пары, регресс timeout=DEFAULT_TIMEOUT_S у хозяина тест ловит; спот-чек tests/test_claude_locks.py → 20 passed совпал с автором, ruff --select F чисто; Important нет, фактических нет, можно принимать; альтернативы: n/a (судились в р.1)",
+  "findings": []
+}
