@@ -8629,14 +8629,20 @@ class TestSwitchRefusesLiveLoginSession:
         assert any("PID 4242" in w for w in result["warnings"])
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
-    def test_superseded_profile_family_keeps_warn_and_proceed(
+    def test_three_generation_shape_is_refused_with_the_override_available(
         self, temp_home: Path, mock_claude_config: Path, _no_token_network
     ):
-        """The CON-1579 review r.1 shape: a re-login/re-add rewrote the BACKUP
-        (B) under the live session, whose profile keeps the older family (A)
-        plus the stale marker; the seed stamp names the generation both
-        started from (neither A nor B) — the backup moved after seeding, so
-        nothing is shared and the existing warn-and-proceed stands."""
+        """The CON-1579 review r.1 shape, re-judged by CON-2052: the BACKUP
+        (B) was rewritten under the live session, whose profile holds another
+        generation (A) plus the stale marker; the seed stamp names the
+        generation both started from (neither A nor B). Until CON-2052 this
+        read as "re-add, nothing shared" and warn-and-proceed stood; the
+        2026-09-04 incident had exactly this fingerprint shape with ONE
+        family (the orchestrator's profile re-written out of band, no
+        re-stamp; the backup rotated by the default login). Fingerprints
+        cannot tell the two apart — refuse, with `--even-if-live` as the
+        explicit override (which keeps the old warn-and-proceed)."""
+        from claude_swap.exceptions import LiveSessionRefusal
         from claude_swap.session import SEED_FINGERPRINT_FILE, STALE_MARKER
 
         s = _live_login_switcher(temp_home)
@@ -8650,10 +8656,15 @@ class TestSwitchRefusesLiveLoginSession:
         (session_dir / STALE_MARKER).touch()
 
         with patch.object(s, "_live_session_pids", return_value=[4242]):
-            result = s.switch_to(_SESSION_NUM, json_output=True)
+            with pytest.raises(LiveSessionRefusal) as exc:
+                s.switch_to(_SESSION_NUM, json_output=True)
+        assert exc.value.pids == [4242]
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(_SESSION_NUM, json_output=True, even_if_live=True)
         assert result["switched"] is True
-        assert any("PID 4242" in w for w in result["warnings"])
+        assert any("PID 4242" in w and "--even-if-live" in w for w in result["warnings"])
 
     def test_profile_that_ran_ahead_under_a_lying_stale_marker_is_refused(
         self, temp_home: Path, mock_claude_config: Path, _no_token_network
@@ -8781,12 +8792,41 @@ class TestLiveSessionSharesLoginJudge:
         (session_dir / SEED_FINGERPRINT_FILE).unlink()
         assert self._judge(s) is True
 
-    def test_backup_rewritten_after_seeding_never_shares(
+    def test_profile_still_at_its_seed_over_a_moved_backup_never_shares(
         self, temp_home: Path, mock_claude_config: Path
     ):
-        """Seed stamp != fp(backup): the backup moved after the profile was
-        seeded (re-login/re-add, or the same family's newer generation written
-        on the way out) — the profile copy is superseded, nothing is shared."""
+        """Seed stamp == fp(profile) != fp(backup): the backup moved after the
+        profile was seeded (re-login/re-add, or the same family's newer
+        generation written on the way out) while the profile still holds the
+        seed generation — the profile copy is provably superseded, nothing is
+        shared."""
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        s = _live_login_switcher(temp_home)
+        # The backup moves FIRST: the backup-write hook drops an idle
+        # profile's copy, so the profile is written after it and stamped
+        # with its own (seed) generation.
+        s.write_account_credentials(
+            _SESSION_NUM, _SESSION_EMAIL, _family_creds("at-moved-2", "rt-moved-2")
+        )
+        seed = _family_creds("at-seed-2", "rt-seed-2")
+        session_dir = _seed_profile_from_backup(s, seed)
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(seed), encoding="utf-8"
+        )
+        assert self._judge(s) is False
+
+    def test_both_sides_moved_after_seeding_reads_as_shared(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """CON-2052 (live incident 2026-09-04 09:00Z): profile, seed stamp and
+        backup are three different generations — the profile rotated (or was
+        re-written out of band, no re-stamp) AND the backup moved. By
+        fingerprints this is indistinguishable from an honest re-add over a
+        lingering old-family session; the incident shape was ONE family, and
+        the daemon (same judge) landed the default login on the
+        orchestrator's live slot three times. Undecidable reads as shared.
+        RED on main: False."""
         from claude_swap.session import SEED_FINGERPRINT_FILE
 
         s = _live_login_switcher(temp_home)
@@ -8795,4 +8835,4 @@ class TestLiveSessionSharesLoginJudge:
             oauth.credential_fingerprint(_family_creds("at-seed-2", "rt-seed-2")),
             encoding="utf-8",
         )
-        assert self._judge(s) is False
+        assert self._judge(s) is True

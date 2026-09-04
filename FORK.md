@@ -318,7 +318,19 @@ read in one sitting.
   envelope) when `_live_session_shares_login` says the profile runs on the
   slot's own login family: equal refresh-token fingerprints, a differing
   generation over a backup the seed stamp says never moved (the session
-  rotated past it), or a profile that cannot be read at all. The judge reads
+  rotated past it), or a profile that cannot be read at all. Since CON-2052
+  (2026-09-04) a profile that moved past its seed while the backup moved
+  too — three generations in three places — is shared as well: by
+  fingerprints that is an honest re-add over a lingering old-family session
+  OR one family forked in two stores, and the live incident was the second
+  (the orchestrator's profile re-written out of band without a re-stamp,
+  the backup rotated by the default login); the daemon, whose
+  `_freshen_target` asks the same judge, landed the login on the live slot
+  three times in a day (09:00Z, 09:47Z, 12:39Z). Only a profile still AT
+  its seed generation over a moved backup stays "superseded, not shared".
+  The daemon now drops such slots from the ranked targets BEFORE the drain
+  gates and dry-run's early exit (`skip-live-login-slot` event with the
+  slot and its PIDs; `no-viable-target` names them). The judge reads
   the SEED STAMP, not the stale marker (review r.1): `_post_backup_write`
   marks a live profile stale on every backup rewrite — leaving the slot
   after an `--even-if-live` visit included — so the marker lies once the
