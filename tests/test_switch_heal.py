@@ -224,6 +224,30 @@ class TestSwitchRefusesDeadLanding:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
+    def test_live_session_ahead_is_adopted_under_even_if_live(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """CON-2069: the fleet's guard returns the login to the home slot with
+        `--even-if-live` while the home's own `cswap run` session is live and
+        rotated ahead of the backup. Instead of the refusal above the backup
+        adopts the session's generation (no POST) and THAT generation lands;
+        the live profile is left alone."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert result["switched"] is True
+        landed = _live_path(temp_home).read_text(encoding="utf-8")
+        assert oauth.extract_access_token(landed) == oauth.extract_access_token(profile)
+        assert oauth.extract_access_token(landed) != oauth.extract_access_token(backup)
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
+        assert any("adopted the session's generation" in w for w in result.get("warnings", []))
+        no_network.assert_not_called()
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] == int(TARGET_NUM)
+
     def test_rejected_grant_is_refused_with_relogin_recipe(
         self, temp_home, mock_claude_config, no_network
     ):

@@ -1696,10 +1696,12 @@ class AutoSwitchEngine:
                     # rotation — not a threshold breach to flee, which is
                     # what re-hoarded a model-fresh account on every tick.
                     # Suspended while the home pin is active (CON-1581): the
-                    # pin already guarantees the fleet a resting login, and
-                    # the pinned login's own work is model-pinned — resting
-                    # it on a model-burned host is the mute terminal the
-                    # model-window escape above exists to end.
+                    # pin already guarantees the fleet a resting login, so
+                    # away from home (a failover or a manual switch) the
+                    # login is coming home anyway and a model-aware landing
+                    # is the cheaper wait (CON-2069: at home the pin holds
+                    # regardless of the model window — this branch only runs
+                    # away from home).
                     base_h = base_headroom.get(current)
                     if base_h is not None:
                         utilization = 100.0 - base_h

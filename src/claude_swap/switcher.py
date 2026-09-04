@@ -5657,6 +5657,7 @@ class ClaudeAccountSwitcher:
         data: dict,
         emit_output: bool,
         warnings_out: list[str],
+        even_if_live: bool = False,
     ) -> None:
         """Refuse or heal a target whose stored backup lags its session profile.
 
@@ -5713,11 +5714,39 @@ class ClaudeAccountSwitcher:
                 warnings_out.append(msg)
             return
         if outcome == LIVE_SESSION:
-            # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
-            # menu bar shows it with a copy button — instead of a failed action.
             pids = [
                 int(p) for p in (report.detail or "").split(",") if p.strip().isdigit()
             ]
+            if even_if_live:
+                # CON-2069: the fleet's guard brings the login home with
+                # `switch <home> --even-if-live` while the home's own `cswap
+                # run` sessions are live and may have rotated the family past
+                # the backup. The override is the user's explicit word (the
+                # config repo's ADR 0020 accepts two copies of the family on
+                # the home slot); refusing here left the login stranded on a
+                # fleet seat (critic C2 of that ADR). Adopt the profile's
+                # newer generation into the backup — no POST, the seed stamp
+                # re-stamped, the live profile untouched — and land THAT
+                # generation, never the consumed one.
+                adopted = self.adopt_profile_family(account_num, email, org_uuid)
+                if adopted:
+                    msg = (
+                        f"Account-{account_num}'s stored login was a consumed "
+                        f"generation behind its live session (PID "
+                        f"{report.detail}); adopted the session's generation "
+                        "before activation because --even-if-live was passed "
+                        "— the login and the session now share one "
+                        "generation in two stores (they drift at the next "
+                        "rotation; the session re-bootstraps once idle)."
+                    )
+                    self._logger.info(msg)
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                    return
+            # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
+            # menu bar shows it with a copy button — instead of a failed action.
             raise LiveSessionRefusal(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {report.detail}) that rotated the token family "
@@ -5890,7 +5919,8 @@ class ClaudeAccountSwitcher:
             # store lock itself and may POST one refresh; nothing here runs
             # while our locks are held.
             self._heal_target_backup(
-                target_account, pre_email, pre_data, emit_output, warnings_out
+                target_account, pre_email, pre_data, emit_output, warnings_out,
+                even_if_live=even_if_live,
             )
             pids = self._live_session_pids(target_account, pre_email)
             if pids:

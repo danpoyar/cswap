@@ -5873,7 +5873,7 @@ class TestLiveLoginSlotSkip:
             assert h.engine._freshen_target("2", "b@example.com") == "skip-live-session"
         post.assert_not_called()
 
-    def test_burned_home_proactive_skips_the_only_live_login_candidate(self, temp_home):
+    def test_burned_active_proactive_skips_the_only_live_login_candidate(self, temp_home):
         """The 09:00Z tick: the active slot's Fable at the threshold, slot 2
         the only fit candidate and the orchestrator's live login slot. RED on
         main: switch to 2 with the advisory warning nobody reads. (Pinless
@@ -5896,7 +5896,7 @@ class TestLiveLoginSlotSkip:
         detail = self._no_viable(h).detail
         assert "Account-2" in detail and str(self.LIVE_PID) in detail
 
-    def test_burned_home_at_limit_skips_the_live_login_candidate_too(self, temp_home):
+    def test_burned_active_at_limit_skips_the_live_login_candidate_too(self, temp_home):
         """The 09:47Z / 12:39Z ticks (trigger at-limit). RED on main."""
         h = self._harness(temp_home)
         self._incident_profile(h, 2, "b@example.com")

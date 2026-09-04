@@ -171,19 +171,30 @@ class TestHomeHoldsThroughBurnedModel:
         assert _reasons(h) == ["home-pinned"]
         assert "92%" in _detail(h, "home-pinned")
 
-    def test_hold_at_home_does_not_stack_unhealthy_ticks(self, temp_home):
-        # A burned window is not a dead token: three burned ticks in a row
-        # must not escalate to failover.
+    def test_burned_hold_at_home_resets_the_unhealthy_count(self, temp_home):
+        # A burned window is not a dead token: it must reset the unhealthy
+        # count the way any readable tick does (the default failover needs
+        # three unreadable ticks in a row). dead → burned → dead → dead must
+        # not fail over: the burned tick in between broke the streak, and
+        # only the two trailing dead ticks count.
         h = _harness(temp_home, live=1)
-        usage = {
+        dead = {"1": None, "2": _scoped_usage(10.0, 20.0), "3": _scoped_usage(10.0, 30.0)}
+        burned = {
             "1": _scoped_usage(5.0, 100.0),
             "2": _scoped_usage(10.0, 20.0),
             "3": _scoped_usage(10.0, 30.0),
         }
-        for _ in range(4):
-            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(burned) is TickOutcome.NO_ACTION
+        assert "home-pinned" in _reasons(h)
+        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert _switches(h) == []
+        # The third consecutive dead tick still fails over (CON-1070 escape).
+        assert h.tick_with_usage(dead) is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
 
     def test_five_hour_wall_still_holds_at_home(self, temp_home):
         # CON-1070 stands: an account-wide wall at home is the user's own
