@@ -716,3 +716,48 @@ class TestSpilledAdoptionReconcile:
         assert not (session_dir / STALE_MARKER).exists()
         assert not (session_dir / SEED_FINGERPRINT_FILE).exists()
         no_network.assert_not_called()
+
+    def test_session_exiting_between_the_hook_and_the_settling_is_still_settled(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Review r.1 of PR #37 (minor): the write hook and the settling must
+        not judge liveness independently. Hook sees the session live (marks
+        the profile stale, keeps its copy); the session exits before the
+        settling runs. A second process scan would see nothing live and leave
+        the lying marker on an idle profile that rotated onward — the next
+        `cswap run` would destroy that newest generation. Liveness is judged
+        once, by the hook: the marker it left IS the proof."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        _spilled_adoption(s)
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
+
+        scans = iter([[4242]])  # the hook's scan sees the session; later ones do not
+
+        def _pids(*_a, **_k):
+            return next(scans, [])
+
+        with (
+            patch.object(s, "_live_session_pids", side_effect=_pids),
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}}),
+            ),
+        ):
+            s._fetch_account_usage(
+                (int(TARGET_NUM), TARGET_EMAIL, "Org", "", False, backup, "")
+            )
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile_3
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(profile)
+        from claude_swap.refresh import _backup_is_newer
+
+        assert _backup_is_newer(
+            session_dir, s.read_account_credentials(TARGET_NUM, TARGET_EMAIL)
+        ) is None, "the oracles must read: the profile ran ahead"
+        no_network.assert_not_called()

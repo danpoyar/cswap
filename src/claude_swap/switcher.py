@@ -1948,33 +1948,58 @@ class ClaudeAccountSwitcher:
         family) leaves the truthful marker alone. An idle profile lost its
         copy to the hook — a stamp over no credential would freeze the
         backup for the collector's seed guard (reseed door, review r.1).
+
+        Liveness is judged ONCE per landing — by the hook: the marker it
+        touched is the proof it took the live branch and kept the profile's
+        copy (the idle branch unlinks the marker along with the copy). A
+        second process scan here would race a session that exits between
+        the two (review r.1 of PR #37, minor): the marker would stay on an
+        idle profile that rotated onward, and the next ``cswap run`` would
+        destroy that newest generation and seed the consumed one.
         Never raises.
         """
         from claude_swap.session import (
+            STALE_MARKER,
             read_session_credentials,
             session_identity_drifted,
         )
 
         try:
-            if not self._live_session_pids(account_num, email):
-                return
             session_dir = self._session_dir(account_num, email)
-            if not session_dir.is_dir():
-                return
+            if not (session_dir / STALE_MARKER).exists():
+                return  # idle branch: the hook dropped the copy — nothing to settle
             org_uuid = self.account_identity(account_num).get(
                 "organizationUuid", ""
             )
             if session_identity_drifted(session_dir, email, org_uuid):
+                self._logger.info(
+                    f"Account {account_num}: rotation spill landed under a "
+                    "profile logged in as another account; stale marker kept"
+                )
                 return
             profile = read_session_credentials(session_dir)
             if not profile or is_inference_token_credentials(profile):
+                self._logger.info(
+                    f"Account {account_num}: rotation spill landed but the "
+                    "profile holds no readable login credential; stale "
+                    "marker kept"
+                )
                 return
             landed_fp = oauth.credential_fingerprint(landed)
             if not landed_fp:
+                self._logger.info(
+                    f"Account {account_num}: landed rotation spill has no "
+                    "fingerprint; stale marker kept"
+                )
                 return
             if origin != SPILL_ORIGIN_PROFILE and (
                 oauth.credential_fingerprint(profile) != landed_fp
             ):
+                self._logger.info(
+                    f"Account {account_num}: landed rotation spill is a "
+                    "generation the live profile does not hold; the stale "
+                    "marker is truthful and stays"
+                )
                 return
         except Exception:
             self._logger.warning(
