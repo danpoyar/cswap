@@ -46,7 +46,9 @@ _EVENT_ROLES = {
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
 }
-_QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
+_QUIET_KINDS = {
+    "poll", "no-switch", "sleep", "account-unquarantined", "skip-live-login-slot",
+}
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:

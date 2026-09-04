@@ -892,7 +892,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = accent(line)
         elif event.kind in ("error", "account-quarantined", "drain-timeout"):
             line = yellowed(line)
-        elif event.kind in ("poll", "no-switch", "sleep"):
+        elif event.kind in ("poll", "no-switch", "sleep", "skip-live-login-slot"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
 

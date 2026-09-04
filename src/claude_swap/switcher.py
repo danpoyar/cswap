@@ -5769,17 +5769,19 @@ class ClaudeAccountSwitcher:
         - the profile is logged in as another account
           (``session_identity_drifted``): it no longer holds this slot's
           family;
-        - the profile holds a full OAuth credential of a DIFFERENT generation
-          AND the backup moved after the profile was seeded (the seed stamp
-          no longer matches the backup): a re-login/re-add, or the same
-          family's newer generation written on the way out — the profile
-          copy is superseded, nothing is shared.
+        - the profile still holds its SEED generation while the backup moved
+          after the profile was seeded (the seed stamp matches the profile,
+          not the backup): a re-login/re-add, or the same family's newer
+          generation written on the way out — the profile copy is
+          superseded, nothing is shared.
 
         Equal refresh-token fingerprints = one family about to live in two
         stores (the heal's "same lineage" outcome) → shared. A differing
         generation over an UNMOVED backup (seed stamp == backup) means the
         session rotated the family past the backup: it owns the newest
-        generation → shared. The stale marker is deliberately NOT an oracle
+        generation → shared. Profile AND backup both moved past the seed
+        (three generations, CON-2052) → undecidable → shared. The stale
+        marker is deliberately NOT an oracle
         here (review r.1 of CON-2030): ``_post_backup_write`` sets it on the
         live profile at every backup rewrite, including leaving the slot
         with the same family at the same generation after an
@@ -5817,12 +5819,26 @@ class ClaudeAccountSwitcher:
         if not backup:
             return True
         fp_backup = oauth.credential_fingerprint(backup)
-        if oauth.credential_fingerprint(profile) == fp_backup:
+        fp_profile = oauth.credential_fingerprint(profile)
+        if fp_profile == fp_backup:
             return True
         seed = read_seed_fingerprint(session_dir)
         # Backup unmoved since seeding (or no stamp to prove it moved): the
         # profile ran ahead — the live session owns the family.
-        return seed is None or seed == fp_backup
+        if seed is None or seed == fp_backup:
+            return True
+        # The backup moved after seeding. Only a profile still AT its seed
+        # generation is a provably superseded copy (a re-login/re-add, or
+        # the same family's newer generation written on the way out): not
+        # shared. When the profile moved too, three generations stand in
+        # three places and fingerprints cannot tell an honest re-add over a
+        # lingering old-family session from ONE family forked in two stores
+        # — the CON-2052 shape (2026-09-04: the orchestrator's profile
+        # re-written out of band without a re-stamp, the backup rotated by
+        # the default login), which this branch read as "superseded"; the
+        # daemon, asking the same judge, landed the login on the live slot
+        # three times in a day. Undecidable reads as shared.
+        return fp_profile != seed
 
     def _perform_switch(
         self,

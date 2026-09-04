@@ -5790,3 +5790,246 @@ class TestLiveSessionSkipJudgesLoginFamily:
             outcome = h.tick_with_usage({"1": _usage(100), "2": "api key"})
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestLiveLoginSlotSkip:
+    """CON-2052 (live incident 2026-09-04 09:00Z, 09:47Z, 12:39Z): with the
+    home's Fable window burned, the proactive / at-limit escape landed the
+    default login on the orchestrator's slot — a live `cswap run` session
+    on the slot's own login family — three times in one day. The gate
+    existed (`_freshen_target`, CON-2030) but the judge read the slot's
+    shape — profile, seed stamp and backup three different generations —
+    as "superseded copy, nothing shared". Now: that shape is shared, the
+    live-login skip runs BEFORE the drain gates (no park pause for a
+    candidate that cannot be taken; dry-run honors it too), and the daemon
+    logs `skip-live-login-slot` with the slot and its PIDs plus a
+    `no-viable-target` detail naming them.
+    """
+
+    HOME = "home@example.com"
+    LIVE_PID = 28157
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        settings = {
+            "strategy": "consume-first",
+            "cooldown_seconds": 0.0,
+            "home_account": "1",
+            "model": "Fable",
+            **kwargs,
+        }
+        h = EngineHarness(temp_home, **settings)
+        h.seed(1, self.HOME)
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com")
+        h.make_live(self.HOME, 1)
+        return h
+
+    def _incident_profile(self, h: EngineHarness, num: int, email: str) -> Path:
+        """Profile, seed stamp and backup: three generations (the 09:00Z shape)."""
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        session_dir = h.switcher._session_dir(str(num), email)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-profile-gen", "refreshToken": "rt-profile-gen",
+            "expiresAt": int(h.clock() * 1000) + 3_600_000,
+        }}), encoding="utf-8")
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-seed-gen", "refreshToken": "rt-seed-gen",
+            }})),
+            encoding="utf-8",
+        )
+        return session_dir
+
+    def _live_pids_on(self, num: int):
+        return lambda number, email: [self.LIVE_PID] if str(number) == str(num) else []
+
+    def _skips(self, h: EngineHarness) -> list:
+        return [e for e in h.events if e.kind == "skip-live-login-slot"]
+
+    def _switches(self, h: EngineHarness) -> list[SwitchEvent]:
+        return [e for e in h.events if isinstance(e, SwitchEvent)]
+
+    def _no_viable(self, h: EngineHarness) -> NoSwitchEvent:
+        return next(
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "no-viable-target"
+        )
+
+    def test_freshen_target_skips_the_incident_shape(self, temp_home):
+        """RED on main: "ok" — the daemon activated the slot."""
+        h = self._harness(temp_home)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)), \
+             patch("claude_swap.autoswitch.oauth.try_refresh_oauth_credentials") as post, \
+             patch("claude_swap.refresh.try_refresh_oauth_credentials", post):
+            assert h.engine._freshen_target("2", "b@example.com") == "skip-live-session"
+        post.assert_not_called()
+
+    def test_burned_home_proactive_skips_the_only_live_login_candidate(self, temp_home):
+        """The 09:00Z tick: home Fable at the threshold, slot 2 the only fit
+        candidate and the orchestrator's live login slot. RED on main: switch
+        to 2 with the advisory warning nobody reads."""
+        h = self._harness(temp_home)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": _scoped_usage(5.0, 92.0),
+                "2": _scoped_usage(10.0, 20.0),
+                "3": _scoped_usage(10.0, 100.0),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        (skip,) = self._skips(h)
+        assert (skip.number, skip.email, skip.pids) == ("2", "b@example.com", [self.LIVE_PID])
+        assert skip.trigger == "proactive"
+        detail = self._no_viable(h).detail
+        assert "Account-2" in detail and str(self.LIVE_PID) in detail
+
+    def test_burned_home_at_limit_skips_the_live_login_candidate_too(self, temp_home):
+        """The 09:47Z / 12:39Z ticks (trigger at-limit). RED on main."""
+        h = self._harness(temp_home)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": _scoped_usage(5.0, 100.0),
+                "2": _scoped_usage(10.0, 20.0),
+                "3": _scoped_usage(10.0, 100.0),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        (skip,) = self._skips(h)
+        assert skip.trigger == "at-limit" and skip.number == "2"
+
+    def test_next_ranked_candidate_wins_over_a_skipped_live_login_slot(self, temp_home):
+        """A skipped slot yields to the next fit candidate; the skip is still logged."""
+        h = self._harness(temp_home)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": _scoped_usage(5.0, 100.0),
+                "2": _scoped_usage(10.0, 20.0),
+                "3": _scoped_usage(10.0, 30.0),
+            })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        (skip,) = self._skips(h)
+        assert skip.number == "2"
+
+    def test_live_login_skip_runs_before_the_drain_pause(self, temp_home):
+        """A candidate the judge will refuse must not cost the park a
+        checkpoint pause: with drain v2 armed and a busy park, the only
+        candidate being a live login slot ends the tick with no
+        `drain2-signal` and no episode record. RED on main: the park was
+        signaled, then released without a swap."""
+        h = self._harness(
+            temp_home, drain2_wait_seconds=180.0, drain_timeout_seconds=600.0,
+            switch_under_load=True,
+        )
+        park = FakePark()
+        park.roster_value = [_park_row("fix-a", pid=201), _park_row("fix-b", pid=202)]
+        h.engine = h._make_engine(park=park)
+        self._incident_profile(h, 2, "b@example.com")
+        _write_transcript(h, age_s=1.0)
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": _scoped_usage(5.0, 92.0),
+                "2": _scoped_usage(10.0, 20.0),
+                "3": _scoped_usage(10.0, 100.0),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert h.engine._read_drain2() is None
+        assert self._skips(h)
+
+    def test_early_swap_stays_put_without_the_last_account_cry(self, temp_home):
+        """Review r.1 (Important): a voluntary early tick (75% < 90%, early
+        band) whose only better candidate is a live login slot stays put
+        by choice — NO_ACTION, no `last-account` alert, no stamp, no park
+        pause. RED before the fix: BLOCKED + last-account on a healthy park."""
+        h = EngineHarness(
+            temp_home, early_swap_threshold=70.0, early_swap_max_busy=2,
+            drain2_wait_seconds=180.0, drain_timeout_seconds=600.0,
+            switch_under_load=True,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        park.roster_value = [_park_row("fix-a", pid=201), _park_row("fix-b", pid=202)]
+        h.engine = h._make_engine(park=park)
+        self._incident_profile(h, 2, "b@example.com")
+        _write_transcript(h, age_s=1.0)
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({"1": _usage(75), "2": _usage(20)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        assert self._skips(h)
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert h.state().get("lastAccountAlertedAt") is None
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert self._no_viable(h).detail
+
+    def test_consume_first_stays_put_without_the_last_account_cry(self, temp_home):
+        """Review r.1 (Important), the other voluntary trigger: a healthy
+        below-threshold active account and a sooner-resetting candidate
+        hosting a live login session — NO_ACTION, no alert."""
+        h = EngineHarness(temp_home, strategy="consume-first", cooldown_seconds=0.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        self._incident_profile(h, 2, "b@example.com")
+        later, sooner = "2026-09-10T00:00:00Z", "2026-09-05T00:00:00Z"
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 30.0, "resets_at": later}},
+                "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0, "resets_at": sooner}},
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        (skip,) = self._skips(h)
+        assert skip.trigger == "consume-first"
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert h.state().get("lastAccountAlertedAt") is None
+
+    def test_api_key_last_resort_stands_after_the_live_login_filter(self, temp_home):
+        """Review r.1 (Minor): a must-move tick whose every OAuth candidate
+        is a live login slot still takes the metered API-key last resort —
+        an API-key slot has no family to fork."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10), "3": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        (skip,) = self._skips(h)
+        assert skip.number == "2"
+
+    def test_dry_run_honors_the_live_login_skip(self, temp_home):
+        """Dry-run stops at the decision, but the decision must already
+        exclude the live login slot — else the printed plan lies."""
+        h = self._harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": _scoped_usage(5.0, 100.0),
+                "2": _scoped_usage(10.0, 20.0),
+                "3": _scoped_usage(10.0, 100.0),
+            })
+        assert outcome is TickOutcome.BLOCKED
+        assert self._switches(h) == []
+        assert self._skips(h)

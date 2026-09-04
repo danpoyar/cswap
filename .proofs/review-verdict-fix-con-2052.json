@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2052",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "97ea2026af30c9947a7d7da4f24c796bd013ec96",
+  "summary": "р.2: Important р.1 (ложная тревога last-account на early/consume-first) починен — воспроизведено репро р.1 на 97ea202 (NO_ACTION, тревоги и штампа нет), must-move по-прежнему кричит (проба at-limit: BLOCKED + last-account); фактических нет, можно принимать; альтернативы: n/a (р.2 судит только фикс Important, секция судилась в р.1)",
+  "findings": []
+}

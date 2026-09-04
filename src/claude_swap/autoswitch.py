@@ -513,6 +513,37 @@ class NoSwitchEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class LiveLoginSlotSkipEvent(AutoSwitchEvent):
+    """A ranked candidate hosts a live ``cswap run`` session on its own
+    login family (CON-2052): making it the default login too would put one
+    rotating refresh token in two stores with a writer on each side (the
+    CON-2030 class). The slot is dropped from this tick's targets before
+    any drain gate runs. One event per skipped slot per tick."""
+
+    kind: ClassVar[str] = "skip-live-login-slot"
+    trigger: str
+    number: str
+    email: str
+    pids: list[int] = field(default_factory=list)
+
+    def _fields(self) -> dict:
+        return {
+            "trigger": self.trigger,
+            "number": self.number,
+            "email": self.email,
+            "pids": list(self.pids),
+        }
+
+    def human(self) -> str:
+        pid_list = ", ".join(map(str, self.pids)) or "?"
+        return (
+            f"skip live-login-slot: Account-{self.number} ({self.email}) hosts a "
+            f"live session on its login family (PID {pid_list}) — not a "
+            f"{self.trigger} target"
+        )
+
+
+@dataclass(frozen=True)
 class DrainTimeoutEvent(AutoSwitchEvent):
     """The drain ceiling hit while sessions were still writing: the forced
     switch proceeds under load, paying the prompt caches of every live
@@ -1157,6 +1188,58 @@ class AutoSwitchEngine:
 
     # -- freshening -----------------------------------------------------------
 
+    def _live_login_pids(self, number: str, email: str) -> list[int]:
+        """PIDs of live ``cswap run`` sessions on ``number`` that run on the
+        slot's own LOGIN family — empty when there is no live session, or
+        the sessions are proven independent of the login (API-key slot,
+        token-seeded profile, drifted identity, a profile still at its seed
+        generation over a moved backup: ``_live_session_shares_login``).
+        Read-only: a PID scan and, only when sessions exist, one profile
+        credential read."""
+        if self.switcher.account_kind_for(number) == "api_key":
+            return []
+        pids = self.switcher.live_session_pids_for(number, email)
+        if pids and self.switcher.live_session_shares_login_for(number, email):
+            return pids
+        return []
+
+    def _drop_live_login_slots(
+        self, ordered: list[str], trigger: str
+    ) -> tuple[list[str], list[tuple[str, str, list[int]]]]:
+        """Split the ranked targets into (takeable, skipped). A slot hosting
+        a live session on its login family is skipped with a
+        ``skip-live-login-slot`` event naming the slot and its PIDs
+        (CON-2052)."""
+        kept: list[str] = []
+        skipped: list[tuple[str, str, list[int]]] = []
+        for num in ordered:
+            email = self.switcher.account_email(num)
+            pids = self._live_login_pids(num, email)
+            if pids:
+                skipped.append((num, email, pids))
+                self._emit(
+                    LiveLoginSlotSkipEvent(
+                        trigger=trigger, number=num, email=email, pids=pids
+                    )
+                )
+            else:
+                kept.append(num)
+        return kept, skipped
+
+    @staticmethod
+    def _live_login_detail(skipped: list[tuple[str, str, list[int]]]) -> str:
+        """``no-viable-target`` detail naming the skipped live login slots."""
+        if not skipped:
+            return ""
+        slots = "; ".join(
+            f"Account-{num} ({email}, PID {', '.join(map(str, pids))})"
+            for num, email, pids in skipped
+        )
+        return (
+            "skipped live login slot(s) — a 'cswap run' session there runs "
+            f"on the slot's own login family: {slots}"
+        )
+
     def _freshen_target(self, number: str, email: str) -> str:
         """Ensure a candidate's stored token outlives Claude Code's 5-min
         refresh buffer before it gets activated.
@@ -1170,9 +1253,7 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(
-            number, email
-        ) and self.switcher.live_session_shares_login_for(number, email):
+        if self._live_login_pids(number, email):
             # A live `cswap run` session owns this account's LOGIN family in
             # its own profile. Auto-activating it as the default login too
             # would put one rotating refresh token in two config dirs (the
@@ -1967,6 +2048,57 @@ class AutoSwitchEngine:
             self._abandon_switch_intent(trigger, "every candidate exhausted")
             return TickOutcome.BLOCKED
 
+        # -- live login slots (CON-2052) -----------------------------------
+        # A candidate whose live `cswap run` session runs on its own login
+        # family is not a target for ANY trigger: the default login landing
+        # there puts one rotating refresh token in two stores with a writer
+        # on each side (the CON-2030 class). Judged here — before the drain
+        # gates and before dry-run's early exit: `_freshen_target` skipped
+        # such a slot too, but only after the park had been paused for a
+        # swap that could not happen, and dry-run never reached it at all.
+        # Live incident 2026-09-04 (09:00Z, 09:47Z, 12:39Z): the home's
+        # Fable window burned, the orchestrator's slot ranked first, and the
+        # login landed on it three times in a day.
+        ordered, skipped_live = self._drop_live_login_slots(ordered, trigger)
+        if (
+            not ordered
+            and skipped_live
+            and api_key_candidates
+            and trigger != "consume-first"
+            and not early
+        ):
+            # The metered API-key last resort (above) applies to a target
+            # list the live-login filter emptied as well: an API-key slot
+            # has no OAuth family to fork, so the filter never drops one.
+            ordered = api_key_candidates
+        if not ordered:
+            self._emit(
+                NoSwitchEvent(
+                    reason="no-viable-target",
+                    detail=self._live_login_detail(skipped_live),
+                )
+            )
+            # Same law as the no-qualifying-candidate exits above: only a
+            # must-move tick is down to its last account. A voluntary tick
+            # (the early swap, consume-first) that found nothing takeable
+            # stays put by choice — no last-account cry, NO_ACTION (review
+            # r.1 of CON-2052: the alert fired on a 75%-healthy park).
+            if early:
+                self._abandon_switch_intent(
+                    trigger,
+                    "every qualifying candidate for the early swap hosts a "
+                    "live login-family session",
+                    alert=False,
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == "consume-first":
+                return TickOutcome.NO_ACTION
+            self._abandon_switch_intent(
+                trigger,
+                "every qualifying candidate hosts a live login-family session",
+            )
+            return TickOutcome.BLOCKED
+
         # A qualifying candidate exists: the switch intent is real again —
         # re-arm the last-account alert for the next drought.
         self._clear_last_account_alert()
@@ -2061,7 +2193,17 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
-        self._emit(NoSwitchEvent(reason="no-viable-target"))
+        live_detail = self._live_login_detail(skipped_live)
+        self._emit(
+            NoSwitchEvent(
+                reason="no-viable-target",
+                detail=(
+                    f"every ranked target failed to freshen; {live_detail}"
+                    if live_detail
+                    else ""
+                ),
+            )
+        )
         self._drain2_release(drain2, "every ranked target failed to freshen")
         return TickOutcome.BLOCKED
 

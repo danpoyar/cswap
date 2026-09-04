@@ -330,16 +330,29 @@ class TestBackupNewerThanProfile:
         assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == new_login
         no_network.assert_not_called()
 
-    def test_stale_marked_profile_with_live_session_keeps_its_copy(
+    def test_stale_marked_profile_with_live_session_is_refused_then_kept_under_override(
         self, temp_home, mock_claude_config, no_network
     ):
-        """Different families, no sharing: activate the backup, leave the live
-        session's copy alone (setup_session re-bootstraps it once idle)."""
+        """Three generations (seed, A in the live profile, B in the backup):
+        since CON-2052 the switch REFUSES — by fingerprints this is an honest
+        re-add over a lingering old-family session or one family forked in
+        two stores, and the 2026-09-04 incident was the latter. Under the
+        explicit `--even-if-live` override the heal's law stands: activate
+        the backup, leave the live session's copy alone (setup_session
+        re-bootstraps it once idle)."""
+        from claude_swap.exceptions import LiveSessionRefusal
+
         s = _make_switcher(temp_home)
         new_login, old_family, session_dir = _superseded_profile(s)
 
         with patch.object(s, "_live_session_pids", return_value=[4242]):
-            result = s.switch_to(TARGET_NUM, json_output=True)
+            with pytest.raises(LiveSessionRefusal):
+                s.switch_to(TARGET_NUM, json_output=True)
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == old_family
+        no_network.assert_not_called()
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
 
         assert result["switched"] is True
         assert oauth.extract_access_token(
