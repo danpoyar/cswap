@@ -180,17 +180,21 @@ class TestCcRefreshLockProtocol:
     def test_credentials_lock_for_config_home_keeps_cc_order_and_staleness(
         self, temp_home, monkeypatch
     ):
-        """The profile pair keeps CC's order (primary → legacy) and the 60s
-        credential staleness — what refresh/reseed spelled out by hand."""
+        """The profile pair keeps CC's order (primary → legacy), the 60s
+        credential staleness and the deferred timeout (``None`` → the
+        per-lock ``DEFAULT_TIMEOUT_S`` resolved at call time, review r.1
+        nit) — what refresh/reseed spelled out by hand."""
         from contextlib import contextmanager
 
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-        events: list[tuple[str, float | None]] = []
+        events: list[tuple[str, float | None, float | None]] = []
         real = claude_locks.proper_lockfile
 
         @contextmanager
         def recording(lock_dir, **kwargs):
-            events.append((lock_dir.name, kwargs.get("staleness")))
+            events.append(
+                (lock_dir.name, kwargs.get("staleness"), kwargs.get("timeout"))
+            )
             with real(lock_dir, **kwargs):
                 yield
 
@@ -200,8 +204,8 @@ class TestCcRefreshLockProtocol:
         with claude_credentials_lock(config_home=profile):
             pass
         assert events == [
-            (".oauth_refresh.lock", claude_locks.CREDENTIALS_STALENESS_S),
-            ("p.lock", claude_locks.CREDENTIALS_STALENESS_S),
+            (".oauth_refresh.lock", claude_locks.CREDENTIALS_STALENESS_S, None),
+            ("p.lock", claude_locks.CREDENTIALS_STALENESS_S, None),
         ], events
 
     def test_credentials_staleness_is_60s_not_10s(self, temp_home, monkeypatch):
