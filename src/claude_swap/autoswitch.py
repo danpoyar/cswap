@@ -2060,6 +2060,17 @@ class AutoSwitchEngine:
         # Fable window burned, the orchestrator's slot ranked first, and the
         # login landed on it three times in a day.
         ordered, skipped_live = self._drop_live_login_slots(ordered, trigger)
+        if (
+            not ordered
+            and skipped_live
+            and api_key_candidates
+            and trigger != "consume-first"
+            and not early
+        ):
+            # The metered API-key last resort (above) applies to a target
+            # list the live-login filter emptied as well: an API-key slot
+            # has no OAuth family to fork, so the filter never drops one.
+            ordered = api_key_candidates
         if not ordered:
             self._emit(
                 NoSwitchEvent(
@@ -2067,6 +2078,21 @@ class AutoSwitchEngine:
                     detail=self._live_login_detail(skipped_live),
                 )
             )
+            # Same law as the no-qualifying-candidate exits above: only a
+            # must-move tick is down to its last account. A voluntary tick
+            # (the early swap, consume-first) that found nothing takeable
+            # stays put by choice — no last-account cry, NO_ACTION (review
+            # r.1 of CON-2052: the alert fired on a 75%-healthy park).
+            if early:
+                self._abandon_switch_intent(
+                    trigger,
+                    "every qualifying candidate for the early swap hosts a "
+                    "live login-family session",
+                    alert=False,
+                )
+                return TickOutcome.NO_ACTION
+            if trigger == "consume-first":
+                return TickOutcome.NO_ACTION
             self._abandon_switch_intent(
                 trigger,
                 "every qualifying candidate hosts a live login-family session",
@@ -2167,10 +2193,15 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        live_detail = self._live_login_detail(skipped_live)
         self._emit(
             NoSwitchEvent(
                 reason="no-viable-target",
-                detail=self._live_login_detail(skipped_live),
+                detail=(
+                    f"every ranked target failed to freshen; {live_detail}"
+                    if live_detail
+                    else ""
+                ),
             )
         )
         self._drain2_release(drain2, "every ranked target failed to freshen")

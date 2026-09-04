@@ -5946,6 +5946,78 @@ class TestLiveLoginSlotSkip:
         assert h.engine._read_drain2() is None
         assert self._skips(h)
 
+    def test_early_swap_stays_put_without_the_last_account_cry(self, temp_home):
+        """Review r.1 (Important): a voluntary early tick (75% < 90%, early
+        band) whose only better candidate is a live login slot stays put
+        by choice — NO_ACTION, no `last-account` alert, no stamp, no park
+        pause. RED before the fix: BLOCKED + last-account on a healthy park."""
+        h = EngineHarness(
+            temp_home, early_swap_threshold=70.0, early_swap_max_busy=2,
+            drain2_wait_seconds=180.0, drain_timeout_seconds=600.0,
+            switch_under_load=True,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        park = FakePark()
+        park.roster_value = [_park_row("fix-a", pid=201), _park_row("fix-b", pid=202)]
+        h.engine = h._make_engine(park=park)
+        self._incident_profile(h, 2, "b@example.com")
+        _write_transcript(h, age_s=1.0)
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({"1": _usage(75), "2": _usage(20)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        assert self._skips(h)
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert h.state().get("lastAccountAlertedAt") is None
+        assert not [e for e in h.events if isinstance(e, Drain2SignalEvent)]
+        assert self._no_viable(h).detail
+
+    def test_consume_first_stays_put_without_the_last_account_cry(self, temp_home):
+        """Review r.1 (Important), the other voluntary trigger: a healthy
+        below-threshold active account and a sooner-resetting candidate
+        hosting a live login session — NO_ACTION, no alert."""
+        h = EngineHarness(temp_home, strategy="consume-first", cooldown_seconds=0.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        self._incident_profile(h, 2, "b@example.com")
+        later, sooner = "2026-09-10T00:00:00Z", "2026-09-05T00:00:00Z"
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({
+                "1": {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 30.0, "resets_at": later}},
+                "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0, "resets_at": sooner}},
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._switches(h) == []
+        (skip,) = self._skips(h)
+        assert skip.trigger == "consume-first"
+        assert not [e for e in h.events if isinstance(e, LastAccountAlertEvent)]
+        assert h.state().get("lastAccountAlertedAt") is None
+
+    def test_api_key_last_resort_stands_after_the_live_login_filter(self, temp_home):
+        """Review r.1 (Minor): a must-move tick whose every OAuth candidate
+        is a live login slot still takes the metered API-key last resort —
+        an API-key slot has no family to fork."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        self._incident_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10), "3": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        (skip,) = self._skips(h)
+        assert skip.number == "2"
+
     def test_dry_run_honors_the_live_login_skip(self, temp_home):
         """Dry-run stops at the decision, but the decision must already
         exclude the live login slot — else the printed plan lies."""
