@@ -222,7 +222,7 @@ class TestReseedWritesBackupIntoLiveProfile:
         from claude_swap.reseed import RESEEDED, reseed_account
 
         s = _make_switcher()
-        _consumed, backup, session_dir = _incident_slot(s)
+        _consumed, _backup, session_dir = _incident_slot(s)
 
         with patch.object(s, "_live_session_pids", return_value=[]):
             report = reseed_account(s, NUM)
