@@ -527,6 +527,106 @@ def _stale_targets(
     return kept
 
 
+def _reseed_command(argv: list[str]) -> None:
+    """Handle `cswap reseed NUM|EMAIL [--json]` (CON-2030).
+
+    Puts the stored login's NEWER generation into the slot's session
+    profile — live sessions included (their PIDs are reported; they adopt
+    the generation at their next locked store re-read, a restart guarantees
+    it). A profile that rotated past the backup is left alone and the backup
+    adopts its generation instead. See claude_swap.reseed for the law.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} reseed",
+        description=(
+            "Put the stored login's newer generation into a slot's session "
+            "profile, without waiting for its sessions to end. Judged by the "
+            "seed stamp: a profile that rotated past the backup is left as it "
+            "is (the backup adopts its generation); a profile holding the "
+            "consumed generation gets the backup's, an expired backup is "
+            "refreshed first (rejected grant → nothing written). A profile "
+            "on an inference token, an API-key slot and a slot without a "
+            "profile are refused."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap reseed 32
+  cswap reseed yor@example.com --json
+        """,
+    )
+    parser.add_argument(
+        "account",
+        metavar="NUM|EMAIL",
+        help="Slot whose session profile to reseed (number, email or alias)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Machine-readable output"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.reseed import ReseedRefusal, reseed_account
+
+        try:
+            report = reseed_account(switcher, args.account)
+        except ReseedRefusal as e:
+            if args.json:
+                # The switch-style error envelope, plus the stable outcome
+                # and the live PIDs so a healer script can branch on them.
+                envelope = error_envelope(e)
+                envelope["error"]["outcome"] = e.outcome
+                envelope["error"]["livePids"] = e.live_pids
+                print(json.dumps(envelope, indent=2))
+            else:
+                error(f"Error: {e}")
+            sys.exit(1)
+
+        if args.json:
+            payload = {
+                "schemaVersion": SCHEMA_VERSION,
+                "number": int(report.number),
+                "email": report.email,
+                "reseeded": report.reseeded,
+                "outcome": report.outcome,
+                "from": report.source,
+                "generation": report.generation,
+                "livePids": report.live_pids,
+                "detail": report.detail,
+            }
+            print(json.dumps(payload, indent=2))
+            return
+        pids = ", ".join(str(p) for p in report.live_pids)
+        if report.reseeded:
+            live_note = (
+                f"; live sessions {pids} adopt it at their next locked store "
+                "re-read — restart them to be sure"
+                if pids
+                else "; no live session — the next `cswap run` uses it"
+            )
+            print(
+                f"  {report.number}: {report.email} — reseeded from the stored "
+                f"login (generation {report.generation}){live_note}"
+            )
+        else:
+            note = f" ({report.detail})" if report.detail else ""
+            live_note = f"  · live sessions: {pids}" if pids else ""
+            print(f"  {report.number}: {report.email} — {report.outcome}{note}{live_note}")
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _move_command(argv: list[str]) -> None:
     """Handle `cswap move NUM|EMAIL|ALIAS SLOT`.
 
@@ -1058,6 +1158,9 @@ def main() -> None:
     if argv and argv[0] == "refresh":
         _refresh_command(argv[1:])
         return
+    if argv and argv[0] == "reseed":
+        _reseed_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1102,6 +1205,8 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s refresh <num|email>        refresh a parked slot's expired token
   %(prog)s refresh --all              refresh every slot that needs it
+  %(prog)s reseed <num|email>         put the stored login's newer generation into
+                                   the slot's session profile (live sessions included)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts

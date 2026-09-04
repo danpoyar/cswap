@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2030",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "908cbcb17b47274d6ed7488e92579a109f270a32",
+  "summary": "фактических нет; р.2 судил только Important-находки р.1 и их фикс (5aee440, 908cbcb): (1) idle profile-ahead — после adopt_profile_family дверь перечитывает профиль под парой замков и при (None, None) снимает SEED_FINGERPRINT_FILE (reseed.py:381-385), тесты ассертят штамп и повторный reseed→reseeded / refresh→fresh; (2) ворота active-slot под FileLock дословно по предикату _refresh_resolved (reseed.py:268-281 = refresh.py:219-225), отказ без POST и без записи; (3) чтения профиля и бэкапа перенесены под пару замков профиля (reseed.py:290-321), тест фиксирует порядок lock,lock,read. RED-проба тестов HEAD на коде 4ef85d1 в /tmp-копии — 4 failed/1 passed ровно по трём находкам; свой прогон tests/test_reseed.py+test_refresh.py+test_switch_heal.py — 62 passed; ruff чист; порядок замков FileLock→пара профиля→usage-lock без инверсий; альтернативы: judged (развилка «ворота активного слота» названа с ценой); можно принимать",
+  "findings": []
+}
