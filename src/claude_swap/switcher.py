@@ -111,6 +111,12 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
 # instant (request hygiene; see issue #85).
+# Origin tag a rotation spill carries (CON-2075): the spilled bytes were the
+# session profile's own generation (``adopt_profile_family``), so landing them
+# later must do the adoption's bookkeeping — they are not a network refresh
+# the profile never saw.
+SPILL_ORIGIN_PROFILE = "profile-adoption"
+
 _FETCH_STAGGER_S = 0.25
 
 # Show a "· Xm ago" age note on displayed usage older than this. Inside the
@@ -1658,6 +1664,7 @@ class ClaudeAccountSwitcher:
         email: str,
         credentials: str,
         predecessor: str | None = None,
+        origin: str | None = None,
     ) -> bool:
         """Persist rotated credentials to a slot's backup store, under the lock.
 
@@ -1680,6 +1687,11 @@ class ClaudeAccountSwitcher:
         lock before the next network touch. Other write failures (Keychain
         refusing under a held lock) still propagate to the caller's warn
         path.
+
+        ``origin`` tags a spill with where the bytes came from
+        (``SPILL_ORIGIN_PROFILE`` for an adoption of the session profile's
+        generation, CON-2075): the reconcile that lands it later must settle
+        the live profile the way the direct adoption would have.
 
         Returns True when the pair landed in the primary backup store, False
         when it went to the spill — a False target must not be activated off
@@ -1708,7 +1720,7 @@ class ClaudeAccountSwitcher:
                 if attempt == 1:
                     continue
         self._spill_rotated_credentials(
-            account_num, email, credentials, predecessor
+            account_num, email, credentials, predecessor, origin
         )
         return False
 
@@ -1721,6 +1733,7 @@ class ClaudeAccountSwitcher:
         email: str,
         credentials: str,
         predecessor: str | None,
+        origin: str | None = None,
     ) -> None:
         """Preserve a rotated pair the lock race would otherwise drop.
 
@@ -1738,14 +1751,17 @@ class ClaudeAccountSwitcher:
             path = self._pending_rotation_path(account_num)
             from claude_swap.settings import atomic_write_json
 
-            atomic_write_json(path, {
+            payload = {
                 "credentials": credentials,
                 "predecessorFingerprint": predecessor,
                 "email": email,
                 "createdAt": datetime.now(timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 ),
-            })
+            }
+            if origin:
+                payload["origin"] = origin
+            atomic_write_json(path, payload)
             if sys.platform != "win32":
                 os.chmod(path, 0o600)
             self._logger.warning(
@@ -1814,6 +1830,12 @@ class ClaudeAccountSwitcher:
         unclaimed safety copy rather than destroyed. An unreadable spill is
         set aside as forensics — its bytes are unrecoverable either way, and
         leaving it in place would defer the slot forever.
+
+        A landed spill is a deferred backup write whose hook marks a LIVE
+        profile stale; when the landed generation is the live profile's own
+        (a spilled adoption — or the profile holds it anyway) the marker
+        lies and the seed stamp is the predecessor, so the landing settles
+        the profile exactly as the direct adoption does (CON-2075).
         """
         path = self._pending_rotation_path(account_num)
         try:
@@ -1846,6 +1868,9 @@ class ClaudeAccountSwitcher:
         if not current or (predecessor and current_fp == predecessor):
             self._write_account_credentials(account_num, email, spilled)
             path.unlink(missing_ok=True)
+            self._settle_live_profile_after_spill(
+                account_num, email, spilled, payload.get("origin")
+            )
             self._logger.info(
                 f"Reconciled spilled rotated credentials for account "
                 f"{account_num} into the backup"
@@ -1867,6 +1892,127 @@ class ClaudeAccountSwitcher:
             )
         path.unlink(missing_ok=True)
         return current
+
+    def _stamp_profile_generation(
+        self, session_dir: Path, fingerprint: str, account_num: str
+    ) -> None:
+        """Record that the backup now holds the profile's generation: seed
+        stamp := ``fingerprint``, stale marker dropped. Best-effort, logged.
+
+        Shared by the direct adoption (``adopt_profile_family``) and the
+        deferred one (a spilled adoption landing in the reconcile, CON-2075):
+        ``_backup_is_newer`` reads the marker first and the stamp second, so
+        once backup == profile BOTH must say "one generation" — or the next
+        pre-activation heal lands the backup after the session's next
+        rotation, the consumed generation (CON-2069, review r.2 of PR #35).
+        """
+        from claude_swap.session import SEED_FINGERPRINT_FILE, STALE_MARKER
+
+        try:
+            (session_dir / SEED_FINGERPRINT_FILE).write_text(
+                fingerprint, encoding="utf-8"
+            )
+        except OSError:
+            self._logger.warning(
+                f"Could not re-stamp the seed fingerprint for account "
+                f"{account_num} after adoption", exc_info=True,
+            )
+        try:
+            (session_dir / STALE_MARKER).unlink(missing_ok=True)
+        except OSError:
+            self._logger.warning(
+                f"Could not clear the stale marker of account "
+                f"{account_num}'s profile after adoption", exc_info=True,
+            )
+
+    def _settle_live_profile_after_spill(
+        self, account_num: str, email: str, landed: str, origin: str | None
+    ) -> None:
+        """After a spill landed in the backup: undo the write hook's stale
+        marker and re-stamp the seed when the LIVE profile and the backup are
+        one generation — the deferred half of ``adopt_profile_family``
+        (CON-2075, review r.3 of PR #35).
+
+        ``_post_backup_write`` marks a live profile stale on EVERY backup
+        rewrite ("the backup is the newer login") and the reconcile never
+        re-stamped the seed, so after landing a spilled ADOPTION both
+        ordering oracles of ``_backup_is_newer`` lied and the next
+        ``switch --even-if-live`` (session rotated once more) landed the
+        consumed generation. Settled when the profile holds the landed
+        generation (true whatever the spill's origin), or when the spill
+        came from the profile (``SPILL_ORIGIN_PROFILE``): the profile may
+        have rotated onward meanwhile — the backup is then its consumed
+        predecessor, and the oracles must read "the profile ran ahead" so
+        the heal adopts the newest generation instead of landing a dead one.
+        A spill the profile never held (a network refresh of the backup
+        family) leaves the truthful marker alone. An idle profile lost its
+        copy to the hook — a stamp over no credential would freeze the
+        backup for the collector's seed guard (reseed door, review r.1).
+
+        Liveness is judged ONCE per landing — by the hook: the marker it
+        touched is the proof it took the live branch and kept the profile's
+        copy (the idle branch unlinks the marker along with the copy). A
+        second process scan here would race a session that exits between
+        the two (review r.1 of PR #37, minor): the marker would stay on an
+        idle profile that rotated onward, and the next ``cswap run`` would
+        destroy that newest generation and seed the consumed one.
+        Never raises.
+        """
+        from claude_swap.session import (
+            STALE_MARKER,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        try:
+            session_dir = self._session_dir(account_num, email)
+            if not (session_dir / STALE_MARKER).exists():
+                return  # idle branch: the hook dropped the copy — nothing to settle
+            org_uuid = self.account_identity(account_num).get(
+                "organizationUuid", ""
+            )
+            if session_identity_drifted(session_dir, email, org_uuid):
+                self._logger.info(
+                    f"Account {account_num}: rotation spill landed under a "
+                    "profile logged in as another account; stale marker kept"
+                )
+                return
+            profile = read_session_credentials(session_dir)
+            if not profile or is_inference_token_credentials(profile):
+                self._logger.info(
+                    f"Account {account_num}: rotation spill landed but the "
+                    "profile holds no readable login credential; stale "
+                    "marker kept"
+                )
+                return
+            landed_fp = oauth.credential_fingerprint(landed)
+            if not landed_fp:
+                self._logger.info(
+                    f"Account {account_num}: landed rotation spill has no "
+                    "fingerprint; stale marker kept"
+                )
+                return
+            if origin != SPILL_ORIGIN_PROFILE and (
+                oauth.credential_fingerprint(profile) != landed_fp
+            ):
+                self._logger.info(
+                    f"Account {account_num}: landed rotation spill is a "
+                    "generation the live profile does not hold; the stale "
+                    "marker is truthful and stays"
+                )
+                return
+        except Exception:
+            self._logger.warning(
+                f"Could not judge account {account_num}'s live profile after "
+                "landing its rotation spill; leaving the stale marker in place",
+                exc_info=True,
+            )
+            return
+        self._stamp_profile_generation(session_dir, landed_fp, account_num)
+        self._logger.info(
+            f"Landed rotation spill of account {account_num} is the live "
+            "profile's own generation; seed re-stamped, stale marker cleared"
+        )
 
     def account_identity(self, account_num: str) -> dict:
         """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""
@@ -3073,8 +3219,6 @@ class ClaudeAccountSwitcher:
         there was nothing to adopt or the pair spilled (backup unchanged).
         """
         from claude_swap.session import (
-            SEED_FINGERPRINT_FILE,
-            STALE_MARKER,
             read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
@@ -3109,36 +3253,23 @@ class ClaudeAccountSwitcher:
             landed = True
         else:
             landed = self.persist_backup_credentials(
-                account_num, email, profile, predecessor=fp_backup
+                account_num, email, profile, predecessor=fp_backup,
+                origin=SPILL_ORIGIN_PROFILE,
             )
         if landed and fp_profile:
             # Backup now IS the profile's generation — the stamp must say so,
             # or the re-added guard above throws away the session's NEXT
-            # rotation (review r.2 Major, repro test_B).
-            try:
-                (session_dir / SEED_FINGERPRINT_FILE).write_text(
-                    fp_profile, encoding="utf-8"
-                )
-            except OSError:
-                self._logger.warning(
-                    f"Could not re-stamp the seed fingerprint for account "
-                    f"{account_num} after adoption", exc_info=True,
-                )
-            # The backup-write hook marked a LIVE profile stale ("the backup
-            # is the newer login") — after an adoption the two are ONE
-            # generation, so the marker lies: `_backup_is_newer` reads it
-            # first and the next pre-activation heal would land the backup
-            # after the session rotates again (CON-2069, review r.2 of PR
-            # #35, Important; the reseed door dropped it by hand — now every
-            # adopter does). An idle profile lost its copy instead; nothing
-            # to clear there.
-            try:
-                (session_dir / STALE_MARKER).unlink(missing_ok=True)
-            except OSError:
-                self._logger.warning(
-                    f"Could not clear the stale marker of account "
-                    f"{account_num}'s profile after adoption", exc_info=True,
-                )
+            # rotation (review r.2 Major, repro test_B). The backup-write
+            # hook marked a LIVE profile stale ("the backup is the newer
+            # login") — after an adoption the two are ONE generation, so the
+            # marker lies: `_backup_is_newer` reads it first and the next
+            # pre-activation heal would land the backup after the session
+            # rotates again (CON-2069, review r.2 of PR #35, Important; the
+            # reseed door dropped it by hand — now every adopter does). An
+            # idle profile lost its copy instead; nothing to clear there.
+            # Same bookkeeping when the adoption spilled and lands later
+            # (CON-2075) — one helper, so the two paths cannot drift.
+            self._stamp_profile_generation(session_dir, fp_profile, account_num)
         if landed:
             self._logger.info(
                 f"Adopted the session profile's newer login generation into "

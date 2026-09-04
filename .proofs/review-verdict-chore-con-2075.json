@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2075",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "2cfa4ea6ba6cc578a0ab656d56d6bf9e95199a3e",
+  "summary": "р.2: фикс minor р.1 (двойной скан PID) принят — settle судит живость по маркеру хука, одна оценка на посадку; Important нет, новых находок нет — можно принимать; альтернативы: judged; красное→зелёное воспроизведено (1 failed/21 passed на switcher.py 50ac832, 22 passed на HEAD)",
+  "findings": []
+}
