@@ -341,6 +341,45 @@ read in one sitting.
   drift there touches only the quota gauge, not inference). Fleet-shaped;
   offer upstream with the session-mode work.
 
+- `cswap reseed N` puts the stored login's newer generation INTO a session
+  profile, live sessions included (CON-2030, second half, 2026-09-04;
+  `reseed.py`). The fleet's healer for a dead orchestrator login
+  (config repo, sensor P → `yor-slot-move.sh --restart` → `cswap run
+  <email> -- --resume`) relied on the profile's stale marker: the backup was
+  rewritten under the live session, so the next `cswap run` would
+  re-bootstrap the profile. Review r.1 of config PR #1253 showed the gap:
+  `setup_session` honors the marker only on an IDLE profile, and the reuse
+  probe `claude auth status --json` says `loggedIn: true` for an EXPIRED
+  token (probe with `expiresAt: 1000`) — and since the operator's terminal
+  tabs live in the orchestrator's profile (`cswap run yor@…`, hub
+  `terminal-account`), that profile is never idle: the restart came back
+  up on the consumed generation and printed "Login expired" again. The
+  door judges who ran ahead by the SEED STAMP only (the marker lies after
+  `_post_backup_write`, review r.1 of #32): backup unmoved since seeding →
+  the profile owns the newest generation, nothing is written into it and
+  the backup adopts it (`adopt_profile_family`, no POST) — `profile-ahead`;
+  backup moved after seeding → the profile holds the consumed generation and
+  gets the backup's `claudeAiOauth` family through the bootstrap-shaped
+  writer (`refresh._reseed_profile`: hashed keychain entry deleted,
+  plaintext seed written, stamp re-stamped) under Claude Code's credential
+  lock pair for THAT config dir, keeping the profile's own `mcpOAuth` forks
+  (CON-1432) and dropping the marker — `reseeded`; an expired backup is
+  proven alive first (one POST with the BACKUP's grant — the family's
+  newest, held by no live process), a rejected grant leaves the profile
+  untouched (`relogin-required`, strike recorded). Deliberately NOT routed
+  through `heal_backup_before_activation`: it refuses `live-session` (the
+  door exists for live profiles) and its `_backup_is_newer` reads the
+  marker first. Live sessions adopt the generation at their next locked
+  store re-read (`_fetch_active_usage` docstring, proven for the active
+  store; a profile is the same code with `CLAUDE_CONFIG_DIR` as its config
+  home) — not separately proven for profiles in this fork, so the recipe
+  stays "reseed, then restart" (`cswap run N -- --resume`), which the
+  healer does anyway. Refusals (`no-profile`, `api-key`, `token-profile`,
+  `identity-drifted`, `deferred`, `undecidable`, `no-credentials`,
+  `transient-error`) are the switch-style JSON error envelope plus
+  `error.outcome`/`error.livePids`. Fleet-shaped; offer upstream with the
+  session-mode work.
+
 - The home pin judges the pinned model's window, and the record follows
   the real login (CON-1581, 2026-08-31). Live incident: after a reboot and
   a manual browser `/login`, `return-home` moved the live login back onto

@@ -152,6 +152,20 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 </details>
 
 <details>
+<summary>Recovery — a session that says "Login expired" while its stored login is newer</summary>
+
+A session's claude rotates the token family inside its profile and nothing syncs it back; the other way round happens too: the stored login gets rewritten under a live session (a re-login with `cswap add --slot N`, a `cswap switch N --even-if-live` visit whose couriers rotated the family, a persisted rotation), and the session keeps running on the generation that rewrite consumed — "Login expired · Please run /login" at its next refresh. The profile is marked for a re-bootstrap, but that only happens once it is idle, and a profile hosting your terminal tabs never is. `cswap reseed N` closes that gap without waiting:
+
+```bash
+cswap reseed 32                 # put the stored login's newer generation into slot 32's profile
+cswap reseed 32 --json          # {"reseeded": true, "from": "backup", "generation": …, "livePids": [...]}
+```
+
+It judges who ran ahead by the profile's seed stamp, never by the stale marker: a profile that rotated past the stored login is left alone (`profile-ahead` — the stored login adopts its generation instead, no grant consumed); a profile holding the consumed generation gets the stored login's `claudeAiOauth` written into its store under Claude Code's own credential locks for that profile, keeping the profile's own MCP logins; an expired stored login is refreshed first, and a rejected grant leaves the profile untouched (`relogin-required`). Live sessions are not a blocker — their PIDs are reported; they pick the new generation up at their next locked store re-read (Claude Code re-reads its store before refreshing or forcing re-auth), and restarting them (`cswap run N -- --resume`) guarantees it. A profile on an attached setup-token, an API-key slot and a slot without a profile are refused (`token-profile`, `api-key`, `no-profile`); with `--json` a refusal is the usual error envelope plus `error.outcome` and `error.livePids`, exit 1.
+
+</details>
+
+<details>
 <summary>Map accounts to directories — auto-pick per repo</summary>
 
 Bind a directory to an account, and a bare `cswap run` there launches that account in session mode — e.g. work account in work repos, personal elsewhere:
@@ -202,6 +216,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap reseed 2                  # Put the stored login's newer generation into account 2's session profile
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
@@ -334,7 +349,7 @@ cswap switch 2 --json
 }
 ```
 
-Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`. `reseed --json` reports `{"reseeded": true|false, "outcome": "reseeded"|"in-sync"|"profile-ahead", "from": "backup"|null, "generation": …, "livePids": [...], "detail": …}`; its refusals carry `error.outcome` (`no-profile`, `token-profile`, `relogin-required`, …) and `error.livePids` inside the error envelope.
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Once last-good data is too old to drive a decision, `usageStatus` remains `unavailable` and `usage` remains null, while additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
