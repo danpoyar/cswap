@@ -3069,10 +3069,12 @@ class ClaudeAccountSwitcher:
         adopt off the same read, or an intermittent Keychain timeout skips
         the adoption here and passes the guard there. Without it the profile
         is read best-effort (``read_session_credentials``).
-        Returns True when a generation was adopted.
+        Returns True when a generation was adopted INTO THE BACKUP; False when
+        there was nothing to adopt or the pair spilled (backup unchanged).
         """
         from claude_swap.session import (
             SEED_FINGERPRINT_FILE,
+            STALE_MARKER,
             read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
@@ -3122,11 +3124,38 @@ class ClaudeAccountSwitcher:
                     f"Could not re-stamp the seed fingerprint for account "
                     f"{account_num} after adoption", exc_info=True,
                 )
-        self._logger.info(
-            f"Adopted the session profile's newer login generation into the "
-            f"backup of account {account_num} (landed={landed})"
-        )
-        return True
+            # The backup-write hook marked a LIVE profile stale ("the backup
+            # is the newer login") — after an adoption the two are ONE
+            # generation, so the marker lies: `_backup_is_newer` reads it
+            # first and the next pre-activation heal would land the backup
+            # after the session rotates again (CON-2069, review r.2 of PR
+            # #35, Important; the reseed door dropped it by hand — now every
+            # adopter does). An idle profile lost its copy instead; nothing
+            # to clear there.
+            try:
+                (session_dir / STALE_MARKER).unlink(missing_ok=True)
+            except OSError:
+                self._logger.warning(
+                    f"Could not clear the stale marker of account "
+                    f"{account_num}'s profile after adoption", exc_info=True,
+                )
+        if landed:
+            self._logger.info(
+                f"Adopted the session profile's newer login generation into "
+                f"the backup of account {account_num}"
+            )
+        else:
+            # The pair went to the spill sidecar: the backup is still the
+            # consumed generation until a reconcile pass folds it in —
+            # nothing was adopted INTO THE BACKUP, and a caller that
+            # activates on True would hand out the consumed grant (review
+            # r.2 of PR #35, minor).
+            self._logger.warning(
+                f"Account {account_num}: the session profile's newer generation "
+                "spilled instead of landing in the backup — not adopted yet "
+                "(the reconcile pass folds the spill in)"
+            )
+        return landed
 
     def attach_inference_token(self, identifier: str, token: str) -> None:
         """Attach a ``claude setup-token`` to a managed login slot.
@@ -5729,6 +5758,21 @@ class ClaudeAccountSwitcher:
                 # re-stamped, the live profile untouched — and land THAT
                 # generation, never the consumed one.
                 adopted = self.adopt_profile_family(account_num, email, org_uuid)
+                if adopted:
+                    # Belt and braces: land only what the backup now holds
+                    # equals the profile — an adoption that did not reach
+                    # the backup store must fall through to the refusal.
+                    from claude_swap.session import read_session_credentials
+
+                    prof_now = read_session_credentials(
+                        self._session_dir(account_num, email)
+                    )
+                    back_now = self._read_account_credentials(account_num, email)
+                    adopted = bool(
+                        prof_now and back_now
+                        and oauth.credential_fingerprint(prof_now)
+                        == oauth.credential_fingerprint(back_now)
+                    )
                 if adopted:
                     msg = (
                         f"Account-{account_num}'s stored login was a consumed "

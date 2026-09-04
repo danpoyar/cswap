@@ -248,6 +248,100 @@ class TestSwitchRefusesDeadLanding:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == int(TARGET_NUM)
 
+    def test_adoption_under_even_if_live_leaves_the_live_profile_current(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Review r.2 of PR #35 (Important): the backup write behind the
+        adoption marked the LIVE profile stale (``_post_backup_write``), and
+        ``_backup_is_newer`` reads that marker first — so the guard's SECOND
+        ``switch <home> --even-if-live`` (the session rotated again meanwhile,
+        the login died and failed over) landed the consumed backup silently:
+        the CON-1579 shape the heal exists to exclude. After an adoption
+        backup == profile: no marker, the seed re-stamped, and the next visit
+        adopts the session's NEXT generation again."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            first = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert first["switched"] is True
+        assert not (session_dir / STALE_MARKER).exists(), (
+            "an adoption must not mark the live profile stale — backup == profile"
+        )
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(profile)
+
+        # The login leaves home (a failover) and the live session rotates
+        # the family once more.
+        s.switch_to(ACTIVE_NUM, json_output=True)
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            second = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert second["switched"] is True
+        landed = _live_path(temp_home).read_text(encoding="utf-8")
+        assert oauth.extract_access_token(landed) == "at-profile-3", (
+            "the second visit must land the session's newest generation, "
+            "never the consumed one"
+        )
+        assert oauth.extract_access_token(
+            s.read_account_credentials(TARGET_NUM, TARGET_EMAIL)
+        ) == "at-profile-3"
+        assert any("adopted the session's generation" in w for w in second.get("warnings", []))
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile_3
+        no_network.assert_not_called()
+
+    def test_spilled_adoption_under_even_if_live_is_refused_not_landed_consumed(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Review r.2 (minor): ``adopt_profile_family`` reported an adoption
+        even when the pair went to the spill sidecar (backup still the consumed
+        generation) — the heal then activated the consumed backup under an
+        "adopted" notice. A spilled adoption is no adoption: the refusal stands."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        live_before = _live_path(temp_home).read_text(encoding="utf-8")
+
+        with (
+            patch.object(s, "_live_session_pids", return_value=[4242]),
+            patch.object(s, "persist_backup_credentials", return_value=False),
+        ):
+            with pytest.raises(SwitchError) as exc:
+                s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert "4242" in str(exc.value)
+        assert _live_path(temp_home).read_text(encoding="utf-8") == live_before
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == backup
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        no_network.assert_not_called()
+
+    def test_nothing_to_adopt_under_even_if_live_falls_back_to_the_refusal(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """Review r.2 (nit): the ``adopted=False`` branch under the override
+        keeps the typed refusal with its recipe — no silent landing."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        live_before = _live_path(temp_home).read_text(encoding="utf-8")
+
+        with (
+            patch.object(s, "_live_session_pids", return_value=[4242]),
+            patch.object(s, "adopt_profile_family", return_value=False),
+        ):
+            with pytest.raises(SwitchError) as exc:
+                s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert f"cswap run {TARGET_NUM}" in str(exc.value)
+        assert _live_path(temp_home).read_text(encoding="utf-8") == live_before
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == backup
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
+        no_network.assert_not_called()
+
     def test_rejected_grant_is_refused_with_relogin_recipe(
         self, temp_home, mock_claude_config, no_network
     ):
