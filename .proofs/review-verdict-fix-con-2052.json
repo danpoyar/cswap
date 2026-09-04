@@ -1,16 +1,9 @@
 {
   "role": "code-reviewer",
   "ticket": "CON-2052",
-  "verdict": "revise",
-  "round": 1,
-  "head_sha": "9589d7072d89d54ee1f37406f05979950ce913f3",
-  "summary": "1 Important (ложная тревога last-account на добровольных тиках early/consume-first), 1 Minor, 4 нита; альтернативы: judged",
-  "findings": [
-    {"severity": "major", "message": "Pre-drain блок зовёт _abandon_switch_intent с alert=True для любого триггера: добровольный тик (early swap / consume-first), у которого единственный лучший кандидат — слот с живой логин-сессией, эмитит last-account (уведомление menubar «Park is on its last account», штамп lastAccountAlertedAt) — против закона тех же веток (1953–1975: early → alert=False, NO_ACTION; 1976–2011: consume-first без тревоги). Репро /tmp/con2052-review/test_repro_alert.py: KINDS [...,'skip-live-login-slot','no-switch','last-account']. Чинить: alert=(not early and trigger != 'consume-first'), для early/consume-first — NO_ACTION как в соседних ветках.", "file": "src/claude_swap/autoswitch.py", "line": 2070},
-    {"severity": "minor", "message": "Фильтр стоит после api_key-фолбэка (1914–1927): на must-move тике, где фильтр опустошил ordered, metered API-key последний резерв не пробуется — BLOCKED вместо документированного last resort (на main тот же эффект давал skip внутри _freshen_target, регрессии нет).", "file": "src/claude_swap/autoswitch.py", "line": 2062},
-    {"severity": "nit", "message": "skip-live-login-slot не в _QUIET_KINDS (tui/autoview.py:49) и не в dimmed-списке (cli.py:895): по строке на пропущенный слот каждые 30 с у стены, плюс повтор detail у no-viable-target.", "file": "src/claude_swap/autoswitch.py", "line": 1223},
-    {"severity": "nit", "message": "_freshen_target дважды зовёт account_kind_for (1254 и внутри _live_login_pids 1199).", "file": "src/claude_swap/autoswitch.py", "line": 1256},
-    {"severity": "nit", "message": "Хвост цикла freshen (2170–2175) подставляет detail про пропущенные live-слоты и тогда, когда хвост достигнут карантином оставшихся кандидатов — detail объясняет только часть причины.", "file": "src/claude_swap/autoswitch.py", "line": 2173},
-    {"severity": "nit", "message": "Двухфазный refetch consume-first/early (1878–1912) тратит fetch'и до фильтра, который затем ветирует кандидатов — только цена.", "file": "src/claude_swap/autoswitch.py", "line": 1878}
-  ]
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "97ea2026af30c9947a7d7da4f24c796bd013ec96",
+  "summary": "р.2: Important р.1 (ложная тревога last-account на early/consume-first) починен — воспроизведено репро р.1 на 97ea202 (NO_ACTION, тревоги и штампа нет), must-move по-прежнему кричит (проба at-limit: BLOCKED + last-account); фактических нет, можно принимать; альтернативы: n/a (р.2 судит только фикс Important, секция судилась в р.1)",
+  "findings": []
 }

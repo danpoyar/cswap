@@ -3,7 +3,7 @@
 создан: 2026-09-04 15:04 +0200 · сессия: fix-con-2052 · посадка: session:Yor
 
 ## Где стоп
-- 16:05 +0200: ревью р.1 — не принимать (1 Important: ложная тревога last-account на early/consume-first; 1 Minor: API-key last resort после фильтра; 4 нита). Починено Important, Minor, 2 нита (приглушение события в TUI/CLI, detail хвоста); тесты добавлены, полный pytest зелёный (2105). Следующий шаг: коммит → раунд 2 тем же маршрутом (свежий прогон с отчётом р.1, судит только Important) → вердикт-файл р.2 → merge → deploy.sh main → приёмка по логу → финал.
+- 16:20 +0200: ревью р.2 — можно принимать (вердикт-файл approve, head 97ea202), CI PR #34 зелёный (macos-keychain, test, test-windows). Следующий шаг: `gh pr merge 34 --squash` (без --auto) → `~/projects/cswap/scripts/deploy.sh main` → приёмка: launchctl, хвост cswap-auto.log (skip-live-login-slot для 32, нет switch to 32 новее деплоя), cswap status → финал в тикет + SendMessage Yor.
 
 ## Проверено
 - Проблема жива: демон переключал 21→32 ещё 09:47:35Z (at-limit) и 12:39:47Z (at-limit) — ~/.claude/logs/cswap-auto.log; `env -u CLAUDE_CONFIG_DIR cswap status` 15:09:47 +0200 → Account-32.
