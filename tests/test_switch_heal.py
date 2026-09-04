@@ -495,3 +495,224 @@ class TestDriftNoticeOrdering:
                 with pytest.raises(SwitchError):
                     s.switch_to(TARGET_NUM, json_output=False)
         warn.assert_not_called()
+
+
+def _spilled_adoption(s: ClaudeAccountSwitcher):
+    """`switch --even-if-live` while the store lock is held elsewhere: the
+    adoption's persist loses the lock race twice and the profile's generation
+    goes to the spill sidecar (CON-849); the switch is refused. Returns the
+    sidecar path."""
+    from claude_swap.locking import FileLock as _FL
+
+    holder = _FL(s.lock_file, timeout=0.1)
+    assert holder.acquire()
+    try:
+        with (
+            patch.object(s, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.switcher.FileLock",
+                lambda path, **kw: _FL(path, timeout=0.1),
+            ),
+        ):
+            with pytest.raises(SwitchError):
+                s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+    finally:
+        holder.release()
+    spill = s._pending_rotation_path(TARGET_NUM)
+    assert spill.exists(), "the adoption must have spilled"
+    return spill
+
+
+def _collect_pass(s: ClaudeAccountSwitcher, backup: str, pids: list[int]):
+    """One usage-collector visit of the parked slot — the reconcile pass
+    that folds a pending spill into the backup before any network touch."""
+    with (
+        patch.object(s, "_live_session_pids", return_value=pids),
+        patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}}),
+        ),
+    ):
+        s._fetch_account_usage(
+            (int(TARGET_NUM), TARGET_EMAIL, "Org", "", False, backup, "")
+        )
+
+
+class TestSpilledAdoptionReconcile:
+    """CON-2075 (review r.3 of PR #35, below Important → ticket): an adoption
+    under `--even-if-live` that SPILLED lands in the backup later, through
+    `_reconcile_spilled_rotation_locked` → `_write_account_credentials` →
+    `_post_backup_write`, whose live-PID branch marks the profile stale and
+    which never re-stamps the seed. After that landing backup == profile
+    (one generation), yet BOTH ordering oracles of `_backup_is_newer` say
+    "the backup is newer" — the marker lies and the seed stamp is the
+    predecessor. The next `switch <home> --even-if-live`, after the session
+    rotated once more, would land the consumed generation: the CON-1579
+    shape the heal exists to exclude. The spill is a deferred adoption: its
+    landing must do the adoption's bookkeeping (seed re-stamped, marker
+    dropped) for a live profile that holds — or rotated onward from — the
+    spilled generation."""
+
+    def test_spilled_adoption_reconciled_under_the_live_session_leaves_no_lying_marker(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        spill = _spilled_adoption(s)
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == backup
+        assert json.loads(spill.read_text(encoding="utf-8"))["credentials"] == profile
+
+        _collect_pass(s, backup, pids=[4242])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert not spill.exists()
+        assert not (session_dir / STALE_MARKER).exists(), (
+            "the landed spill IS the live profile's generation — the marker lies"
+        )
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(profile), (
+            "backup and profile are one generation again — the seed must say so"
+        )
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile
+
+        # The live session rotates the family once more; the guard returns
+        # the login home — it must land the session's NEWEST generation.
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert result["switched"] is True
+        landed = _live_path(temp_home).read_text(encoding="utf-8")
+        assert oauth.extract_access_token(landed) == "at-profile-3", (
+            "the return home landed the consumed generation"
+        )
+        assert oauth.extract_access_token(
+            s.read_account_credentials(TARGET_NUM, TARGET_EMAIL)
+        ) == "at-profile-3"
+        assert any("adopted the session's generation" in w for w in result.get("warnings", []))
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == profile_3
+        no_network.assert_not_called()
+
+    def test_session_rotated_between_spill_and_reconcile_still_lands_its_newest_generation(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """The spill's bytes came from the profile; when the profile rotates
+        onward BEFORE the reconcile lands them, the backup becomes the
+        profile's consumed predecessor. The oracles must then read "the
+        profile ran ahead" (seed == backup, no marker), so the next return
+        home adopts the session's newest generation instead of landing the
+        consumed one under a lying marker."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        _spilled_adoption(s)
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
+
+        _collect_pass(s, backup, pids=[4242])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(profile)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert result["switched"] is True
+        assert oauth.extract_access_token(
+            _live_path(temp_home).read_text(encoding="utf-8")
+        ) == "at-profile-3"
+        assert oauth.extract_access_token(
+            s.read_account_credentials(TARGET_NUM, TARGET_EMAIL)
+        ) == "at-profile-3"
+        assert not (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+    def test_legacy_spill_without_origin_matching_the_live_profile_is_settled(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """A sidecar written before the origin field existed: the ticket's
+        own rule — the landed generation equals the live profile's — is
+        enough to settle the profile."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        spill = s._pending_rotation_path(TARGET_NUM)
+        spill.write_text(json.dumps({
+            "credentials": profile,
+            "predecessorFingerprint": oauth.credential_fingerprint(backup),
+            "email": TARGET_EMAIL,
+        }), encoding="utf-8")
+
+        _collect_pass(s, backup, pids=[4242])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert not spill.exists()
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(profile)
+        no_network.assert_not_called()
+
+    def test_foreign_spill_keeps_the_truthful_marker_on_a_live_profile(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """A spill that did NOT come from the profile (a network refresh of
+        the backup family) lands a generation the live profile does not hold:
+        the backup really is the newer login, the marker is truthful and the
+        seed stamp stays — the settling must not over-reach."""
+        s = _make_switcher(temp_home)
+        seeded = _creds("at-seed-2", "rt-seed-2")
+        s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, seeded)
+        session_dir = s._session_dir(TARGET_NUM, TARGET_EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(seeded, encoding="utf-8")
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(seeded), encoding="utf-8"
+        )
+        rotated_by_network = _creds("at-net-3", "rt-net-3")
+        spill = s._pending_rotation_path(TARGET_NUM)
+        spill.write_text(json.dumps({
+            "credentials": rotated_by_network,
+            "predecessorFingerprint": oauth.credential_fingerprint(seeded),
+            "email": TARGET_EMAIL,
+        }), encoding="utf-8")
+
+        _collect_pass(s, seeded, pids=[4242])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == rotated_by_network
+        assert not spill.exists()
+        assert (session_dir / STALE_MARKER).exists(), (
+            "the profile holds an older generation — the marker is truthful"
+        )
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(seeded)
+        from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+        assert report.outcome == BACKUP_CURRENT
+        no_network.assert_not_called()
+
+    def test_spilled_adoption_reconciled_on_an_idle_profile_leaves_no_stamp_over_no_credential(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """The session exited before the reconcile: the write hook drops the
+        idle profile's copy (one family, one copy). The settling must not
+        re-create a seed stamp over no credential — that freezes the backup
+        for the collector's seed guard (reseed door, review r.1 Major 1)."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        _spilled_adoption(s)
+
+        _collect_pass(s, backup, pids=[])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / STALE_MARKER).exists()
+        assert not (session_dir / SEED_FINGERPRINT_FILE).exists()
+        no_network.assert_not_called()
