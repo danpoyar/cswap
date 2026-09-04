@@ -1118,6 +1118,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
   %(prog)s switch user@example.com
+  %(prog)s switch 2 --even-if-live           # onto a slot a live 'cswap run' session holds
   %(prog)s list --token-status
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
@@ -1220,6 +1221,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
             "login first"
+        ),
+    )
+    parser.add_argument(
+        "--even-if-live",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': switch onto a slot whose live 'cswap run' "
+            "session shares the stored login. Refused without it — one rotating "
+            "refresh token in two stores kills that session at the next rotation; "
+            "'cswap run <num>' is the safe way to work under such an account"
         ),
     )
     parser.add_argument(
@@ -1398,6 +1409,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
+    if args.even_if_live and not args.switch_to:
+        parser.error("--even-if-live can only be used with 'switch <num|email>'")
+
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
@@ -1484,7 +1498,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                even_if_live=args.even_if_live,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)

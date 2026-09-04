@@ -1170,13 +1170,23 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        if self.switcher.live_session_pids_for(number, email):
-            # A live `cswap run` session owns this account's token in its own
-            # profile. Auto-activating it as the default login too would put
-            # one rotating refresh token in two config dirs (the stale-copy
-            # failure class) with nobody reading the warning — and its quota
-            # is already being consumed by that session anyway. Manual
-            # switch_to keeps its warn-and-proceed behavior; auto skips.
+        if self.switcher.live_session_pids_for(
+            number, email
+        ) and self.switcher.live_session_shares_login_for(number, email):
+            # A live `cswap run` session owns this account's LOGIN family in
+            # its own profile. Auto-activating it as the default login too
+            # would put one rotating refresh token in two config dirs (the
+            # stale-copy failure class) with nobody reading the warning — and
+            # its quota is already being consumed by that session anyway.
+            # Judged by what the profile holds (CON-2030): a slot whose
+            # sessions run on the attached year-long inference token owns no
+            # family (`_bootstrap` seeds the profile with the TOKEN, the login
+            # stays in backup as the quota gauge), so the login may land
+            # there — on main the park's token home (slot 21, always hosting
+            # bg-agent sessions) logged `return-home-wait: a 'cswap run'
+            # session holds Account-21` every 30 s and the login never came
+            # home. Manual switch_to refuses the shared-login case and offers
+            # `--even-if-live`.
             return "skip-live-session"
         # CON-1595: the backup may be a CONSUMED generation — a `cswap run`
         # session on this slot rotated the family inside its profile and

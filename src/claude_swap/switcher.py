@@ -5229,13 +5229,24 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        even_if_live: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``even_if_live`` overrides the CON-2030 refusal: a target whose live
+        ``cswap run`` session shares the stored login is refused by default
+        (``LiveSessionRefusal``); with the override the switch proceeds and
+        the drift notice is emitted instead. Deliberately not ``force``:
+        that one also skips backing up the current login, a different and
+        destructive semantic the override must not carry.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -5334,6 +5345,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            even_if_live=even_if_live,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -5734,12 +5746,91 @@ class ClaudeAccountSwitcher:
             f"or run first: cswap refresh {account_num}"
         )
 
+    def live_session_shares_login_for(self, account_num: str, email: str) -> bool:
+        """Public wrapper for the auto-switch engine: whether the slot's
+        session profile runs on the slot's own login family (CON-2030)."""
+        return self._live_session_shares_login(str(account_num), email)
+
+    def _live_session_shares_login(self, account_num: str, email: str) -> bool:
+        """Whether the slot's session profile runs on the slot's own stored
+        login family (CON-2030) — the case a default-login switch must refuse
+        and the auto-switch engine must skip.
+
+        Judged by credential SHAPE and lineage, the same way the collector
+        and the pre-activation heal judge a profile. A session is proven
+        INDEPENDENT of the login family — and the login may move — when:
+
+        - the slot is an API-key slot (``kind == "api_key"``): no OAuth
+          family at all;
+        - the profile is token-seeded (``is_inference_token_credentials``):
+          it "holds no login family — the backup login is this slot's family
+          and quota gauge" (CON-1329); ``SessionManager._bootstrap`` seeds
+          such a profile "with IT, not with the login's refresh family";
+        - the profile is logged in as another account
+          (``session_identity_drifted``): it no longer holds this slot's
+          family;
+        - the profile holds a full OAuth credential of a DIFFERENT generation
+          AND the backup moved after the profile was seeded (the seed stamp
+          no longer matches the backup): a re-login/re-add, or the same
+          family's newer generation written on the way out — the profile
+          copy is superseded, nothing is shared.
+
+        Equal refresh-token fingerprints = one family about to live in two
+        stores (the heal's "same lineage" outcome) → shared. A differing
+        generation over an UNMOVED backup (seed stamp == backup) means the
+        session rotated the family past the backup: it owns the newest
+        generation → shared. The stale marker is deliberately NOT an oracle
+        here (review r.1 of CON-2030): ``_post_backup_write`` sets it on the
+        live profile at every backup rewrite, including leaving the slot
+        with the same family at the same generation after an
+        ``--even-if-live`` visit — from then on it lies, and the heal's
+        ``_backup_is_newer`` (marker first) would call the consumed backup
+        "newer"; trusting it, the daemon (no blanket PID skip any more)
+        would POST the consumed grant under the live session. Anything that
+        cannot be judged (no readable profile credential, no backup, no seed
+        stamp) reads as shared: the callers are a refusal with an explicit
+        override and a daemon skip, and over-reporting defers a destructive
+        activation instead of forking a live family.
+        """
+        if self._account_kind(account_num) == "api_key":
+            return False
+        from claude_swap.session import (
+            read_seed_fingerprint,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        data = self._get_sequence_data() or {}
+        org_uuid = (
+            data.get("accounts", {}).get(account_num, {}).get("organizationUuid", "")
+            or ""
+        )
+        if session_identity_drifted(session_dir, email, org_uuid):
+            return False
+        profile = read_session_credentials(session_dir)
+        if not profile:
+            return True
+        if is_inference_token_credentials(profile):
+            return False
+        backup = self._read_account_credentials(account_num, email)
+        if not backup:
+            return True
+        fp_backup = oauth.credential_fingerprint(backup)
+        if oauth.credential_fingerprint(profile) == fp_backup:
+            return True
+        seed = read_seed_fingerprint(session_dir)
+        # Backup unmoved since seeding (or no stamp to prove it moved): the
+        # profile ran ahead — the live session owns the family.
+        return seed is None or seed == fp_backup
+
     def _perform_switch(
         self,
         target_account: str,
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        even_if_live: bool = False,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -5755,14 +5846,21 @@ class ClaudeAccountSwitcher:
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
 
+        ``even_if_live`` lifts the CON-2030 refusal (a live ``cswap run``
+        session sharing the target's stored login) back to the advisory
+        notice. Only ``switch_to`` passes it; the rotation paths (``switch``,
+        the auto-switch engine's ``switch_to`` call) never override.
+
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
         warnings_out: list[str] = []
-        # Session-mode drift warning (warn, never block): switching the
-        # default login to an account that also has a live session profile
-        # puts the same refresh token in two config dirs — if the server
-        # rotates it, one copy goes stale.
+        # Session-mode drift notice: switching the default login to an
+        # account that also has a live session profile puts the same refresh
+        # token in two config dirs — if the server rotates it, one copy goes
+        # stale. Advisory only when the two copies are DIFFERENT families or
+        # the session runs on an inference token; when the live session
+        # shares the login family it is a refusal (CON-2030, below).
         pre_data = self._get_sequence_data() or {}
         pre_email = (
             pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
@@ -5780,14 +5878,45 @@ class ClaudeAccountSwitcher:
             )
             pids = self._live_session_pids(target_account, pre_email)
             if pids:
+                pid_list = ", ".join(map(str, pids))
+                # CON-2030: the heal above only refuses when the profile
+                # ROTATED PAST the backup. Live incident 2026-09-03 19:09:
+                # the profile held the backup's own generation (seeded, not
+                # yet rotated), the heal saw "same lineage", the notice went
+                # into JSON `warnings` nobody displays, and the switch put
+                # one rotating refresh token in two stores with a writer on
+                # each side. Couriers on the global login rotated the
+                # family; the live session kept the consumed grant and died
+                # ("Login expired") — the orchestrator was mute for 12.5 h.
+                # Equal lineage + live session on the login = refusal; the
+                # override is an explicit flag, never `--force` (which also
+                # skips backing up the current login).
+                shares_login = self._live_session_shares_login(
+                    target_account, pre_email
+                )
+                if shares_login and not even_if_live:
+                    raise LiveSessionRefusal(
+                        f"Account-{target_account} ({pre_email}) has a live "
+                        f"session-mode Claude instance (PID {pid_list}): switching "
+                        "the default login there would put one rotating refresh "
+                        "token in two stores and kill that session at the next "
+                        f"rotation. Use 'cswap run {target_account}' to work under "
+                        f"this account, or 'cswap switch {target_account} "
+                        "--even-if-live' to switch anyway.",
+                        account_num=target_account,
+                        email=pre_email,
+                        pids=pids,
+                    )
                 msg = (
                     f"Account-{target_account} ({pre_email}) has a live session-mode "
-                    f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
+                    f"Claude instance (PID {pid_list}). Running the "
                     "same account as both the default login and a session can make "
                     "one copy's token go stale if the server rotates it. If the "
                     "session later fails to authenticate, exit it and re-run "
                     f"'cswap run {target_account}'."
                 )
+                if shares_login:
+                    msg += " Proceeding because --even-if-live was passed."
                 if emit_output:
                     warning(msg)
                 else:

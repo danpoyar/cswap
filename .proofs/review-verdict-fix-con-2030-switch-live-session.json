@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2030",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "ce99c72ea71156238b3aade44484158bf901d91a",
+  "summary": "фактических нет; major р.1 закрыт: судья при разных поколениях читает штамп посева, не STALE_MARKER — лгущий маркер больше не ведёт к активации/POST-у ни в _freshen_target (skip до heal'а), ни в _perform_switch (отказ после heal'а); ветка «штамп ≠ бэкап → False» не открывает POST потреблённого гранта; штамп пишется при каждом бутстрапе (session.py:932,974-975); minor 4 р.1 (тексты TUI/menubar) — долг по слову автора; альтернативы: judged",
+  "findings": []
+}

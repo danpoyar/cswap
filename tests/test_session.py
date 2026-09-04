@@ -1641,9 +1641,14 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
         assert not seeded_switcher.backup_dir.exists()
 
-    def test_switch_warns_on_live_target_but_completes(
+    def test_switch_refuses_live_target_without_readable_login(
         self, seeded_switcher, monkeypatch, capsys
     ):
+        """CON-2030: a live profile whose credential cannot be read is not
+        proven independent of the login family — refused, not warned (was:
+        warn-and-proceed)."""
+        from claude_swap.exceptions import LiveSessionRefusal
+
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
@@ -1652,7 +1657,24 @@ class TestGuards:
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
         monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
 
-        seeded_switcher._perform_switch(ACCOUNT_NUM)
+        with pytest.raises(LiveSessionRefusal, match="cswap run 2"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert "live session-mode" not in capsys.readouterr().out
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+
+    def test_switch_even_if_live_warns_on_live_target_and_completes(
+        self, seeded_switcher, monkeypatch, capsys
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        seeded_switcher._perform_switch(ACCOUNT_NUM, even_if_live=True)
 
         out = capsys.readouterr().out
         assert "live session-mode" in out

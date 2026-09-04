@@ -81,6 +81,8 @@ cswap list
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
+A switch onto an account that is running a live [session-mode](#run-multiple-accounts-at-the-same-time-session-mode) terminal on its stored login is **refused** (the error names the PIDs): the default login and the session would share one rotating refresh token in two stores, and the session loses its login at the next rotation. Work under that account with `cswap run N` instead, or pass `cswap switch N --even-if-live` to switch anyway (the session keeps running until its token rotates). Sessions on an attached setup-token or on an API-key account don't share the login, so they only get a notice. Auto-switch applies the same rule: it never rotates onto — or returns home to — an account whose live sessions run on its login, but a token or API-key account with live sessions stays a valid target.
+
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
 ### Automatic switching

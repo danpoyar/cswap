@@ -7921,6 +7921,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            even_if_live=False,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(
@@ -8391,3 +8392,407 @@ class TestSessionProfileEnvPoisoning:
             "1", "account1@example.com", "", creds_b)
         assert switcher._read_account_credentials(
             "1", "account1@example.com") == creds_a
+
+
+# ---------------------------------------------------------------------------
+# CON-2030: a switch onto a slot whose live `cswap run` session shares the
+# stored login is REFUSED (was: warn-and-proceed).
+# ---------------------------------------------------------------------------
+#
+# Live incident 2026-09-03 19:09 on the fleet machine: the operator switched
+# the default login onto the slot whose session profile hosted the live
+# orchestrator terminal. The profile and the slot backup held the SAME
+# generation (the profile was seeded from the backup and had not rotated
+# yet), so the CON-1579 heal saw "same lineage" and only the advisory drift
+# notice fired — in JSON mode into `warnings`, which the panel never shows.
+# Couriers on the global login then rotated the family; the profile kept the
+# consumed grant and printed "Login expired · Please run /login" 74 times
+# until morning. The equal-lineage case is exactly the one-family-two-stores
+# hazard the notice describes, so it is refused; `--even-if-live` overrides.
+
+_LIVE_NUM, _LIVE_EMAIL = "1", "test@example.com"  # identity of mock_claude_config
+_SESSION_NUM, _SESSION_EMAIL = "2", "account2@example.com"
+
+
+def _family_creds(access: str, refresh: str) -> str:
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": 32_503_680_000_000,  # far future
+    }})
+
+
+def _live_login_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
+    """Two managed slots on the Linux file backend; slot 1 is the live login
+    (its backup equals the live bytes → no identity oracle needed), slot 2
+    holds a full OAuth login in its backup."""
+    s = ClaudeAccountSwitcher()
+    s._setup_directories()
+    s.platform = Platform.LINUX
+    s._write_json(s.sequence_file, {
+        "activeAccountNumber": 1,
+        "lastUpdated": "2026-01-01T00:00:00Z",
+        "sequence": [1, 2],
+        "accounts": {
+            _LIVE_NUM: {"email": _LIVE_EMAIL, "uuid": "test-uuid-1234",
+                        "added": "2026-01-01T00:00:00Z"},
+            _SESSION_NUM: {"email": _SESSION_EMAIL, "uuid": "uuid-2",
+                           "added": "2026-01-02T00:00:00Z"},
+        },
+    })
+    live = _family_creds("at-live-1", "rt-live-1")
+    (temp_home / ".claude" / ".credentials.json").write_text(live, encoding="utf-8")
+    s.write_account_credentials(_LIVE_NUM, _LIVE_EMAIL, live)
+    s._write_account_config(_LIVE_NUM, _LIVE_EMAIL, json.dumps({
+        "oauthAccount": {"emailAddress": _LIVE_EMAIL, "accountUuid": "test-uuid-1234"},
+    }))
+    s.write_account_credentials(
+        _SESSION_NUM, _SESSION_EMAIL, _family_creds("at-2", "rt-2")
+    )
+    s._write_account_config(_SESSION_NUM, _SESSION_EMAIL, json.dumps({
+        "oauthAccount": {"emailAddress": _SESSION_EMAIL, "accountUuid": "uuid-2"},
+    }))
+    return s
+
+
+def _seed_profile_from_backup(s: ClaudeAccountSwitcher, credentials: str | None = None):
+    """The incident shape: the session profile holds the backup's own
+    generation (seeded, not yet rotated) — or the given credential."""
+    from claude_swap.session import SEED_FINGERPRINT_FILE
+
+    backup = s.read_account_credentials(_SESSION_NUM, _SESSION_EMAIL)
+    session_dir = s._session_dir(_SESSION_NUM, _SESSION_EMAIL)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / ".credentials.json").write_text(
+        credentials if credentials is not None else backup, encoding="utf-8"
+    )
+    (session_dir / SEED_FINGERPRINT_FILE).write_text(
+        oauth.credential_fingerprint(backup), encoding="utf-8"
+    )
+    return session_dir
+
+
+@pytest.fixture
+def _no_token_network():
+    """The identity oracle and the token endpoint never leave the test."""
+    with (
+        patch("claude_swap.oauth.fetch_oauth_profile", return_value=None),
+        patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
+        patch("claude_swap.refresh.try_refresh_oauth_credentials", post),
+    ):
+        yield post
+
+
+class TestSwitchRefusesLiveLoginSession:
+    """CON-2030: same lineage + live session on the login = refusal."""
+
+    def _live_bytes(self, temp_home: Path) -> str:
+        return (temp_home / ".claude" / ".credentials.json").read_text(encoding="utf-8")
+
+    def test_same_lineage_live_session_is_refused_with_recipe(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """RED on main: warn-and-proceed activated the shared generation."""
+        from claude_swap.exceptions import LiveSessionRefusal
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+        live_before = self._live_bytes(temp_home)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242, 4243]), \
+             patch("claude_swap.switcher.warning") as warn:
+            with pytest.raises(LiveSessionRefusal) as exc:
+                s.switch_to(_SESSION_NUM)
+
+        msg = str(exc.value)
+        assert "PID 4242, 4243" in msg
+        assert f"cswap run {_SESSION_NUM}" in msg
+        assert "--even-if-live" in msg
+        assert exc.value.pids == [4242, 4243]
+        assert exc.value.account_num == _SESSION_NUM
+        assert exc.value.command == f"cswap run {_SESSION_NUM}"
+        # Nothing moved, and the advisory notice did not precede the refusal.
+        warn.assert_not_called()
+        assert self._live_bytes(temp_home) == live_before
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        _no_token_network.assert_not_called()
+
+    def test_json_mode_refusal_is_the_structured_error_envelope(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network, capsys
+    ):
+        """`cswap switch 2 --json` → rc 1, stdout = error envelope naming the
+        refusal type and the recipe (what the Quota panel reads)."""
+        from claude_swap import cli
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch.object(s, "_live_session_pids", return_value=[4242]), \
+             patch.object(sys, "argv", ["claude-swap", "switch", _SESSION_NUM, "--json"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        captured = capsys.readouterr()
+        envelope = json.loads(captured.out)
+        assert envelope["error"]["type"] == "LiveSessionRefusal"
+        assert "PID 4242" in envelope["error"]["message"]
+        assert f"cswap run {_SESSION_NUM}" in envelope["error"]["message"]
+        assert captured.err == ""
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_even_if_live_switches_and_keeps_the_warning(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(_SESSION_NUM, json_output=True, even_if_live=True)
+
+        assert result["switched"] is True
+        assert result["to"] == {"number": 2, "email": _SESSION_EMAIL}
+        assert any("PID 4242" in w for w in result["warnings"])
+        assert oauth.extract_access_token(self._live_bytes(temp_home)) == "at-2"
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_even_if_live_human_mode_prints_the_warning(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]), \
+             patch("claude_swap.switcher.warning") as warn:
+            s.switch_to(_SESSION_NUM, even_if_live=True)
+
+        assert warn.call_count == 1
+        assert "PID 4242" in warn.call_args[0][0]
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_cli_even_if_live_flag_reaches_switch_to(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network, capsys
+    ):
+        from claude_swap import cli
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch.object(s, "_live_session_pids", return_value=[4242]), \
+             patch.object(sys, "argv", [
+                 "claude-swap", "switch", _SESSION_NUM, "--json", "--even-if-live",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["switched"] is True
+        assert any("PID 4242" in w for w in payload["warnings"])
+
+    def test_no_live_session_switches_silently(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """Regression guard: an idle profile with the same lineage is the
+        plain switch — no refusal, no notice."""
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[]):
+            result = s.switch_to(_SESSION_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert result["warnings"] == []
+
+    def test_token_seeded_profile_session_keeps_warn_and_proceed(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """A session running on the slot's attached inference token owns no
+        login family (CON-1329: `is_inference_token_credentials`) — the
+        default login can move there without touching that session, so the
+        advisory notice stays and nothing is refused."""
+        from claude_swap.inference_token import inference_token_credentials
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(
+            s, inference_token_credentials("sk-ant-oat01-year-long-token")
+        )
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(_SESSION_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert any("PID 4242" in w for w in result["warnings"])
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_superseded_profile_family_keeps_warn_and_proceed(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """The CON-1579 review r.1 shape: a re-login/re-add rewrote the BACKUP
+        (B) under the live session, whose profile keeps the older family (A)
+        plus the stale marker; the seed stamp names the generation both
+        started from (neither A nor B) — the backup moved after seeding, so
+        nothing is shared and the existing warn-and-proceed stands."""
+        from claude_swap.session import SEED_FINGERPRINT_FILE, STALE_MARKER
+
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(
+            s, _family_creds("at-old-2", "rt-old-2")
+        )
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(_family_creds("at-seed-2", "rt-seed-2")),
+            encoding="utf-8",
+        )
+        (session_dir / STALE_MARKER).touch()
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(_SESSION_NUM, json_output=True)
+
+        assert result["switched"] is True
+        assert any("PID 4242" in w for w in result["warnings"])
+
+    def test_profile_that_ran_ahead_under_a_lying_stale_marker_is_refused(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """Review r.1 (major): `_post_backup_write` marks a LIVE profile stale
+        on every backup rewrite — including leaving the slot with the same
+        family at the same generation (own-family write), after an
+        `--even-if-live` visit. The marker then lies: when the session rotates
+        next, the profile is the family's newest generation and the backup
+        is a consumed one, yet the heal's oracle reads the marker first and
+        calls the backup "newer". The judge must trust the seed stamp (backup
+        unmoved since seeding → the profile ran ahead → the live session
+        owns the family) and refuse — RED before the fix: warn-and-proceed
+        activated the consumed generation."""
+        from claude_swap.exceptions import LiveSessionRefusal
+        from claude_swap.session import STALE_MARKER
+
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(
+            s, _family_creds("at-2-next", "rt-2-next")  # rotated past the backup
+        )
+        (session_dir / STALE_MARKER).touch()  # seed stamp == fp(backup): lying
+        live_before = self._live_bytes(temp_home)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            with pytest.raises(LiveSessionRefusal):
+                s.switch_to(_SESSION_NUM, json_output=True)
+
+        assert self._live_bytes(temp_home) == live_before
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        _no_token_network.assert_not_called()
+
+    def test_bare_rotation_onto_a_live_login_session_is_refused(
+        self, temp_home: Path, mock_claude_config: Path, _no_token_network
+    ):
+        """`cswap switch` (rotate) lands on slot 2 — the same hazard, the
+        same refusal; there is no override on the rotation path."""
+        from claude_swap.exceptions import LiveSessionRefusal
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            with pytest.raises(LiveSessionRefusal):
+                s.switch(json_output=True)
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+
+class TestLiveSessionSharesLoginJudge:
+    """Every branch of `_live_session_shares_login` (review r.1, minor 3):
+    proven-independent sessions read False, everything unprovable True."""
+
+    def _judge(self, s) -> bool:
+        return s._live_session_shares_login(_SESSION_NUM, _SESSION_EMAIL)
+
+    def test_api_key_slot_never_shares(self, temp_home: Path, mock_claude_config: Path):
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+        data = s._get_sequence_data()
+        data["accounts"][_SESSION_NUM]["kind"] = "api_key"
+        s._write_json(s.sequence_file, data)
+        assert self._judge(s) is False
+
+    def test_drifted_profile_identity_never_shares(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(s)
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "other@example.com", "accountUuid": "u-x"},
+        }), encoding="utf-8")
+        assert self._judge(s) is False
+
+    def test_token_seeded_profile_never_shares(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        from claude_swap.inference_token import inference_token_credentials
+
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s, inference_token_credentials("sk-ant-oat01-x"))
+        assert self._judge(s) is False
+
+    def test_unreadable_profile_credential_reads_as_shared(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        s = _live_login_switcher(temp_home)
+        s._session_dir(_SESSION_NUM, _SESSION_EMAIL).mkdir(parents=True)
+        assert self._judge(s) is True
+
+    def test_missing_backup_reads_as_shared(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+        with patch.object(s, "_read_account_credentials", return_value=""):
+            assert self._judge(s) is True
+
+    def test_equal_generation_shares(self, temp_home: Path, mock_claude_config: Path):
+        s = _live_login_switcher(temp_home)
+        _seed_profile_from_backup(s)
+        assert self._judge(s) is True
+
+    def test_profile_ran_ahead_of_unmoved_backup_shares(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """Seed stamp == fp(backup), profile differs: the session rotated the
+        family past the backup — it owns the newest generation. The stale
+        marker, when present, is the lying one (review r.1 major)."""
+        from claude_swap.session import STALE_MARKER
+
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(s, _family_creds("at-2-next", "rt-2-next"))
+        assert self._judge(s) is True
+        (session_dir / STALE_MARKER).touch()
+        assert self._judge(s) is True
+
+    def test_missing_seed_stamp_with_differing_generation_reads_as_shared(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(s, _family_creds("at-2-next", "rt-2-next"))
+        (session_dir / SEED_FINGERPRINT_FILE).unlink()
+        assert self._judge(s) is True
+
+    def test_backup_rewritten_after_seeding_never_shares(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """Seed stamp != fp(backup): the backup moved after the profile was
+        seeded (re-login/re-add, or the same family's newer generation written
+        on the way out) — the profile copy is superseded, nothing is shared."""
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        s = _live_login_switcher(temp_home)
+        session_dir = _seed_profile_from_backup(s, _family_creds("at-old-2", "rt-old-2"))
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(_family_creds("at-seed-2", "rt-seed-2")),
+            encoding="utf-8",
+        )
+        assert self._judge(s) is False
