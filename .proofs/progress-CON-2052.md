@@ -3,7 +3,7 @@
 создан: 2026-09-04 15:04 +0200 · сессия: fix-con-2052 · посадка: session:Yor
 
 ## Где стоп
-- 16:20 +0200: ревью р.2 — можно принимать (вердикт-файл approve, head 97ea202), CI PR #34 зелёный (macos-keychain, test, test-windows). Следующий шаг: `gh pr merge 34 --squash` (без --auto) → `~/projects/cswap/scripts/deploy.sh main` → приёмка: launchctl, хвост cswap-auto.log (skip-live-login-slot для 32, нет switch to 32 новее деплоя), cswap status → финал в тикет + SendMessage Yor.
+- 16:30 +0200: ГОТОВО. PR #34 влит (squash 21a800c), деплой DEPLOY-OK (receipt 15:50:23, демон PID 18328 с 15:50:24, direct_url commit 21a800c), судья на живом слоте 32 инсталлированным пакетом → True. Логин стоит на 32 с 12:39:47Z (демон до фикса) — вернуть на 21 должна Yor рукой; после этого ждать в логе `skip-live-login-slot` для 32 при выжженном доме. Тикет → Done.
 
 ## Проверено
 - Проблема жива: демон переключал 21→32 ещё 09:47:35Z (at-limit) и 12:39:47Z (at-limit) — ~/.claude/logs/cswap-auto.log; `env -u CLAUDE_CONFIG_DIR cswap status` 15:09:47 +0200 → Account-32.
