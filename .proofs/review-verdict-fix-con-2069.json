@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2069",
+  "verdict": "approve",
+  "round": 3,
+  "head_sha": "ad39e054490a01b3beea2839824995d431dc481a",
+  "summary": "фактических нет, можно принимать. Important р.2 (STALE_MARKER на живом профиле после усыновления) закрыт: adopt_profile_family снимает маркер после landed (switcher.py:3136), возвращает landed (3158), heal сверяет fp(профиль)==fp(бэкап) до посадки (5767-5775); minor р.2 (spill → True) закрыт возвратом landed; нит р.2 закрыт тестами (а)-(в). Проверено: тесты (а),(б) красные на 9a87bf8 (оверлей старого src: marker exists / DID NOT RAISE), (в) зелёный до фикса (нит про покрытие); спот-чек HEAD test_switch_heal+test_reseed 47 passed; CI на head 1 прогон success; остальные вызыватели adopt (session.py:821/903/1033, reseed.py:368, switcher.py:3206/3224) маркер снимают или ставят заново сами; возврат читает только 5760; альтернативы: n/a (судились в р.1)",
+  "findings": []
+}

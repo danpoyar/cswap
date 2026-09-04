@@ -428,6 +428,27 @@ read in one sitting.
   wrong slot; an adoption is one lock-guarded write on drift plus an
   `adopt-real-login` event with both numbers. Fleet-shaped policy; the
   record reconciliation could travel upstream on its own.
+- The home pin holds through a burned model window (CON-2069, 2026-09-04;
+  supersedes change (1) of the CON-1581 item above). Since the terminals
+  moved into the home slot's own `cswap run` profile (config CON-2030), the
+  global login serves only the couriers — jobs without `cswap run` that ride
+  the model ladder and never need the pinned model — so the model-window
+  escape bought the terminal nothing and cost the fleet a seat: every slot
+  the login moved to fell out of the seat-picker's rotation for as long as
+  the home stayed burned (three moves on 2026-09-04, one Fable slot lost
+  for two days, the owner's third "the active login is always on 32").
+  Now, with the pin active: at home a burned scoped window is a
+  `home-pinned` hold whose detail names the window (never an
+  at-limit/proactive escape); the return home judges token liveness only
+  (the `home-model-burned` wait is gone); the account-wide 5h/7d walls
+  keep holding, a dead token still fails over, and the only voluntary way
+  off the home slot is `cswap config set autoswitch.homeAccount` /
+  `cswap disable`. The pool-shield stand-down while pinned (change (2)) and
+  the record reconciliation (change (3)) are unchanged. Away from home the
+  return still waits on a live `cswap run` session of the home slot
+  (`skip-live-session`, PR #34) — the fleet's guard (config
+  fleet-sensors, sensor R) brings the login home with
+  `cswap switch <home> --even-if-live`; the engine never overrides.
 
 - Bootstrap never POSTs the backup's consumed grant over a live profile
   family (CON-1740; live incident on this fleet, 2026-09-02, slot 29: a

@@ -5804,6 +5804,12 @@ class TestLiveLoginSlotSkip:
     candidate that cannot be taken; dry-run honors it too), and the daemon
     logs `skip-live-login-slot` with the slot and its PIDs plus a
     `no-viable-target` detail naming them.
+
+    CON-2069: the pin no longer yields at a burned home (the login stays on
+    the home slot through a burned model window — ``test_home_model_window``),
+    so the escapes these cases exercise run WITHOUT a pin: the candidate
+    filter under test is pin-independent, and a pinless rotation is exactly
+    where the fleet still rotates (a fleet slot at the threshold).
     """
 
     HOME = "home@example.com"
@@ -5813,7 +5819,7 @@ class TestLiveLoginSlotSkip:
         settings = {
             "strategy": "consume-first",
             "cooldown_seconds": 0.0,
-            "home_account": "1",
+            "home_account": "",
             "model": "Fable",
             **kwargs,
         }
@@ -5867,11 +5873,13 @@ class TestLiveLoginSlotSkip:
             assert h.engine._freshen_target("2", "b@example.com") == "skip-live-session"
         post.assert_not_called()
 
-    def test_burned_home_proactive_skips_the_only_live_login_candidate(self, temp_home):
-        """The 09:00Z tick: home Fable at the threshold, slot 2 the only fit
-        candidate and the orchestrator's live login slot. RED on main: switch
-        to 2 with the advisory warning nobody reads."""
-        h = self._harness(temp_home)
+    def test_burned_active_proactive_skips_the_only_live_login_candidate(self, temp_home):
+        """The 09:00Z tick: the active slot's Fable at the threshold, slot 2
+        the only fit candidate and the orchestrator's live login slot. RED on
+        main: switch to 2 with the advisory warning nobody reads. (Pinless
+        since CON-2069; ``strategy=best`` keeps the proactive escape on the
+        model-aware axis — consume-first's pool-shield judges 5h/7d.)"""
+        h = self._harness(temp_home, strategy="best")
         self._incident_profile(h, 2, "b@example.com")
         with patch.object(h.switcher, "live_session_pids_for", side_effect=self._live_pids_on(2)):
             outcome = h.tick_with_usage({
@@ -5888,7 +5896,7 @@ class TestLiveLoginSlotSkip:
         detail = self._no_viable(h).detail
         assert "Account-2" in detail and str(self.LIVE_PID) in detail
 
-    def test_burned_home_at_limit_skips_the_live_login_candidate_too(self, temp_home):
+    def test_burned_active_at_limit_skips_the_live_login_candidate_too(self, temp_home):
         """The 09:47Z / 12:39Z ticks (trigger at-limit). RED on main."""
         h = self._harness(temp_home)
         self._incident_profile(h, 2, "b@example.com")
@@ -5927,7 +5935,7 @@ class TestLiveLoginSlotSkip:
         signaled, then released without a swap."""
         h = self._harness(
             temp_home, drain2_wait_seconds=180.0, drain_timeout_seconds=600.0,
-            switch_under_load=True,
+            switch_under_load=True, strategy="best",
         )
         park = FakePark()
         park.roster_value = [_park_row("fix-a", pid=201), _park_row("fix-b", pid=202)]

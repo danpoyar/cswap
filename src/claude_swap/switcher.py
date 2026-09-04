@@ -3069,10 +3069,12 @@ class ClaudeAccountSwitcher:
         adopt off the same read, or an intermittent Keychain timeout skips
         the adoption here and passes the guard there. Without it the profile
         is read best-effort (``read_session_credentials``).
-        Returns True when a generation was adopted.
+        Returns True when a generation was adopted INTO THE BACKUP; False when
+        there was nothing to adopt or the pair spilled (backup unchanged).
         """
         from claude_swap.session import (
             SEED_FINGERPRINT_FILE,
+            STALE_MARKER,
             read_seed_fingerprint,
             read_session_credentials,
             session_identity_drifted,
@@ -3122,11 +3124,38 @@ class ClaudeAccountSwitcher:
                     f"Could not re-stamp the seed fingerprint for account "
                     f"{account_num} after adoption", exc_info=True,
                 )
-        self._logger.info(
-            f"Adopted the session profile's newer login generation into the "
-            f"backup of account {account_num} (landed={landed})"
-        )
-        return True
+            # The backup-write hook marked a LIVE profile stale ("the backup
+            # is the newer login") — after an adoption the two are ONE
+            # generation, so the marker lies: `_backup_is_newer` reads it
+            # first and the next pre-activation heal would land the backup
+            # after the session rotates again (CON-2069, review r.2 of PR
+            # #35, Important; the reseed door dropped it by hand — now every
+            # adopter does). An idle profile lost its copy instead; nothing
+            # to clear there.
+            try:
+                (session_dir / STALE_MARKER).unlink(missing_ok=True)
+            except OSError:
+                self._logger.warning(
+                    f"Could not clear the stale marker of account "
+                    f"{account_num}'s profile after adoption", exc_info=True,
+                )
+        if landed:
+            self._logger.info(
+                f"Adopted the session profile's newer login generation into "
+                f"the backup of account {account_num}"
+            )
+        else:
+            # The pair went to the spill sidecar: the backup is still the
+            # consumed generation until a reconcile pass folds it in —
+            # nothing was adopted INTO THE BACKUP, and a caller that
+            # activates on True would hand out the consumed grant (review
+            # r.2 of PR #35, minor).
+            self._logger.warning(
+                f"Account {account_num}: the session profile's newer generation "
+                "spilled instead of landing in the backup — not adopted yet "
+                "(the reconcile pass folds the spill in)"
+            )
+        return landed
 
     def attach_inference_token(self, identifier: str, token: str) -> None:
         """Attach a ``claude setup-token`` to a managed login slot.
@@ -5657,6 +5686,7 @@ class ClaudeAccountSwitcher:
         data: dict,
         emit_output: bool,
         warnings_out: list[str],
+        even_if_live: bool = False,
     ) -> None:
         """Refuse or heal a target whose stored backup lags its session profile.
 
@@ -5713,11 +5743,54 @@ class ClaudeAccountSwitcher:
                 warnings_out.append(msg)
             return
         if outcome == LIVE_SESSION:
-            # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
-            # menu bar shows it with a copy button — instead of a failed action.
             pids = [
                 int(p) for p in (report.detail or "").split(",") if p.strip().isdigit()
             ]
+            if even_if_live:
+                # CON-2069: the fleet's guard brings the login home with
+                # `switch <home> --even-if-live` while the home's own `cswap
+                # run` sessions are live and may have rotated the family past
+                # the backup. The override is the user's explicit word (the
+                # config repo's ADR 0020 accepts two copies of the family on
+                # the home slot); refusing here left the login stranded on a
+                # fleet seat (critic C2 of that ADR). Adopt the profile's
+                # newer generation into the backup — no POST, the seed stamp
+                # re-stamped, the live profile untouched — and land THAT
+                # generation, never the consumed one.
+                adopted = self.adopt_profile_family(account_num, email, org_uuid)
+                if adopted:
+                    # Belt and braces: land only what the backup now holds
+                    # equals the profile — an adoption that did not reach
+                    # the backup store must fall through to the refusal.
+                    from claude_swap.session import read_session_credentials
+
+                    prof_now = read_session_credentials(
+                        self._session_dir(account_num, email)
+                    )
+                    back_now = self._read_account_credentials(account_num, email)
+                    adopted = bool(
+                        prof_now and back_now
+                        and oauth.credential_fingerprint(prof_now)
+                        == oauth.credential_fingerprint(back_now)
+                    )
+                if adopted:
+                    msg = (
+                        f"Account-{account_num}'s stored login was a consumed "
+                        f"generation behind its live session (PID "
+                        f"{report.detail}); adopted the session's generation "
+                        "before activation because --even-if-live was passed "
+                        "— the login and the session now share one "
+                        "generation in two stores (they drift at the next "
+                        "rotation; the session re-bootstraps once idle)."
+                    )
+                    self._logger.info(msg)
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                    return
+            # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
+            # menu bar shows it with a copy button — instead of a failed action.
             raise LiveSessionRefusal(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {report.detail}) that rotated the token family "
@@ -5890,7 +5963,8 @@ class ClaudeAccountSwitcher:
             # store lock itself and may POST one refresh; nothing here runs
             # while our locks are held.
             self._heal_target_backup(
-                target_account, pre_email, pre_data, emit_output, warnings_out
+                target_account, pre_email, pre_data, emit_output, warnings_out,
+                even_if_live=even_if_live,
             )
             pids = self._live_session_pids(target_account, pre_email)
             if pids:
