@@ -96,11 +96,10 @@ Refusals raise :class:`ReseedRefusal` (a ``SessionError``) carrying a stable
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap import oauth
-from claude_swap.claude_locks import CREDENTIALS_STALENESS_S, proper_lockfile
+from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import (
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -187,22 +186,6 @@ def _full_pair(credentials: str | None) -> dict | None:
     return None
 
 
-def _profile_locks(session_dir: Path):
-    """Claude Code's credential-lock pair for THIS config dir, in CC's own
-    order — the same pair ``refresh._refresh_resolved`` holds around a
-    profile write (``claude_locks`` derives the names from the config home:
-    ``<home>/.oauth_refresh.lock`` then legacy ``<home>.lock``)."""
-    return (
-        proper_lockfile(
-            session_dir / ".oauth_refresh.lock", staleness=CREDENTIALS_STALENESS_S
-        ),
-        proper_lockfile(
-            session_dir.parent / (session_dir.name + ".lock"),
-            staleness=CREDENTIALS_STALENESS_S,
-        ),
-    )
-
-
 def _login_family_into_profile(profile_raw: str | None, backup: str) -> str:
     """The bytes to write: the backup's login family under the profile's OWN
     machine-shared fields. ``merge_shared_credential_fields`` lets the
@@ -286,8 +269,7 @@ def reseed_account(
             # own claude mid-refresh is excluded, and the bytes the
             # shared-fields merge writes back are the ones it holds NOW
             # (review r.1, Minor 3).
-            lock_a, lock_b = _profile_locks(session_dir)
-            with lock_a, lock_b:
+            with claude_credentials_lock(config_home=session_dir):
                 # ONE read of the profile's newest generation feeds the
                 # token gate, the ordering judge and the shared-fields
                 # merge (CON-1740, review r.1: two reads let a Keychain

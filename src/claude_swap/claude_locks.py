@@ -63,17 +63,24 @@ DEFAULT_TIMEOUT_S = 9.0
 _logger = logging.getLogger("claude-swap")
 
 
-def credentials_lock_dir() -> Path:
-    """Legacy credential lock (``~/.claude.lock``) — CC still takes it for
-    compatibility; external exclusion today rests on this one."""
-    home = get_claude_config_home()
+def credentials_lock_dir(home: Path | None = None) -> Path:
+    """Legacy credential lock (``<config-home>.lock`` — ``~/.claude.lock`` for
+    the global home) — CC still takes it for compatibility; external
+    exclusion today rests on this one. ``home`` names another config dir (a
+    cswap session profile, the ``CLAUDE_CONFIG_DIR`` of the claude running
+    there); default is Claude Code's global config home."""
+    if home is None:
+        home = get_claude_config_home()
     return home.parent / (home.name + ".lock")
 
 
-def oauth_refresh_lock_dir() -> Path:
+def oauth_refresh_lock_dir(home: Path | None = None) -> Path:
     """Claude Code's primary OAuth refresh lock
-    (``<config-home>/.oauth_refresh.lock``, 2.1.218+)."""
-    return get_claude_config_home() / ".oauth_refresh.lock"
+    (``<config-home>/.oauth_refresh.lock``, 2.1.218+); ``home`` as in
+    ``credentials_lock_dir``."""
+    if home is None:
+        home = get_claude_config_home()
+    return home / ".oauth_refresh.lock"
 
 
 def config_lock_dir() -> Path:
@@ -155,24 +162,33 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(
+    *, timeout: float | None = None, config_home: Path | None = None
+):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
-    legacy ``~/.claude.lock``; on legacy contention it releases the primary
-    before retrying. Mirroring both the pair and the order means a waiting
-    cswap and a waiting Claude Code can never deadlock against each other,
-    and exclusion holds even after CC drops the legacy lock. Both use CC's
-    60s staleness — never steal a lock a live CC may still hold.
+    legacy ``<config-home>.lock`` (``~/.claude.lock``); on legacy contention
+    it releases the primary before retrying. Mirroring both the pair and the
+    order means a waiting cswap and a waiting Claude Code can never deadlock
+    against each other, and exclusion holds even after CC drops the legacy
+    lock. Both use CC's 60s staleness — never steal a lock a live CC may
+    still hold.
+
+    ``config_home`` names WHOSE pair to hold: default the global config
+    home (the active login's claude); a cswap session profile dir for the
+    claude running there (``refresh``/``reseed`` writing into a profile
+    store) — the one owner of the pair's names, order and staleness
+    (CON-2053).
     """
     with (
         proper_lockfile(
-            oauth_refresh_lock_dir(),
+            oauth_refresh_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
         proper_lockfile(
-            credentials_lock_dir(),
+            credentials_lock_dir(config_home),
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
