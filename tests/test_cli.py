@@ -299,7 +299,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=True
+            "2", json_output=False, force=True, even_if_live=False
         )
 
     def test_switch_to_without_force_forwards_false(self):
@@ -311,7 +311,37 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, even_if_live=False
+        )
+
+    def test_even_if_live_requires_switch_to(self, capsys):
+        """CON-2030: the override only means something on a direct switch."""
+        with patch.object(sys, "argv", ["claude-swap", "--list", "--even-if-live"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert (
+            "--even-if-live can only be used with 'switch <num|email>'"
+            in capsys.readouterr().err
+        )
+
+    def test_even_if_live_rejected_on_bare_switch(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "switch", "--even-if-live"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--even-if-live can only be used with" in capsys.readouterr().err
+
+    def test_switch_to_even_if_live_forwarded(self):
+        """`cswap switch 2 --even-if-live` forwards even_if_live=True."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "switch", "2", "--even-if-live"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2", json_output=False, force=False, even_if_live=True
         )
 
     def test_export_and_import_are_mutually_exclusive(self):
@@ -716,7 +746,7 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, even_if_live=False
         )
 
     def test_bare_switch_subcommand_dispatches_switch(self):

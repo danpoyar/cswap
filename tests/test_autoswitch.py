@@ -5620,3 +5620,138 @@ class TestConsumeFirstPoolShield:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
+
+
+
+class TestLiveSessionSkipJudgesLoginFamily:
+    """CON-2030: the daemon skips a slot with live `cswap run` sessions only
+    when those sessions run on the slot's OAuth LOGIN family.
+
+    Live log on the fleet machine, 2026-09-04 (~/.claude/logs/cswap-auto.log,
+    every 30 s): `"reason": "return-home-wait", "detail": "the return to
+    Account-21 waits: a 'cswap run' session holds Account-21"`. Home 21 is the
+    park's slot on a year-long inference token: its sessions are seeded with
+    the TOKEN (`SessionManager._bootstrap`: "seed the profile with IT, not
+    with the login's refresh family"), so the login family can move without
+    touching them — and there is ALWAYS a live bg-agent session on it, so the
+    login never came home and stayed on the orchestrator's slot 32. On main
+    `_freshen_target` skipped on live PIDs alone; now it skips only when
+    `live_session_shares_login_for` says the profile holds the login family.
+    """
+
+    def _mark_api_key(self, h: EngineHarness, num: int) -> None:
+        data = h.switcher._get_sequence_data()
+        data["accounts"][str(num)]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    def _seed_profile(self, h: EngineHarness, num: int, email: str, creds: str) -> Path:
+        from claude_swap.session import SEED_FINGERPRINT_FILE
+
+        session_dir = h.switcher._session_dir(str(num), email)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(creds, encoding="utf-8")
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(
+                h.switcher.read_account_credentials(str(num), email)
+            ),
+            encoding="utf-8",
+        )
+        return session_dir
+
+    def _token_profile(self, h: EngineHarness, num: int, email: str) -> Path:
+        from claude_swap.inference_token import inference_token_credentials
+
+        return self._seed_profile(
+            h, num, email, inference_token_credentials("sk-ant-oat01-year-long")
+        )
+
+    def _login_profile(self, h: EngineHarness, num: int, email: str) -> Path:
+        """The profile holds the backup's own generation (seeded, unrotated)."""
+        return self._seed_profile(
+            h, num, email, h.switcher.read_account_credentials(str(num), email)
+        )
+
+    def test_freshen_target_activates_a_token_seeded_live_slot(self, temp_home):
+        """RED on main: "skip-live-session" (the daemon waited forever)."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        self._token_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            assert h.engine._freshen_target("2", "b@example.com") == "ok"
+
+    def test_freshen_target_still_skips_a_live_login_slot(self, temp_home):
+        """Unchanged: sessions on the login family hold the slot."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        self._login_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            assert h.engine._freshen_target("2", "b@example.com") == "skip-live-session"
+
+    def test_return_home_lands_on_a_token_slot_with_live_sessions(self, temp_home):
+        """RED on main: return-home-wait ("a 'cswap run' session holds
+        Account-1") on every tick — the incident shape."""
+        h = EngineHarness(
+            temp_home, strategy="consume-first", cooldown_seconds=0.0, home_account="1"
+        )
+        h.seed(1, "home@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        self._token_profile(h, 1, "home@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            outcome = h.tick_with_usage({"1": _usage(30), "2": _usage(30)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "return-home"
+
+    def test_return_home_waits_while_login_sessions_hold_home(self, temp_home):
+        """Unchanged: a login-family session on home holds the return."""
+        h = EngineHarness(
+            temp_home, strategy="consume-first", cooldown_seconds=0.0, home_account="1"
+        )
+        h.seed(1, "home@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(2, "b@example.com")
+        h.make_live("b@example.com", 2)
+        data = h.switcher._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        self._login_profile(h, 1, "home@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            outcome = h.tick_with_usage({"1": _usage(30), "2": _usage(30)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        waits = [e for e in h.events if isinstance(e, NoSwitchEvent)
+                 and e.reason == "return-home-wait"]
+        assert waits and "cswap run" in waits[0].detail
+
+    def test_rotation_activates_a_token_slot_with_live_sessions(self, temp_home):
+        """RED on main: BLOCKED — the only fresh candidate was skipped."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        self._token_profile(h, 2, "b@example.com")
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_live_api_key_last_resort_still_activates(self, temp_home):
+        """Unchanged: an API-key session runs on the static key — no OAuth
+        family to fork, the daemon may still take the last resort."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        with patch.object(h.switcher, "live_session_pids_for", return_value=[4242]):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2

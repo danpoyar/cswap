@@ -304,6 +304,35 @@ read in one sitting.
   typed refusal + TUI handoff could travel upstream with the session-mode
   work.
 
+- `switch` REFUSES a slot whose live `cswap run` session shares the stored
+  login, and the daemon judges a live-session slot by what its profile holds
+  (CON-2030, 2026-09-04). Live incident 2026-09-03 19:09: the operator
+  switched the default login onto the slot hosting the orchestrator's live
+  terminal. Profile and backup held the SAME generation (seeded, not yet
+  rotated), so the CON-1579 heal saw "same lineage" and only the advisory
+  drift notice fired — in JSON mode into `warnings`, which the panel never
+  shows. Couriers on the global login rotated the family, the profile kept
+  the consumed grant, and the terminal printed "Login expired" 74 times until
+  morning (12.5 h mute). Now `_perform_switch` raises the typed
+  `LiveSessionRefusal` (PIDs + recipe `cswap run N`; JSON: the error
+  envelope) when `_live_session_shares_login` says the profile runs on the
+  slot's own login family: equal refresh-token fingerprints, or a profile
+  that cannot be read at all. Proven-independent sessions keep the old
+  warn-and-proceed: an API-key slot, a token-seeded profile
+  (`is_inference_token_credentials` — "holds no login family", CON-1329), a
+  profile logged in as another account, or a DIFFERENT family (the heal
+  already judged who ran ahead). The override is a new flag,
+  `cswap switch N --even-if-live` — deliberately not `--force`, which also
+  skips backing up the current login. The same judge fixes the daemon's
+  mirror bug: `_freshen_target` skipped ANY slot with live PIDs, so the
+  park's token home (slot 21, always hosting bg-agent sessions on the
+  attached inference token) logged `return-home-wait: a 'cswap run' session
+  holds Account-21` every 30 s and the login never came home from the
+  orchestrator's slot. It now skips only when the sessions run on the login
+  family; a token or API-key slot with live sessions is activated (family
+  drift there touches only the quota gauge, not inference). Fleet-shaped;
+  offer upstream with the session-mode work.
+
 - The home pin judges the pinned model's window, and the record follows
   the real login (CON-1581, 2026-08-31). Live incident: after a reboot and
   a manual browser `/login`, `return-home` moved the live login back onto
