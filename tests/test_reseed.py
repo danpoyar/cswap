@@ -133,7 +133,7 @@ class TestReseedWritesBackupIntoLiveProfile:
         from claude_swap.reseed import RESEEDED, reseed_account
 
         s = _make_switcher()
-        consumed, backup, session_dir = _incident_slot(s)
+        _consumed, backup, session_dir = _incident_slot(s)
 
         report = reseed_account(s, NUM)
 
@@ -300,6 +300,41 @@ class TestProfileAhead:
         # One family, one copy (the codebase's backup-write invariant for an
         # idle profile): the next `cswap run` seeds it back from the backup.
         assert not (session_dir / ".credentials.json").exists()
+        # A profile without credentials owns no family — the seed stamp the
+        # adoption re-wrote must not survive, or it freezes the freshly
+        # adopted backup ("the backup is the profile's consumed seed") for
+        # the collector's seed guard, `cswap refresh` and this door
+        # (review r.1, Major 1).
+        assert not (session_dir / SEED_FINGERPRINT_FILE).exists()
+        assert "dropped" in (report.detail or "")
+        post.assert_not_called()
+
+    def test_idle_profile_ahead_leaves_a_slot_the_door_and_refresh_can_use(
+        self, temp_home, post
+    ):
+        """Review r.1 repro: after the idle adoption a second reseed answered
+        `relogin-required` and `cswap refresh` `deferred` — the backup was
+        frozen behind a stamp over no credential."""
+        from claude_swap.refresh import FRESH, refresh_account
+        from claude_swap.reseed import PROFILE_AHEAD, RESEEDED, reseed_account
+
+        s = _make_switcher()
+        seed = _creds("at-seed", "rt-seed", expires=EXPIRED_MS)
+        rotated = _creds("at-rotated", "rt-rotated")
+        s.write_account_credentials(NUM, EMAIL, seed)
+        session_dir = _profile(s, rotated, seed_of=seed)
+
+        with patch.object(s, "_live_session_pids", return_value=[]):
+            first = reseed_account(s, NUM)
+            second = reseed_account(s, NUM)
+            refreshed = refresh_account(s, NUM)
+
+        assert first.outcome == PROFILE_AHEAD
+        # The dropped copy comes back from the adopted backup — no POST.
+        assert second.outcome == RESEEDED
+        assert _plaintext(session_dir) == rotated
+        assert _stamp(session_dir) == oauth.credential_fingerprint(rotated)
+        assert refreshed.outcome == FRESH
         post.assert_not_called()
 
     def test_same_generation_is_in_sync_and_nothing_is_written(
@@ -425,6 +460,81 @@ class TestRefusals:
         assert "condemned" in str(exc.value)
         assert _plaintext(session_dir) == consumed
         post.assert_not_called()
+
+    def test_active_slot_is_refused_like_refresh_does(self, temp_home, post, live):
+        """Review r.1, Major 2: the active default login's live credential is
+        Claude Code's store; the stored copy is a consumed predecessor
+        whenever CC rotated in place — POSTing or copying it strikes a LIVE
+        login (`_refresh_resolved` refuses `active-slot` the same way)."""
+        from claude_swap.reseed import ACTIVE_SLOT, ReseedRefusal, reseed_account
+
+        s = _make_switcher()
+        consumed, backup, session_dir = _incident_slot(s, backup_expires=EXPIRED_MS)
+
+        with (
+            patch.object(s, "_get_current_account", return_value=(EMAIL, "")),
+            pytest.raises(ReseedRefusal) as exc,
+        ):
+            reseed_account(s, NUM)
+
+        assert exc.value.outcome == ACTIVE_SLOT
+        post.assert_not_called()
+        assert _plaintext(session_dir) == consumed
+        assert s.read_account_credentials(NUM, EMAIL) == backup
+
+    def test_active_slot_with_another_org_is_not_this_slot(
+        self, temp_home, post, live
+    ):
+        from claude_swap.reseed import RESEEDED, reseed_account
+
+        s = _make_switcher()
+        _incident_slot(s)
+        data = json.loads(s.sequence_file.read_text(encoding="utf-8"))
+        data["accounts"][NUM]["organizationUuid"] = "org-2"
+        s.sequence_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch.object(s, "_get_current_account", return_value=(EMAIL, "org-1")):
+            report = reseed_account(s, NUM)
+
+        assert report.outcome == RESEEDED
+
+    def test_profile_is_read_under_its_credential_locks(self, temp_home, post, live):
+        """Review r.1, Minor 3: the shared-fields merge writes back what the
+        live claude holds NOW — the profile read must happen after both of
+        Claude Code's credential locks for that config dir are held."""
+        from contextlib import contextmanager
+
+        from claude_swap import reseed
+
+        s = _make_switcher()
+        _incident_slot(s)
+        events: list[str] = []
+        real_lock = reseed.proper_lockfile
+        real_read = reseed.read_profile_generation
+
+        @contextmanager
+        def recording_lock(lock_dir, **kwargs):
+            with real_lock(lock_dir, **kwargs):
+                events.append(f"lock:{lock_dir.name}")
+                yield
+
+        def recording_read(session_dir):
+            events.append("read")
+            return real_read(session_dir)
+
+        with (
+            patch.object(reseed, "proper_lockfile", recording_lock),
+            patch.object(reseed, "read_profile_generation", recording_read),
+        ):
+            report = reseed.reseed_account(s, NUM)
+
+        assert report.outcome == reseed.RESEEDED
+        session_dir = s._session_dir(NUM, EMAIL)
+        assert events[:3] == [
+            "lock:.oauth_refresh.lock",
+            f"lock:{session_dir.name}.lock",
+            "read",
+        ], events
 
     def test_no_profile_is_nothing_to_reseed(self, temp_home, post):
         from claude_swap.reseed import NO_PROFILE, ReseedRefusal, reseed_account
@@ -640,8 +750,7 @@ class TestReseedCli:
     def test_main_help_mentions_reseed(self, capsys):
         from claude_swap import cli
 
-        with patch("sys.argv", ["cswap", "--help"]):
-            with pytest.raises(SystemExit):
-                cli.main()
+        with patch("sys.argv", ["cswap", "--help"]), pytest.raises(SystemExit):
+            cli.main()
 
         assert "reseed <num|email>" in capsys.readouterr().out

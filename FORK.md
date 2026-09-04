@@ -374,7 +374,17 @@ read in one sitting.
   store; a profile is the same code with `CLAUDE_CONFIG_DIR` as its config
   home) — not separately proven for profiles in this fork, so the recipe
   stays "reseed, then restart" (`cswap run N -- --resume`), which the
-  healer does anyway. Refusals (`no-profile`, `api-key`, `token-profile`,
+  healer does anyway. Review r.1 closed two holes: the ACTIVE slot is
+  refused (`active-slot`) exactly as `_refresh_resolved` refuses it (the
+  live credential is Claude Code's store, the stored copy a consumed
+  predecessor after any in-place rotation — POSTing it strikes a live
+  login); and an idle profile whose copy the backup-write hook dropped
+  after the adoption does not keep the seed stamp the adoption re-wrote (a
+  stamp over no credential froze the freshly adopted backup for the
+  collector's seed guard, `cswap refresh` and the door itself). Every
+  profile read runs under the profile's credential-lock pair, so the
+  shared-fields merge writes back what the live claude holds now. Refusals
+  (`no-profile`, `api-key`, `active-slot`, `token-profile`,
   `identity-drifted`, `deferred`, `undecidable`, `no-credentials`,
   `transient-error`) are the switch-style JSON error envelope plus
   `error.outcome`/`error.livePids`. Fleet-shaped; offer upstream with the

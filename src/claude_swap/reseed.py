@@ -48,6 +48,21 @@ and ``_backup_is_newer`` — marker first — would call the consumed backup
   records the strike, the profile is untouched. A transient failure →
   ``TRANSIENT_ERROR``, untouched.
 - equal fingerprints → ``IN_SYNC``: nothing to reseed, nothing written.
+- the ACTIVE slot (the live default login) is refused (``ACTIVE_SLOT``),
+  exactly as ``refresh._refresh_resolved`` refuses it: its live credential
+  is Claude Code's own store and the backup copy is a consumed predecessor
+  whenever CC rotated in place — POSTing or copying it strikes a LIVE
+  login; the active account heals through its own locked collector path
+  (``_fetch_active_usage``). Review r.1, Major 2.
+- an idle profile whose copy the backup-write hook dropped (one family,
+  one copy) must not keep its seed stamp: a stamp over no credential would
+  freeze the freshly adopted backup for the collector's seed guard,
+  ``cswap refresh`` and this door (review r.1, Major 1; the invariant of
+  ``_invalidate_session_credentials``).
+
+Every read of the profile happens under the profile's credential-lock pair
+(review r.1, Minor 3): the shared-fields merge writes back what the live
+claude holds NOW, not a pre-lock snapshot.
 
 Live sessions do NOT block the door — that is its point. Their PIDs are
 reported. What they do with the new generation rests on Claude Code's own
@@ -62,9 +77,10 @@ a session profile is the same code with ``CLAUDE_CONFIG_DIR`` as the config
 home (same lock names relative to it — ``claude_locks``), so the door holds
 that profile-scoped pair around every store write, exactly like
 ``refresh._refresh_resolved`` does. The adoption by a live claude in a
-PROFILE is not separately proven in this fork: живые сессии подхватят
-поколение на следующем 401-перечтении хранилища; гарантия — перезапуск
-сессии (``cswap run N -- --resume``, which the healer does anyway).
+PROFILE is not separately proven in this fork: live sessions pick the
+generation up at their next 401-path re-read of the store; the guarantee is
+a restart of the session (``cswap run N -- --resume``, which the healer does
+anyway).
 
 Locking mirrors the bootstrap and the parked-slot refresh: the account
 ``FileLock`` serializes against ``cswap run`` bootstraps, the collector's
@@ -94,6 +110,7 @@ from claude_swap.inference_token import is_inference_token_credentials
 from claude_swap.locking import FileLock
 from claude_swap.refresh import _reseed_profile
 from claude_swap.session import (
+    SEED_FINGERPRINT_FILE,
     STALE_MARKER,
     read_profile_generation,
     read_seed_fingerprint,
@@ -116,6 +133,7 @@ PROFILE_AHEAD = "profile-ahead"  # profile owns the newest generation; backup ad
 # Refusals (ReseedRefusal.outcome; exit 1).
 NO_PROFILE = "no-profile"  # nothing to reseed: no session profile on disk
 API_KEY = "api-key"  # API-key slots have no OAuth family
+ACTIVE_SLOT = "active-slot"  # the live default login heals through its own path
 TOKEN_PROFILE = "token-profile"  # profile runs on an inference token (CON-1329)
 IDENTITY_DRIFTED = "identity-drifted"  # profile is logged in as another account
 DEFERRED = "deferred"  # unsafe to judge now (Keychain busy, locks held elsewhere)
@@ -239,136 +257,174 @@ def reseed_account(
 
     try:
         with FileLock(switcher.lock_file, timeout=_RESEED_LOCK_TIMEOUT_S):
-            pids = switcher._live_session_pids(account_num, email)
-            # A pending spilled rotation is the backup family's newest
-            # generation (CON-849): fold it in before judging the disk.
-            backup = switcher.read_account_credentials(account_num, email)
-            backup = switcher.reconcile_pending_rotation_locked(
-                account_num, email, backup
-            )
-            # ONE read of the profile's newest generation feeds the token
-            # gate, the ordering judge and the shared-fields merge
-            # (CON-1740, review r.1: two reads let a Keychain timeout skip
-            # one guard and pass another).
-            profile_read = read_profile_generation(session_dir)
-            profile_raw, profile_err = profile_read
-            if profile_raw is None and profile_err is not None:
-                raise refuse(
-                    DEFERRED,
-                    f"the profile's own credential cannot be read right now "
-                    f"({profile_err}) — who holds the newer generation is "
-                    "undecidable; not overwriting what may be the family's "
-                    "newest. Retry shortly (CON-1740)",
-                    pids,
-                )
-            if profile_raw and is_inference_token_credentials(profile_raw):
-                raise refuse(
-                    TOKEN_PROFILE,
-                    "the profile runs on an inference token, its login family "
-                    "is the backup (CON-1329) — there is no drift to reseed",
-                    pids,
-                )
-            backup_oauth = _full_pair(backup)
-            if backup_oauth is None:
-                raise refuse(
-                    NO_CREDENTIALS,
-                    "the stored backup holds no full token pair — re-add the "
-                    f"slot after logging in: cswap add --slot {account_num}",
-                    pids,
-                )
-            fp_backup = oauth.credential_fingerprint(backup)
-            seed = read_seed_fingerprint(session_dir)
-            profile_oauth = _full_pair(profile_raw)
-            fp_profile = (
-                oauth.credential_fingerprint(profile_raw)
-                if profile_raw and profile_oauth is not None
-                else None
-            )
-
-            if fp_profile == fp_backup:
-                return report(IN_SYNC, pids, fp_profile,
-                              "profile and backup hold the same generation")
-
-            if profile_oauth is not None:
-                if seed is None:
+            # The ACTIVE slot is never reseeded from here (mirror of
+            # `_refresh_resolved`, review r.1 Major 2): its live credential
+            # is Claude Code's store, and the backup copy is a consumed
+            # predecessor whenever CC rotated during normal use — POSTing
+            # it is an invalid_grant strike on a LIVE login at best, and
+            # copying it under a second writer forks the live family.
+            # Judged under the lock, so a concurrent `cswap switch` (same
+            # lock) cannot make this slot active mid-reseed.
+            current = switcher._get_current_account()
+            if current is not None:
+                cur_email, cur_org = current
+                if cur_email == email and (
+                    not cur_org or not org_uuid or cur_org == org_uuid
+                ):
                     raise refuse(
-                        UNDECIDABLE,
-                        "the profile holds a different generation and carries "
-                        "no seed stamp — who ran ahead cannot be told; not "
-                        "overwriting a generation that may be the newest "
-                        f"(idle: cswap refresh {account_num})",
-                        pids,
+                        ACTIVE_SLOT,
+                        "the slot is the active default login — its live "
+                        "credential is Claude Code's own store and the stored "
+                        "copy may be a consumed predecessor; the active login "
+                        "heals through the collector's locked path, nothing to "
+                        "reseed here",
                     )
-                if seed == fp_backup:
-                    # Backup unmoved since seeding: the profile rotated
-                    # ahead and owns the newest generation. Adopt it into
-                    # the backup (no POST; re-stamps the seed) — the
-                    # bootstrap's own judge, stamp-only. The backup-write
-                    # hook marks a LIVE profile stale (or drops an idle
-                    # profile's copy: one family, one copy); after the
-                    # adoption backup == profile, so a marker would lie
-                    # (review r.1 of #32) — drop it.
-                    adopted = switcher.adopt_profile_family(
-                        account_num, email, org_uuid, locked=True,
-                        profile_read=profile_read,
-                    )
-                    (session_dir / STALE_MARKER).unlink(missing_ok=True)
-                    expired = oauth.is_oauth_token_expired(
-                        profile_oauth.get("expiresAt")
-                    )
-                    detail = (
-                        "the profile rotated past the backup; "
-                        + ("backup adopted its generation" if adopted
-                           else "backup not adopted")
-                        + (
-                            " — its access token is expired: a live session "
-                            "refreshes it on its own 401 path"
-                            if expired and pids
-                            else (
-                                f" — its access token is expired: cswap refresh "
-                                f"{account_num}"
-                                if expired
-                                else ""
-                            )
-                        )
-                    )
-                    return report(PROFILE_AHEAD, pids, fp_profile, detail)
-                # seed != backup: the backup moved after the profile was
-                # seeded — the profile's copy is the consumed predecessor.
-            elif seed and seed == fp_backup:
-                # No usable pair in the profile (claude's invalid_grant wipe,
-                # or nothing at all) over a backup that still equals the
-                # generation the profile was seeded with: the profile's
-                # family rotated past it and died — the backup is the
-                # consumed predecessor, and replaying a consumed grant is the
-                # documented reuse signal (CON-849).
-                raise refuse(
-                    RELOGIN_REQUIRED,
-                    "the profile holds no usable login and the stored backup "
-                    "is the consumed seed generation the profile rotated "
-                    "past — only a re-login helps: cswap-relogin.sh "
-                    f"{account_num} (or `cswap add --slot {account_num}` "
-                    f"after logging in with {email})",
-                    pids,
-                )
+            pids = switcher._live_session_pids(account_num, email)
 
-            # The backup is the newer generation. Never reseed a lineage
-            # the store already condemned (same parole rule as the
-            # collector, `cswap refresh` and the bootstrap).
-            entry = switcher._usage_store.entries(identity)[account_num]
-            if entry.token_dead() and not switcher._parole_eligible(entry, backup):
-                raise refuse(
-                    RELOGIN_REQUIRED,
-                    "the stored login's lineage is condemned (the token "
-                    "endpoint already answered invalid_grant for this "
-                    "generation) — not seeding a profile with it. Re-login "
-                    f"and re-add the slot: cswap-relogin.sh {account_num}",
-                    pids,
-                )
-
-            working = backup
+            # Everything that reads or writes the profile runs under Claude
+            # Code's credential-lock pair for THIS config dir: the profile's
+            # own claude mid-refresh is excluded, and the bytes the
+            # shared-fields merge writes back are the ones it holds NOW
+            # (review r.1, Minor 3).
             lock_a, lock_b = _profile_locks(session_dir)
             with lock_a, lock_b:
+                # ONE read of the profile's newest generation feeds the
+                # token gate, the ordering judge and the shared-fields
+                # merge (CON-1740, review r.1: two reads let a Keychain
+                # timeout skip one guard and pass another).
+                profile_read = read_profile_generation(session_dir)
+                profile_raw, profile_err = profile_read
+                if profile_raw is None and profile_err is not None:
+                    raise refuse(
+                        DEFERRED,
+                        f"the profile's own credential cannot be read right "
+                        f"now ({profile_err}) — who holds the newer generation "
+                        "is undecidable; not overwriting what may be the "
+                        "family's newest. Retry shortly (CON-1740)",
+                        pids,
+                    )
+                if profile_raw and is_inference_token_credentials(profile_raw):
+                    raise refuse(
+                        TOKEN_PROFILE,
+                        "the profile runs on an inference token, its login "
+                        "family is the backup (CON-1329) — there is no drift "
+                        "to reseed",
+                        pids,
+                    )
+                # The backup is read AFTER the profile on purpose: on macOS
+                # both live in the Keychain, and the backup reader answers a
+                # Keychain timeout with "" (credentials.py) — judged first it
+                # would turn a busy Keychain into a false "no credentials".
+                # A pending spilled rotation is the backup family's newest
+                # generation (CON-849): folded in before judging the disk
+                # (its backup-write hook lands under these locks too).
+                backup = switcher.read_account_credentials(account_num, email)
+                backup = switcher.reconcile_pending_rotation_locked(
+                    account_num, email, backup
+                )
+                backup_oauth = _full_pair(backup)
+                if backup_oauth is None:
+                    raise refuse(
+                        NO_CREDENTIALS,
+                        "the stored backup holds no full token pair — re-add "
+                        f"the slot after logging in: cswap add --slot {account_num}",
+                        pids,
+                    )
+                fp_backup = oauth.credential_fingerprint(backup)
+                seed = read_seed_fingerprint(session_dir)
+                profile_oauth = _full_pair(profile_raw)
+                fp_profile = (
+                    oauth.credential_fingerprint(profile_raw)
+                    if profile_raw and profile_oauth is not None
+                    else None
+                )
+
+                if fp_profile == fp_backup:
+                    return report(
+                        IN_SYNC, pids, fp_profile,
+                        "profile and backup hold the same generation",
+                    )
+
+                if profile_oauth is not None:
+                    if seed is None:
+                        raise refuse(
+                            UNDECIDABLE,
+                            "the profile holds a different generation and "
+                            "carries no seed stamp — who ran ahead cannot be "
+                            "told; not overwriting a generation that may be "
+                            f"the newest (idle: cswap refresh {account_num})",
+                            pids,
+                        )
+                    if seed == fp_backup:
+                        # Backup unmoved since seeding: the profile rotated
+                        # ahead and owns the newest generation. Nothing is
+                        # written into its store; the backup adopts that
+                        # generation (`adopt_profile_family` — no POST;
+                        # re-stamps the seed — the bootstrap's own stamp-only
+                        # judge). The backup-write hook marks a LIVE profile
+                        # stale, or drops an IDLE profile's copy (one family,
+                        # one copy). After the adoption backup == profile, so
+                        # a marker would lie (review r.1 of #32) — dropped.
+                        switcher.adopt_profile_family(
+                            account_num, email, org_uuid, locked=True,
+                            profile_read=profile_read,
+                        )
+                        (session_dir / STALE_MARKER).unlink(missing_ok=True)
+                        # An idle profile that lost its copy must not keep
+                        # the seed stamp the adoption re-wrote: a stamp over
+                        # no credential reads as "the backup is the profile's
+                        # consumed seed" to the collector's seed guard,
+                        # `cswap refresh` and this door — freezing the
+                        # freshly adopted backup (review r.1, Major 1; the
+                        # invariant `_invalidate_session_credentials` keeps
+                        # for its own callers).
+                        dropped = read_profile_generation(session_dir) == (None, None)
+                        if dropped:
+                            (session_dir / SEED_FINGERPRINT_FILE).unlink(
+                                missing_ok=True
+                            )
+                        return report(
+                            PROFILE_AHEAD, pids, fp_profile,
+                            _profile_ahead_detail(
+                                account_num, profile_oauth, pids, dropped
+                            ),
+                        )
+                    # seed != backup: the backup moved after the profile was
+                    # seeded — the profile's copy is the consumed predecessor.
+                elif seed and seed == fp_backup:
+                    # No usable pair in the profile (claude's invalid_grant
+                    # wipe, or nothing at all) over a backup that still
+                    # equals the generation the profile was seeded with: the
+                    # profile's family rotated past it and died — the backup
+                    # is the consumed predecessor, and replaying a consumed
+                    # grant is the documented reuse signal (CON-849).
+                    raise refuse(
+                        RELOGIN_REQUIRED,
+                        "the profile holds no usable login and the stored "
+                        "backup is the consumed seed generation the profile "
+                        "rotated past — only a re-login helps: "
+                        f"cswap-relogin.sh {account_num} (or `cswap add --slot "
+                        f"{account_num}` after logging in with {email})",
+                        pids,
+                    )
+
+                # The backup is the newer generation. Never reseed a lineage
+                # the store already condemned (same parole rule as the
+                # collector, `cswap refresh` and the bootstrap).
+                entry = switcher._usage_store.entries(identity)[account_num]
+                if entry.token_dead() and not switcher._parole_eligible(
+                    entry, backup
+                ):
+                    raise refuse(
+                        RELOGIN_REQUIRED,
+                        "the stored login's lineage is condemned (the token "
+                        "endpoint already answered invalid_grant for this "
+                        "generation) — not seeding a profile with it. Re-login "
+                        f"and re-add the slot: cswap-relogin.sh {account_num}",
+                        pids,
+                    )
+
+                working = backup
                 if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                     # Proof of life before the write: one POST with the
                     # BACKUP's grant — the family's newest, held by no live
@@ -391,18 +447,20 @@ def reseed_account(
                         )
                         raise refuse(
                             RELOGIN_REQUIRED,
-                            "the stored login is expired and the token endpoint "
-                            f"rejected its refresh grant ({result.error}) — the "
-                            "profile is left as it is; only a re-login helps: "
-                            f"cswap-relogin.sh {account_num}",
+                            "the stored login is expired and the token "
+                            "endpoint rejected its refresh grant "
+                            f"({result.error}) — the profile is left as it is; "
+                            "only a re-login helps: cswap-relogin.sh "
+                            f"{account_num}",
                             pids,
                         )
                     if result.error is not None or not result.credentials:
                         raise refuse(
                             TRANSIENT_ERROR,
-                            "the stored login is expired and its refresh failed "
-                            f"transiently ({result.error or 'empty refresh result'})"
-                            " — nothing written; retry",
+                            "the stored login is expired and its refresh "
+                            "failed transiently "
+                            f"({result.error or 'empty refresh result'}) — "
+                            "nothing written; retry",
                             pids,
                         )
                     working = result.credentials
@@ -430,7 +488,27 @@ def reseed_account(
         f"stored login (generation {oauth.credential_fingerprint(working)}; "
         f"live sessions: {pids or 'none'})"
     )
-    return report(
-        RESEEDED, pids, oauth.credential_fingerprint(working),
-        None,
-    )
+    return report(RESEEDED, pids, oauth.credential_fingerprint(working))
+
+
+
+def _profile_ahead_detail(
+    account_num: str, profile_oauth: dict, pids: list[int], dropped: bool
+) -> str:
+    """Human detail for PROFILE_AHEAD: what happened to the backup and to
+    the profile copy, and who refreshes an expired generation."""
+    detail = "the profile rotated past the backup; backup adopted its generation"
+    if dropped:
+        return detail + (
+            " — the idle profile copy was dropped by the backup-write hook "
+            f"(one family, one copy); the next `cswap run {account_num}` "
+            "seeds it back"
+        )
+    if oauth.is_oauth_token_expired(profile_oauth.get("expiresAt")):
+        if pids:
+            return detail + (
+                " — its access token is expired: a live session refreshes it "
+                "on its own 401 path"
+            )
+        return detail + f" — its access token is expired: cswap refresh {account_num}"
+    return detail
