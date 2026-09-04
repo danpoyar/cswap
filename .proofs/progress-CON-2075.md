@@ -3,7 +3,7 @@
 создан: 2026-09-04 23:28 +0200 · сессия: chore-con-2075 · посадка: session:Yor
 
 ## Где стоп
-- 23:56 04-09 (date): ревью р.1 approve (0 Important, 1 minor, 3 nit; сессия ревьюера 79165e7b-c424-438b-bf99-05cda17e2e39, вердикт-файл .proofs/review-verdict-chore-con-2075.json — имя по контракту docs/review-verdict-contract.md). Minor (двойной скан PID) починен: settle судит живость по маркеру хука, тест exiting_between (красный на 50ac832). Следующий шаг: коммит → push → р.2 через `claude -p --resume <sid> --effort max` только по minor → вердикт-файл на новый head → мерж руками при зелёном CI → deploy.sh main → Done.
+- 00:02 05-09 (date): ревью р.2 approve (resume сессии р.1, 0 находок; вердикт-файл round 2, head 2cfa4ea). Следующий шаг: коммит вердикта (.proofs только — вердикт не протухает) → CI зелёный → `gh pr merge 37 --squash` руками (без --auto) → `bash scripts/deploy.sh main` (timeout 600) → Done с «Ревью:», «Проверка:», ДОКЛАД, Альтернативы, Что спроектировано плохо → SendMessage Yor.
 
 ## Проверено
 - Баг жив на c3529fc: после reconcile разлива при живом PID лгут ОБА оракула `_backup_is_newer` (refresh.py:136): маркер стоит (switcher.py `_post_backup_write` ~511) И seed-штамп = предшественник (reconcile не перештамповывает, adopt_profile_family — да, switcher.py ~3121–3145). Второй `switch --even-if-live` сажает consumed at-profile-2. Проба: $CLAUDE_JOB_DIR/tmp/test_red_probe.py (копия логики уйдёт в тест).
@@ -22,7 +22,9 @@
 
 ## Команды, которые уже гоняли
 - `env -u FORCE_COLOR timeout 900 uv run pytest -q` — 2117 passed, 3 skipped, 1 xfailed (72 с) на 50ac832.
-- ревью р.1: `claude --agent code-reviewer --effort max -p --permission-mode bypassPermissions --output-format json` (фон Bash) — 41 ход, approve.
+- ревью р.1: `claude --agent code-reviewer --effort max -p --permission-mode bypassPermissions --output-format json` (фон Bash) — 41 ход, approve (1 minor, 3 nit).
+- ревью р.2: то же с `--resume 79165e7b-c424-438b-bf99-05cda17e2e39` — 7 ходов, approve, 0 находок.
+- тест exiting_between на 50ac832 (оверлей старого switcher.py) — 1 failed; на 2cfa4ea — 22 passed; полный сьют 2118 passed, 3 skipped, 1 xfailed.
 - `bash ~/projects/config/scripts/conflict-markers-check.sh $PWD` — 0 OK.
 - `env -u FORCE_COLOR timeout 900 uv run pytest -q tests/test_switch_heal.py` — 16 passed (база).
 - красная проба tests/_probe_con2075.py (временный файл, удалён) — FAILED: marker exists True, landed at-profile-2.

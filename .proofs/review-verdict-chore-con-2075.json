@@ -2,33 +2,8 @@
   "role": "code-reviewer",
   "ticket": "CON-2075",
   "verdict": "approve",
-  "round": 1,
-  "head_sha": "50ac8320ef5819293576c33f62e6581a13bb39b3",
-  "summary": "1 фактическая (minor), 3 нита; Important нет — можно принимать; альтернативы: judged; красное→зелёное воспроизведено (3 failed/2 passed на origin/main switcher.py, 21 passed на HEAD)",
-  "findings": [
-    {
-      "severity": "minor",
-      "message": "Двойной скан живых PID: _post_backup_write (530) и _settle_live_profile_after_spill (1959) судят живость независимо; сессия, вышедшая между ними после ротации (профиль A3, разлив A2), оставляет маркер + seed=предшественник на idle-профиле — следующий cswap run через setup_session 821-828 не усыновляет A3 (seed≠fp(backup), adopt 3222-3225 → False), инвалидирует профиль и сеет consumed A2. Окно — миллисекунды внутри одного локнутого reconcile; соседнее большее окно автор объявил вне объёма. Направление фикса: одна оценка живости на посадку (например, settle судит по факту, что хук взял live-ветку — маркер после записи), а не второй скан.",
-      "file": "src/claude_swap/switcher.py",
-      "line": 1959
-    },
-    {
-      "severity": "nit",
-      "message": "Ранние return settle при нечитаемом профиле / пустом landed_fp (1969-1974) молчат: лживый маркер и старый seed остаются без строки в логе, хотя except-ветка логирует; при разборе следующего инцидента «почему маркер лжёт» следа не будет.",
-      "file": "src/claude_swap/switcher.py",
-      "line": 1970
-    },
-    {
-      "severity": "nit",
-      "message": "Тело PR обещает файл вердикта .proofs/review-verdict-fix-con-2075.json, а контракт review-verdict-contract.md именует его слагом ветки: ветка chore/con-2075 → review-verdict-chore-con-2075.json (этот файл). Второй файл под старым именем судья не увидит.",
-      "file": ".proofs/progress-CON-2075.md",
-      "line": 6
-    },
-    {
-      "severity": "nit",
-      "message": "Метка «00:05 05-09» в «Где стоп» (HEAD; в незакоммиченной рабочей копии уже «00:20 05-09») впереди часов: коммит 50ac832 сделан 2026-09-04T23:42:43+02:00, файл читался в 23:52 того же дня — метка не из живого источника; плюс рабочая копия progress-файла расходится с закоммиченной (git status: M).",
-      "file": ".proofs/progress-CON-2075.md",
-      "line": 6
-    }
-  ]
+  "round": 2,
+  "head_sha": "2cfa4ea6ba6cc578a0ab656d56d6bf9e95199a3e",
+  "summary": "р.2: фикс minor р.1 (двойной скан PID) принят — settle судит живость по маркеру хука, одна оценка на посадку; Important нет, новых находок нет — можно принимать; альтернативы: judged; красное→зелёное воспроизведено (1 failed/21 passed на switcher.py 50ac832, 22 passed на HEAD)",
+  "findings": []
 }
