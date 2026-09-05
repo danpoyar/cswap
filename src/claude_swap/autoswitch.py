@@ -1678,6 +1678,36 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
+            elif self._gauge_rate_limited(entries.get(current), self.clock()):
+                # CON-2267: the usage endpoint answered http-429 (per-token
+                # budget, Retry-After) for the home — a limit on the GAUGE,
+                # not a dead token: the server recognised the token in order
+                # to throttle it. Counting those ticks as "unhealthy" drove
+                # failover off the pinned home three times on 05-09 (18:39,
+                # 20:44, 23:31), each time parking a fleet slot as "active"
+                # for the whole 3600 s backoff while the fleet sensor waited
+                # for the same signal to clear. Hold the pin; the unhealthy
+                # counter neither grows nor resets — only an auth failure
+                # (401 / invalid_grant / unreadable without a cause) still
+                # escalates to failover below. Only while the honoured
+                # Retry-After backoff is live and the collector has no
+                # sentinel verdict on the credentials themselves (review r1:
+                # a stale http-429 on the row survives sentinel passes).
+                self._idle_hold_since = None
+                lifts = (entries[current].backoff_until or 0) - self.clock()
+                self._emit(
+                    NoSwitchEvent(
+                        reason="home-pinned",
+                        detail=(
+                            f"the live login rests on Account-{home}; its "
+                            "usage gauge is rate-limited (http-429, backoff "
+                            f"lifts in {int(max(lifts, 0))} s) — the server "
+                            "recognised the token, so it is alive and the "
+                            "pin holds (CON-2267)"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
 
         early = False
         if active_headroom is not None:
@@ -2816,6 +2846,29 @@ class AutoSwitchEngine:
             return
         self._home_warned = key
         self._emit(ConfigWarningEvent(message=message))
+
+    @staticmethod
+    def _gauge_rate_limited(entry, now: float) -> bool:
+        """Whether a slot's usage is unknown only because the usage endpoint
+        throttled the token (``http-429`` with Retry-After, CON-2267).
+
+        True only while the honoured 429 backoff is live: the store writes
+        ``lastError == "http-429"`` together with ``backoffUntil`` on the 429
+        and clears both on the next success; any later failure rewrites
+        ``lastError`` with its own cause. A sentinel on the entry (no
+        credentials, token expired, relogin required) is the collector's
+        verdict on the credentials themselves and wins — the stale 429 on
+        the row is not a proof of life for a login whose tokens are gone
+        (review r1). A 429 is the server saying "slow down", which it can
+        only say to a token it recognised — alive by construction, unlike
+        401 / invalid_grant or a network cause, where nothing proves life.
+        """
+        if entry is None or getattr(entry, "sentinel", None) is not None:
+            return False
+        if getattr(entry, "last_error", None) != "http-429":
+            return False
+        until = getattr(entry, "backoff_until", None)
+        return until is not None and now < until
 
     def _home_inert(self, home: str, quarantined: set[str]) -> bool:
         """Whether the pin is switched off this tick, wherever the login is.
