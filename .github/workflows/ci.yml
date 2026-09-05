@@ -52,6 +52,11 @@ jobs:
         run: uv run pytest
 
   macos-keychain:
+    # Слово Данилы 05-09 10:00 (CON-2189, CON-2318): macOS-раннеры в CI не запускаем —
+    # за день списывало до $30. Job выключен, не снесён: кейсы Keychain гоняются на маке
+    # парка перед деплоем дверью scripts/deploy.sh (FORK.md «must be green before installing»):
+    #   uv run --group dev pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py
+    if: ${{ false }}
     runs-on: macos-latest
 
     steps:
