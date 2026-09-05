@@ -1678,6 +1678,31 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
+            elif self._gauge_rate_limited(entries.get(current)):
+                # CON-2267: the usage endpoint answered http-429 (per-token
+                # budget, Retry-After) for the home — a limit on the GAUGE,
+                # not a dead token: the server recognised the token in order
+                # to throttle it. Counting those ticks as "unhealthy" drove
+                # failover off the pinned home three times on 05-09 (18:39,
+                # 20:44, 23:31), each time parking a fleet slot as "active"
+                # for the whole 3600 s backoff while the fleet sensor waited
+                # for the same signal to clear. Hold the pin; the unhealthy
+                # counter neither grows nor resets — only an auth failure
+                # (401 / invalid_grant / unreadable without a cause) still
+                # escalates to failover below.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="home-pinned",
+                        detail=(
+                            f"the live login rests on Account-{home}; its "
+                            "usage gauge is rate-limited "
+                            f"({entries[current].last_error}) — the server "
+                            "recognised the token, so it is alive and the "
+                            "pin holds (CON-2267)"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
 
         early = False
         if active_headroom is not None:
@@ -2816,6 +2841,19 @@ class AutoSwitchEngine:
             return
         self._home_warned = key
         self._emit(ConfigWarningEvent(message=message))
+
+    @staticmethod
+    def _gauge_rate_limited(entry) -> bool:
+        """Whether a slot's usage is unknown only because the usage endpoint
+        throttled the token (``http-429`` with Retry-After, CON-2267).
+
+        The collector records the cause on the row (``last_error``); a 429 is
+        the server saying "slow down", which it can only say to a token it
+        recognised — alive by construction, unlike 401 / invalid_grant or a
+        network cause, where nothing proves life.
+        """
+        cause = getattr(entry, "last_error", None) if entry is not None else None
+        return isinstance(cause, str) and cause.startswith("http-429")
 
     def _home_inert(self, home: str, quarantined: set[str]) -> bool:
         """Whether the pin is switched off this tick, wherever the login is.

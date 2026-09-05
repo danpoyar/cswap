@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
 )
 from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.usage_store import UsageEntry
 from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
@@ -43,6 +44,7 @@ from tests.test_autoswitch import (
     _R_LATEST,
     _R_SOON,
     EngineHarness,
+    _entry_for,
     _usage,
     _usage7,
     _write_transcript,
@@ -130,6 +132,65 @@ class TestHomePinHolds:
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() != 1
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+
+    def test_rate_limited_gauge_is_not_a_dead_token(self, temp_home):
+        # CON-2267 (05-09: three failovers off the pinned home in one
+        # evening): the usage endpoint answers http-429 with Retry-After for
+        # the home — a per-token budget on the GAUGE. The server recognised
+        # the token to throttle it, so the login is alive; ticks past
+        # unhealthyTicks must hold the pin, not fail over, and the reason
+        # must say why so the fleet sensor can read the same verdict.
+        h = _harness(temp_home, live=1)
+        cause = "http-429, retry-after 3600s (per-token usage budget reached; backing off)"
+        entries = {
+            "1": UsageEntry(last_error=cause, consecutive_failures=3),
+            "2": _entry_for(_usage(10), h.clock.now),
+            "3": _entry_for(_usage(10), h.clock.now),
+        }
+        for _ in range(5):
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not _switches(h)
+        last = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert last.reason == "home-pinned"
+        assert "rate-limited" in last.detail and "http-429" in last.detail
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_auth_failure_on_home_still_fails_over(self, temp_home):
+        # The escape stays: an unreadable home WITH an auth cause (401) is a
+        # dead token, three ticks → failover exactly as before CON-2267.
+        h = _harness(temp_home, live=1)
+        entries = {
+            "1": UsageEntry(last_error="http-401", consecutive_failures=1),
+            "2": _entry_for(_usage(10), h.clock.now),
+            "3": _entry_for(_usage(10), h.clock.now),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert h.active_number() != 1
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+
+    def test_rate_limited_ticks_do_not_count_toward_failover(self, temp_home):
+        # Two unreadable-without-cause ticks, then an hour of 429, then one
+        # more unreadable tick: the 429 ticks neither grow nor reset the
+        # unhealthy counter — the third plain unreadable tick still escapes.
+        h = _harness(temp_home, live=1)
+        plain = {"1": None, "2": _usage(10), "3": _usage(10)}
+        limited = {
+            "1": UsageEntry(last_error="http-429, retry-after 3600s", consecutive_failures=2),
+            "2": _entry_for(_usage(10), h.clock.now),
+            "3": _entry_for(_usage(10), h.clock.now),
+        }
+        assert h.tick_with_usage(plain) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(plain) is TickOutcome.NO_ACTION
+        for _ in range(3):
+            assert h.tick_with_entries(limited) is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 2
+        assert h.tick_with_usage(plain) is TickOutcome.SWITCHED
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
 
