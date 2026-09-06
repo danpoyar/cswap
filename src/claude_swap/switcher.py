@@ -1749,6 +1749,31 @@ class ClaudeAccountSwitcher:
     def _pending_rotation_path(self, account_num: str) -> Path:
         return self.credentials_dir / f".pending-rotated-{account_num}.json"
 
+    def pending_profile_spill(self, account_num: str) -> bool:
+        """Whether a spilled ADOPTION of the session profile's own generation
+        (``SPILL_ORIGIN_PROFILE``, CON-2075) is waiting in the slot's sidecar.
+
+        Read-only, judged BEFORE ``reconcile_pending_rotation_locked`` lands
+        it (CON-2355): a caller that cannot read the profile right now must
+        not land such a spill — the landing's re-judge (CON-2100) cannot read
+        it either, lands the sidecar as-is, and the backup-write hook's idle
+        branch drops the profile's copy, possibly the family's newest
+        generation. Mirrors the reconcile's "nothing to land" rules: no
+        sidecar, an unreadable one (set aside by the reconcile) or one without
+        credential bytes (dropped by it) is not a pending spill. Never raises.
+        """
+        path = self._pending_rotation_path(account_num)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        spilled = payload.get("credentials")
+        if not isinstance(spilled, str) or not spilled:
+            return False
+        return payload.get("origin") == SPILL_ORIGIN_PROFILE
+
     def _spill_rotated_credentials(
         self,
         account_num: str,
