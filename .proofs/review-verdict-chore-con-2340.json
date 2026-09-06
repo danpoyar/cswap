@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2340",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "763f1c0c13fba5766d9c0c243b77fcad8a7b9c22",
+  "summary": "р.2: Important р.1 закрыт — pending считается по исходу accepted_records (switcher.py: permanent-auth или успех = вердикт; sentinel, transient-ошибка, непринятая запись = pending). Подтверждено репро р.1 на реальном пути _fetch_active_usage (LockError-defer и transient POST → parole_pending=True, _home_dead_verdict=False; 2 passed), целевыми -k … EndToEnd → 109 passed, красной пробой автора 3 failed → 8 passed; ниты 1–3 закрыты (docstring reserve, FORK.md под «What diverges», границы в теле PR). Открытых Important нет. CI на 763f1c0: 1 прогон in_progress (05:03 +0200); полный сьют на 763f1c0 не дописан — не ждал. альтернативы: judged (р.1).",
+  "findings": []
+}
