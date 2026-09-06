@@ -805,27 +805,42 @@ class SessionManager:
                 # the next bootstrap the consumed seed; the marker stays for
                 # a later run (its reason is deferred, not lost).
                 profile_read = read_profile_generation(session_dir)
-                if self._seed_backup_undecidable(
-                    session_dir,
-                    self.switcher.read_account_credentials(account_num, email),
-                    profile_read[1],
-                ):
+                # CON-2374 (review of PR #45): the backup bytes are
+                # deliberately NOT consulted here. The seed guard rules
+                # "no backup -> decidable", but the same Keychain overload
+                # that hides the profile's entry reads the BACKUP as "" too
+                # (credentials.py swallows the KeychainError) — and over ""
+                # the guard is blind: this branch adopted off a swallowed
+                # read (a no-op), invalidated the profile — its keychain
+                # copy, possibly the family's ONLY newest generation, plus
+                # the plaintext, the marker and the seed stamp — and only
+                # then the bootstrap failed as "no stored credentials". An
+                # unreadable profile under a stale marker is never
+                # invalidated: nothing could be folded into backup first,
+                # so nothing may be wiped. Refused transiently right here:
+                # the reuse probe below would hang on the same busy
+                # Keychain and burn its budget, and the bootstrap could not
+                # judge the seed either (CON-1740 and CON-2355 keep the
+                # same rule for the seed-generation backup and the spill).
+                if profile_read[1] is not None:
                     self._logger.warning(
                         f"Account-{account_num}: stale marker kept — the "
                         "profile's own credential cannot be read right now "
-                        "(Keychain busy) and the stored backup is its seed "
-                        "generation; not invalidating a family whose newest "
-                        "generation may be unreadable (CON-1740)"
+                        "(Keychain busy); not invalidating a family whose "
+                        "newest generation may be unreadable, whatever the "
+                        "stored backup reads as (CON-1740, CON-2374)"
                     )
-                else:
-                    self.switcher.adopt_profile_family(
-                        account_num, email, org_uuid, locked=True,
-                        profile_read=profile_read,
+                    raise SessionError(
+                        self._unreadable_stale_message(account_num, email)
                     )
-                    self.switcher._invalidate_session_credentials(
-                        account_num, email
-                    )
-                    (session_dir / STALE_MARKER).unlink(missing_ok=True)
+                self.switcher.adopt_profile_family(
+                    account_num, email, org_uuid, locked=True,
+                    profile_read=profile_read,
+                )
+                self.switcher._invalidate_session_credentials(
+                    account_num, email
+                )
+                (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._token_profile_reusable(
                 session_dir, account_num, email, org_uuid
             ) or self._is_session_valid(session_dir, email, org_uuid):
@@ -1323,7 +1338,11 @@ class SessionManager:
         generation could not be read (``profile_error`` from
         ``read_profile_generation`` — Keychain busy/locked). A backup that
         moved past the seed (re-added), a profile never stamped, and a
-        readable profile (adopted or equal) all decide themselves."""
+        readable profile (adopted or equal) all decide themselves. Blind
+        over ``""``: an empty backup is "nothing stored" AND "the backup's
+        Keychain read timed out" (credentials.py swallows it) — a caller
+        that would wipe the profile on a False must judge the profile read
+        alone (the stale-marker path, CON-2374)."""
         if profile_error is None or not backup:
             return False
         seed = read_seed_fingerprint(session_dir)
@@ -1338,6 +1357,19 @@ class SessionManager:
             "profile's claude. Not POSTing it and not overwriting the profile "
             "(a consumed grant replayed is the documented reuse signal). Retry "
             "shortly; the profile keeps its generation (CON-1740)."
+        )
+
+    @staticmethod
+    def _unreadable_stale_message(account_num: str, email: str) -> str:
+        return (
+            f"Account-{account_num} ({email}): the profile is marked for "
+            "re-seeding (its backup changed while it was live, or its "
+            "machine-shared integrations fell behind), but its own credential "
+            "cannot be read right now (Keychain busy) — the family's newest "
+            "generation may live only in that unreadable entry, and no state "
+            "of the stored backup (empty, the seed generation or a newer one) "
+            "can judge it. Not adopting, not invalidating and not POSTing; "
+            "the marker is kept for a later run. Retry shortly (CON-2374)."
         )
 
     @staticmethod

@@ -234,6 +234,18 @@ def _flaky_keychain(session_dir: Path, failures: int):
     return patch.object(macos_keychain, "get_password", flaky_get)
 
 
+def _keychain_timeout_on_backup(switcher):
+    """The slot BACKUP's Keychain read times out too — the overload is
+    machine-wide, not per item (CON-2374). ``_read_account_credentials``
+    swallows the KeychainError and reports the backup as ``""``, which is
+    byte-for-byte the same answer as "no backup stored"."""
+
+    def busy_read(account_num, email):
+        raise KeychainError("security find-generic-password timed out after 5.0s")
+
+    return patch.object(switcher._store, "_kc_read_backup", busy_read)
+
+
 def _profile_entry(block_real_keychain, session_dir: Path):
     return block_real_keychain.get_password(
         keychain_service_name(session_dir), macos_keychain.keychain_account_name()
@@ -540,6 +552,71 @@ class TestOneReadFeedsAdoptionAndGuard:
         ) == oauth.credential_fingerprint(BACKUP)
         assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
         assert not _entry(switcher).token_dead()
+
+    def test_stale_marker_over_unreadable_profile_and_empty_backup_keeps_the_family(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """RED before CON-2374 (review of PR #45): the same overload that
+        makes the profile unreadable makes the backup read ``""``; the seed
+        guard ruled ``not backup -> decidable``, the stale path adopted off a
+        swallowed read, invalidated the profile (its keychain copy — the
+        family's only newest generation — plaintext, marker and seed stamp
+        all gone) and the bootstrap then failed as "no stored credentials".
+        Now: an unreadable profile under a stale marker is never invalidated,
+        whatever the backup bytes say — the marker is kept for a later run."""
+        mark_session_stale(rotated_profile)
+
+        with _busy_keychain(rotated_profile), _keychain_timeout_on_backup(
+            switcher
+        ), pytest.raises(SessionError) as refused:
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert (rotated_profile / STALE_MARKER).exists()  # deferred, not lost
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert (rotated_profile / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == BACKUP
+        assert not _entry(switcher).token_dead()
+        # Refused TRANSIENTLY (Keychain busy) — not "re-add the slot".
+        assert "keychain" in str(refused.value).lower()
+        assert "no stored credentials" not in str(refused.value)
+
+    def test_stale_marker_over_unreadable_profile_and_readded_backup_defers(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """The one form whose outcome CON-2374 changed (review r.1, nit 2):
+        the backup moved past the seed stamp (slot re-added) while the
+        profile is unreadable. The seed guard calls that decidable and the
+        old branch wiped the unreadable entry blind; now the profile read
+        alone decides — deferred, whatever the backup bytes say. Pinned so a
+        refactor that asks the backup again cannot bring the wipe back
+        under a green suite."""
+        # The marker came from the backup-write hook's LIVE branch (deferred
+        # invalidation); the session has since exited. The store's pure write
+        # stands in for the re-add — the switcher wrapper would run that hook's
+        # idle branch and invalidate the profile before the run under test.
+        readded = _creds("at-readded", "rt-readded")
+        switcher._store._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, readded)
+        mark_session_stale(rotated_profile)
+
+        with _busy_keychain(rotated_profile), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert (rotated_profile / STALE_MARKER).exists()  # deferred, not lost
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == readded
 
     def test_stale_marker_over_readable_profile_adopts_then_reseeds(
         self, manager, switcher, rotated_profile, probe_times_out, post_spy,
