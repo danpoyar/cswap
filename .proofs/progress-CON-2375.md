@@ -3,7 +3,7 @@
 создан: 2026-09-06 20:16 +0200 · сессия: fix-con-2375 · посадка: session:Yor
 
 ## Где стоп
-- 06-09 20:40: фикс и тесты зелёные (полный сьют 2196 passed), 4 новых теста красные на origin/main. Следующий шаг: merge origin/main → коммит явными путями → push → PR → code-reviewer effort max (риск-зона auth) → мерж руками → CI main → deploy дверью scripts/deploy.sh main → Done дверью статусов.
+- 06-09 20:45: ревью р.1 approve (0 Important, 3 нита; sid 5c77c8cd-c43a-4edc-9fba-a0a0a3920f6f, вердикт-файл .proofs/review-verdict-fix-con-2375.json на head 3c0fa17). Дальше: коммит вердикта → CI PR на новом head → мерж руками (squash, без --auto) → CI main → deploy дверью scripts/deploy.sh main → перевести CON-2375 в Done дверью статусов.
 
 ## Проверено
 - Тикет прочитан целиком; ADR в репо нет (docs/_adrs отсутствует); CLAUDE.md в репо нет.
@@ -16,12 +16,16 @@
 - Снимки смежных каталогов: $CLAUDE_JOB_DIR/tmp/snap-cswap.txt (1 строка), snap-config.txt (61 строка), старт snapshot-start.txt.
 
 ## Отвергнуто
-- (пусто — вариант и почему, чтобы преемник не пробовал снова)
+- Ниты ревью не чиню (раунд 1 без Important — раунд 2 не зову): (1) размер 436 строк — не режется без потери смысла; (2) хелпер `_keychain_busy_at_the_landing` трижды — конвенция репо: хелперы тестов живут в каждом файле (`_creds`, `_make_switcher`), conftest вне границ; (3) except-ветка `_profile_generation_past_spill` «landing as-is» — предсуществующее, отдельный тикет.
+- Ревьюер про метод красной пробы: голый PYTHONPATH не переключил бы код (pyproject pythonpath=src); моя проба шла с `--rootdir <база>` — pythonpath=src разрешился в src базы, вывод `claude_swap from base-main/src` и старая строка лога подтверждают.
 
 ## Открытые вопросы
 - (пусто — что не решено и кто решает)
 
 ## Команды, которые уже гоняли
+- `gh pr create --base main --head fix/con-2375 …` → https://github.com/danpoyar/cswap/pull/47; `gh pr edit 47 --body-file` (исправлено число смежных: 36 из 49).
+- `python3 ~/projects/config/scripts/review-rounds.py judge --dir .` → кругов 0, следующий раунд 1, ok.
+- `claude --agent code-reviewer --effort max --permission-mode bypassPermissions --session-id <sid> --output-format json -p …` (фон run_in_background, timeout 3600).
 - `env -u FORCE_COLOR timeout 900 uv run --group dev pytest -q tests/test_bootstrap_family_guard.py tests/test_refresh.py tests/test_reseed.py tests/test_switch_heal.py` — 103 passed.
 - `env -u FORCE_COLOR timeout 900 uv run --group dev pytest -q` — 2196 passed, 3 skipped, 1 xfailed.
 - База для сравнения: `git worktree add --detach $CLAUDE_JOB_DIR/tmp/base-main origin/main` (снести в финале: `git worktree remove`).
