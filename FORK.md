@@ -313,6 +313,27 @@ read in one sitting.
   typed refusal + TUI handoff could travel upstream with the session-mode
   work.
 
+- A spilled ADOPTION lands from the PROFILE when the profile ran past it
+  (CON-2100, 2026-09-06). `switch --even-if-live` under a contended store
+  lock spills the profile's generation to the per-slot sidecar (CON-849,
+  origin `profile-adoption`, CON-2075) and a later collector pass lands it
+  through `_write_account_credentials`, whose hook drops an IDLE profile's
+  copy. If the session rotated the family once more and exited in between,
+  the sidecar is the consumed predecessor and the profile's copy is the only
+  newest generation — the landing destroyed it and the next `cswap run`
+  bootstrapped a dead login. The landing now re-judges the profile first
+  (`_profile_generation_past_spill`: this slot's identity, one
+  `read_profile_generation` read, a full OAuth pair, fingerprint none of the
+  spilled generation / the spill's predecessor / the seed stamp) and lands
+  the profile's bytes; the superseded sidecar is preserved as an unclaimed
+  copy (`superseded-rotation-spill`, `supersededBy: profile-generation`).
+  Liveness is not consulted — the rule holds for a live profile too (it
+  lands the newest generation, as the direct adoption would, and the
+  settling re-stamps the seed), and a second process scan would race the
+  hook's (review r.1 of PR #37). An unreadable keychain entry skips the
+  judgement and lands the sidecar as before (the plaintext under it may be
+  the consumed seed). Fleet-shaped (profiles are this fork's session mode).
+
 - `switch` REFUSES a slot whose live `cswap run` session shares the stored
   login, and the daemon judges a live-session slot by what its profile holds
   (CON-2030, 2026-09-04). Live incident 2026-09-03 19:09: the operator

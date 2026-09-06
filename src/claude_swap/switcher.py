@@ -1858,6 +1858,12 @@ class ClaudeAccountSwitcher:
         (a spilled adoption — or the profile holds it anyway) the marker
         lies and the seed stamp is the predecessor, so the landing settles
         the profile exactly as the direct adoption does (CON-2075).
+
+        A spilled ADOPTION whose profile rotated onward before the landing
+        is landed from the PROFILE, not the sidecar (CON-2100): the sidecar
+        is then the consumed predecessor, and the hook's idle branch would
+        destroy the profile's copy — the family's only newest generation.
+        The superseded sidecar is preserved as an unclaimed copy.
         """
         path = self._pending_rotation_path(account_num)
         try:
@@ -1887,23 +1893,61 @@ class ClaudeAccountSwitcher:
         if current and current_fp == oauth.credential_fingerprint(spilled):
             path.unlink(missing_ok=True)  # already reconciled
             return current
+        origin = payload.get("origin")
         if not current or (predecessor and current_fp == predecessor):
-            self._write_account_credentials(account_num, email, spilled)
+            landing = spilled
+            if origin == SPILL_ORIGIN_PROFILE:
+                # CON-2100: the profile may have rotated past the spilled
+                # generation meanwhile (and exited) — land ITS generation, or
+                # the write hook's idle branch destroys the family's newest.
+                ahead = self._profile_generation_past_spill(
+                    account_num, email, spilled, predecessor
+                )
+                if ahead is not None:
+                    landing = ahead
+            self._write_account_credentials(account_num, email, landing)
+            if landing is not spilled:
+                self._stash_superseded_spill(
+                    account_num, spilled, superseded_by="profile-generation"
+                )
             path.unlink(missing_ok=True)
             self._settle_live_profile_after_spill(
-                account_num, email, spilled, payload.get("origin")
+                account_num, email, landing, origin
             )
-            self._logger.info(
-                f"Reconciled spilled rotated credentials for account "
-                f"{account_num} into the backup"
-            )
-            return spilled
+            if landing is spilled:
+                self._logger.info(
+                    f"Reconciled spilled rotated credentials for account "
+                    f"{account_num} into the backup"
+                )
+            else:
+                self._logger.info(
+                    f"Reconciled account {account_num}'s spilled adoption by "
+                    "landing the session profile's newer generation in the "
+                    "backup; the spilled generation is superseded and "
+                    "preserved as an unclaimed copy"
+                )
+            return landing
         # The backup moved past the spill's predecessor (re-login / re-add).
         # The newer family wins; preserve the spilled bytes instead of
         # destroying a possibly-live refresh token.
+        self._stash_superseded_spill(account_num, spilled, superseded_by="backup")
+        path.unlink(missing_ok=True)
+        return current
+
+    def _stash_superseded_spill(
+        self, account_num: str, spilled: str, *, superseded_by: str
+    ) -> None:
+        """Preserve a superseded spill's bytes as an unclaimed safety copy
+        (never destroy a possibly-live refresh token); a failed stash is
+        logged and the spill dropped — the landing is not held hostage to
+        the diagnostics store. ``superseded_by`` names what outran the spill:
+        ``"backup"`` (re-login / re-add moved the backup past the spill's
+        predecessor) or ``"profile-generation"`` (the session profile rotated
+        past the spilled adoption, CON-2100)."""
         try:
             self._store._write_unclaimed_credential(spilled, {
                 "reason": "superseded-rotation-spill",
+                "supersededBy": superseded_by,
                 "configSlot": account_num,
                 "fingerprint": oauth.credential_fingerprint(spilled),
             })
@@ -1912,8 +1956,93 @@ class ClaudeAccountSwitcher:
                 "Superseded rotation spill for account %s could not "
                 "be stashed; dropping it", account_num,
             )
-        path.unlink(missing_ok=True)
-        return current
+
+    def _profile_generation_past_spill(
+        self,
+        account_num: str,
+        email: str,
+        spilled: str,
+        predecessor: str | None,
+    ) -> str | None:
+        """The session profile's credential when the profile ran PAST a
+        spilled adoption (CON-2100) — the bytes the landing must write
+        instead of the sidecar's — or ``None`` to land the sidecar as before.
+
+        A spill tagged ``SPILL_ORIGIN_PROFILE`` holds the generation the
+        profile had at spill time. Between the spill and its landing the
+        session may rotate the family once more and EXIT: the profile then
+        holds the family's newest generation and the sidecar its consumed
+        predecessor. Landing the sidecar runs the backup-write hook, whose
+        idle branch drops the profile's copy — the ONLY copy of the newest
+        generation — and the backup keeps a consumed one: the next ``cswap
+        run`` bootstraps a dead login ("Login expired"). So the landing
+        re-judges the profile FIRST and lands its generation (the profile is
+        ahead of the sidecar by construction — the sidecar was taken from
+        it); the write hook then leaves the family with one copy either way.
+        Liveness is NOT consulted: the rule holds for a live profile too (the
+        direct adoption would land its newest generation just the same, and
+        the settling re-stamps the seed), and a second process scan here
+        would race the hook's own (review r.1 of PR #37).
+
+        The profile is "ahead" only when it is this slot's identity (not
+        drifted), readable in ONE read (``read_profile_generation``: an
+        existing-but-unreadable keychain entry is not "no profile" — the
+        plaintext under it may be the consumed seed — so the judgement is
+        skipped, logged, and the sidecar lands as before), a full OAuth pair
+        (not the inference token), and its fingerprint is none of: the
+        spilled generation (the plain landing), the spill's predecessor (a
+        profile re-seeded from the old backup — the sidecar is the newer
+        one), its own seed stamp (a profile still AT its seed never rotated —
+        the heal's rule). Never raises.
+        """
+        from claude_swap.session import (
+            read_profile_generation,
+            read_seed_fingerprint,
+            session_identity_drifted,
+        )
+
+        try:
+            session_dir = self._session_dir(account_num, email)
+            if not session_dir.is_dir():
+                return None
+            org_uuid = self.account_identity(account_num).get(
+                "organizationUuid", ""
+            )
+            if session_identity_drifted(session_dir, email, org_uuid):
+                return None
+            profile, err = read_profile_generation(session_dir)
+            if profile is None:
+                if err is not None:
+                    self._logger.warning(
+                        "Account %s: the session profile could not be read "
+                        "while landing its spilled adoption (%s); landing the "
+                        "spilled generation as-is.", account_num, err,
+                    )
+                return None
+            if is_inference_token_credentials(profile):
+                return None
+            profile_oauth = oauth.extract_oauth_data(profile)
+            if not (
+                profile_oauth
+                and profile_oauth.get("accessToken")
+                and profile_oauth.get("refreshToken")
+            ):
+                return None
+            fp_profile = oauth.credential_fingerprint(profile)
+            if not fp_profile or fp_profile in (
+                oauth.credential_fingerprint(spilled),
+                predecessor,
+                read_seed_fingerprint(session_dir),
+            ):
+                return None
+            return profile
+        except Exception:
+            self._logger.warning(
+                "Could not judge account %s's session profile while landing "
+                "its spilled adoption; landing the spilled generation as-is",
+                account_num, exc_info=True,
+            )
+            return None
 
     def _stamp_profile_generation(
         self, session_dir: Path, fingerprint: str, account_num: str
