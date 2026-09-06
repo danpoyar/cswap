@@ -250,6 +250,106 @@ class TestAdoptIdentityOnly:
         assert h.switcher.identity_only_write is None
 
 
+class TestAdoptOwnLineage:
+    def test_own_family_duplicated_in_another_backup_is_a_consistent_login(
+        self, temp_home,
+    ):
+        # Review r.1 finding 3: after a poisoning, another slot's backup may
+        # still carry THIS slot's family (05-09: backup 23 held family 32).
+        # A login whose pair is the slot's own stored family is consistent —
+        # the duplicate is the other slot's problem, not a foreign pair.
+        h = _harness(temp_home, identity=3, pair_of=3, record=1)
+        h.switcher._write_account_credentials("2", EMAILS[2], _pair(3))
+        warnings = _capture(h)
+
+        adopted, prior = h.switcher.adopt_active_account("3")
+
+        assert adopted is True
+        assert prior == "1"
+        assert h.switcher.identity_only_write is None
+        assert warnings.messages == []
+
+
+def _profile(num: int) -> dict:
+    return {"uuid": f"uuid-{num}", "email": EMAILS[num], "organizationUuid": ""}
+
+
+class TestEpisodeAcrossRotation:
+    """Review r.1 finding 2: inside an episode the borrowed family may rotate
+    (Claude Code's own refresh, or the collect pass refreshing the owner's
+    backup) so no backup carries the live lineage any more — the guard must
+    not read that as "nobody's pair, adopt". The profile oracle decides."""
+
+    ROTATED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-1-gen2", "refreshToken": "rt-1-gen2",
+    }})
+
+    def _episode(self, temp_home) -> EngineHarness:
+        h = _harness(temp_home, identity=3, pair_of=1, record=1)
+        h.tick_with_usage(HEALTHY)
+        assert h.active_number() == 1 and len(_identity_only_events(h)) == 1
+        return h
+
+    def test_identity_only_episode_sticks_when_the_family_rotates(self, temp_home):
+        h = self._episode(temp_home)
+        _write_live(h, identity=3, pair=self.ROTATED)
+        h.clock.advance(60)
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=_profile(1)
+        ) as oracle:
+            h.tick_with_usage(HEALTHY)
+            h.clock.advance(60)
+            h.tick_with_usage(HEALTHY)
+
+        assert oracle.call_count == 1  # once per new lineage, not per tick
+        assert h.active_number() == 1
+        assert _adopts(h) == []
+        assert len(_identity_only_events(h)) == 1  # same episode, no re-report
+        assert h.switcher._read_account_credentials("3", EMAILS[3]) == _pair(3)
+
+    def test_identity_only_episode_sticks_while_the_oracle_is_silent(self, temp_home):
+        h = self._episode(temp_home)
+        _write_live(h, identity=3, pair=self.ROTATED)
+        h.clock.advance(60)
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            h.tick_with_usage(HEALTHY)
+
+        assert h.active_number() == 1
+        assert _adopts(h) == []
+        assert h.switcher.identity_only_write == {
+            "identity": "3", "owner": "1", "recorded": "1",
+        }
+
+    def test_identity_only_episode_ends_on_a_genuine_login(self, temp_home):
+        h = self._episode(temp_home)
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-3-new", "refreshToken": "rt-3-new",
+        }})
+        _write_live(h, identity=3, pair=fresh)
+        h.clock.advance(60)
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=_profile(3)
+        ):
+            h.tick_with_usage(HEALTHY)
+
+        assert h.active_number() == 3
+        assert len(_adopts(h)) == 1
+        assert h.switcher.identity_only_write is None
+
+    def test_resync_identity_only_after_rotation_leaves_backup_alone(self, temp_home):
+        # The resync path shares the episode: the rotated borrowed family
+        # served from the live store must not seed Account-3's backup.
+        h = self._episode(temp_home)
+        sw = h.switcher
+        _write_live(h, identity=3, pair=self.ROTATED)
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile", return_value=_profile(1)
+        ):
+            sw._resync_rotated_backup("3", EMAILS[3], "", self.ROTATED)
+
+        assert sw._read_account_credentials("3", EMAILS[3]) == _pair(3)
+
+
 class TestEngineIdentityOnly:
     def test_identity_only_write_is_not_adopted_and_is_reported(self, temp_home):
         h = _harness(temp_home, identity=3, pair_of=1, record=1)

@@ -499,11 +499,26 @@ read in one sitting.
   (backup untouched), WARNs once per episode (`identity-only write: live
   credential belongs to Account-A, identity says Account-B`) and the daemon
   logs one `identity-only-write` event (`identity`, `owner`, `recorded`)
-  followed by the CON-2323 forensic snapshot. A consistent manual `/login`
-  (identity and pair of the same slot) is adopted exactly as before; an
-  empty live store still follows the identity. Tests:
-  `tests/test_identity_only_write.py`. The writer itself is CON-2323's hunt;
-  this closes the poisoning path.
+  followed by the CON-2323 forensic snapshot. The slot's OWN family is
+  always a consistent login, even when another slot's backup still carries a
+  duplicate of it (the state a poisoning leaves behind). The episode is
+  sticky across a lineage change: once the pair is known to be another
+  slot's family, the same identity over a pair no backup carries any more is
+  either that family rotated (Claude Code's own refresh, or the collect pass
+  refreshing the owner's backup — the owner is not "active" by identity) or
+  a genuine `/login` onto the slot; the profile oracle
+  (`oauth.fetch_oauth_profile`) is asked once per new lineage, and
+  unresolved keeps the refusal — a wrong record is recoverable, a poisoned
+  backup is not. A consistent manual `/login` (identity and pair of the same
+  slot) is adopted exactly as before; an empty live store still follows the
+  identity. Cost: one backup scan per foreign verdict (≤ N−1 Keychain reads
+  on a 19-slot fleet), repeated on every genuine adoption and on every
+  rotation drift the resync sees, cached per lineage inside an episode.
+  Boundaries: the writer itself is CON-2323's hunt, and the cascade's last
+  step — the home-pin sensor's `switch --even-if-live` landing the owner's
+  stale backup generation while its live copy rotated — is not this guard's
+  (the owner's backup is not resynced during an episode); this closes the
+  poisoning write. Tests: `tests/test_identity_only_write.py`.
 
 ## Syncing with upstream
 

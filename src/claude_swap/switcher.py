@@ -2288,27 +2288,44 @@ class ClaudeAccountSwitcher:
         return identity is not None and identity == (email, org_uuid or "")
 
     def _identity_only_write(
-        self, identity_slot: str, recorded: str | None, live: str | None = None
+        self,
+        identity_slot: str,
+        recorded: str | None,
+        live: str | None = None,
+        own_backup: str | None = None,
     ) -> dict | None:
         """Detect an identity-only write into the live store (CON-2332).
 
         ``~/.claude.json`` names ``identity_slot`` — but is the live token
         pair that slot's? Its lineage (refresh-token fingerprint) is compared
-        with every OTHER managed slot's stored backup, the recorded active
-        slot first (the measured shape: 05-09 the record's own pair sat
-        under Account-23's identity). A match means something wrote one
+        with the slot's OWN stored backup first (same family = a consistent
+        login, whatever other backups carry — a duplicate of this family in
+        another slot's backup is that slot's problem, not a foreign pair),
+        then with every OTHER managed slot's backup, the recorded active slot
+        first (the measured shape: 05-09 the record's own pair sat under
+        Account-23's identity). A foreign match means something wrote one
         identity without its pair; the caller must neither adopt the slot
         nor seed its backup — the home-pin sensor's ``switch --even-if-live``
         that follows would otherwise land the older generation of the pair's
         owner and the family's next refresh dies (``invalid_grant``).
 
+        An episode is sticky across a lineage change: once the live pair is
+        known to be another slot's family, the same identity over a pair no
+        backup carries any more is either that family rotated (Claude Code's
+        own refresh, or the collect pass refreshing the owner's backup — the
+        owner is not "active" by identity) or a genuine ``/login`` onto this
+        slot. Only the server can tell the two apart, so the profile oracle
+        is asked once per new lineage; unresolved keeps the refusal — a
+        wrong record is recoverable, a poisoned backup is not.
+
         Returns ``{"identity", "owner", "recorded"}`` (slot strings) and
         publishes it as :attr:`identity_only_write` for the engine's event;
         ``None`` — and clears that state — when the live pair is empty,
-        unreadable, or no other slot owns it. ``live`` defaults to the live
-        store's current bytes. Warns ONCE per episode (same identity, owner
-        and lineage) and caches the verdict so the backup scan is not
-        repeated every tick. Never raises.
+        unreadable, the slot's own family, or nobody's. ``live`` defaults to
+        the live store's current bytes; ``own_backup`` lets a caller that
+        already read the slot's backup skip the second read. Warns ONCE per
+        episode and caches the verdict per lineage so the backup scan is
+        not repeated every tick. Never raises.
         """
         try:
             if live is None:
@@ -2319,27 +2336,116 @@ class ClaudeAccountSwitcher:
         if not live or not fp:
             self._clear_identity_only_write()
             return None
+        try:
+            if own_backup is None:
+                own_email = (
+                    (self._get_sequence_data() or {})
+                    .get("accounts", {})
+                    .get(identity_slot, {})
+                    .get("email", "")
+                )
+                own_backup = (
+                    self._read_account_credentials(identity_slot, own_email)
+                    if own_email
+                    else ""
+                )
+        except Exception:
+            own_backup = ""
+        if own_backup and (
+            own_backup == live or oauth.credential_fingerprint(own_backup) == fp
+        ):
+            self._clear_identity_only_write()
+            return None  # the slot's own family: a consistent login
         seen = self._identity_only_seen
         if seen is not None and seen[0] == identity_slot and seen[2] == fp:
             owner = seen[1]
         else:
             owner = self._lineage_owner(live, fp, exclude=identity_slot, first=recorded)
+            in_episode = seen is not None and seen[0] == identity_slot
+            if owner is None and in_episode:
+                owner = self._identity_only_after_rotation(
+                    identity_slot, seen[1], live
+                )
             if owner is None:
                 self._clear_identity_only_write()
                 return None
             self._identity_only_seen = (identity_slot, owner, fp)
-            self._logger.warning(
-                "identity-only write: live credential belongs to Account-%s, "
-                "identity says Account-%s — something wrote Account-%s's "
-                "identity into the live store without its token pair; "
-                "adoption and backup resync refused (record kept at "
-                "Account-%s, Account-%s's backup untouched).",
-                owner, identity_slot, identity_slot,
-                recorded if recorded is not None else "(none)", identity_slot,
-            )
+            if not in_episode:
+                self._logger.warning(
+                    "identity-only write: live credential belongs to Account-%s, "
+                    "identity says Account-%s — something wrote Account-%s's "
+                    "identity into the live store without its token pair; "
+                    "adoption and backup resync refused (record kept at "
+                    "Account-%s, Account-%s's backup untouched).",
+                    owner, identity_slot, identity_slot,
+                    recorded if recorded is not None else "(none)", identity_slot,
+                )
         state = {"identity": identity_slot, "owner": owner, "recorded": recorded}
         self.identity_only_write = state
         return state
+
+    def _identity_only_after_rotation(
+        self, identity_slot: str, prior_owner: str, live: str
+    ) -> str | None:
+        """Mid-episode the live pair's lineage left every backup: whose
+        family is it now? The profile endpoint answers with the token
+        itself. Resolved to ``identity_slot`` → a genuine login (``None``:
+        the episode ends); resolved to another managed slot → that owner;
+        unresolved (offline, unmanaged identity, endpoint failure) → the
+        refusal sticks with ``prior_owner``. Never raises."""
+        resolved = None
+        try:
+            access_token = oauth.extract_access_token(live)
+            if access_token:
+                resolved = oauth.fetch_oauth_profile(access_token)
+        except Exception as e:
+            self._logger.debug(f"Profile resolution raised: {e!r}")
+        slot = (
+            self._resolved_slot(resolved, self._get_sequence_data() or {})
+            if resolved
+            else None
+        )
+        if slot == identity_slot:
+            self._logger.info(
+                "identity-only episode for Account-%s ended: the live pair "
+                "resolved to this slot (a genuine login).", identity_slot,
+            )
+            return None
+        self._logger.info(
+            "identity-only write for Account-%s persists across a lineage "
+            "change: the live pair resolved to %s — refusal kept.",
+            identity_slot,
+            f"Account-{slot}" if slot is not None else (
+                "an unmanaged identity" if resolved else "nothing (unresolved)"
+            ),
+        )
+        return slot if slot is not None else prior_owner
+
+    @staticmethod
+    def _resolved_slot(resolved: dict, data: dict) -> str | None:
+        """Managed slot for a profile-endpoint identity: account uuid first
+        (organization must agree only when both sides record one), then
+        email + organization — refused when the slot's stored uuid conflicts
+        (a recycled email is a different account)."""
+        accounts = data.get("accounts", {})
+        r_email = resolved.get("email") or ""
+        r_org = resolved.get("organizationUuid") or ""
+        r_uuid = (resolved.get("uuid") or "").strip()
+        if r_uuid:
+            for num, acct in accounts.items():
+                a_org = acct.get("organizationUuid", "") or ""
+                if (acct.get("uuid") or "").strip() == r_uuid and (
+                    not r_org or not a_org or r_org == a_org
+                ):
+                    return num
+        if not r_email:
+            return None
+        slot = ClaudeAccountSwitcher._find_account_slot(data, r_email, r_org)
+        if slot is not None and r_uuid:
+            stored = (accounts.get(slot, {}).get("uuid") or "").strip()
+            if stored and stored != r_uuid:
+                return None
+        return slot
 
     def _clear_identity_only_write(self) -> None:
         self.identity_only_write = None
@@ -4029,6 +4135,7 @@ class ClaudeAccountSwitcher:
                 str(account_num),
                 str(recorded) if recorded is not None else None,
                 live=creds,
+                own_backup=backup or "",
             ) is not None:
                 return
             with (
