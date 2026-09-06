@@ -3,7 +3,7 @@
 создан: 2026-09-06 20:16 +0200 · сессия: fix-con-2375 · посадка: session:Yor
 
 ## Где стоп
-- 06-09 20:45: ревью р.1 approve (0 Important, 3 нита; sid 5c77c8cd-c43a-4edc-9fba-a0a0a3920f6f, вердикт-файл .proofs/review-verdict-fix-con-2375.json на head 3c0fa17). Дальше: коммит вердикта → CI PR на новом head → мерж руками (squash, без --auto) → CI main → deploy дверью scripts/deploy.sh main → перевести CON-2375 в Done дверью статусов.
+- 06-09 20:50: PR #47 слит руками (squash) 20:46:49 +0200, sha main ee24e95; CI main run 34052799907 — success; deploy дверью scripts/deploy.sh main → DEPLOY-OK (receipt 1788720562, cswap auto и cswap watch перезапущены). Осталось: самопроверка смежных каталогов → финал-коммент → перевести CON-2375 в Done дверью статусов → строка ящика финалов → выход.
 
 ## Проверено
 - Тикет прочитан целиком; ADR в репо нет (docs/_adrs отсутствует); CLAUDE.md в репо нет.
@@ -23,6 +23,8 @@
 - (пусто — что не решено и кто решает)
 
 ## Команды, которые уже гоняли
+- `gh pr merge 47 --squash` → MERGED ee24e95 (2026-09-06T18:46:49Z); `gh run watch 34052799907` → success; `bash scripts/deploy.sh main` → DEPLOY-OK.
+- Тикет-хвост на except-ветку: `linear-issue.sh … --owner src/claude_swap/switcher.py --class collector-spill-judge-exception` → DAN-143 (без -T дверь дала DAN) → перенесён в Quasar issueUpdate → CON-2420.
 - `gh pr create --base main --head fix/con-2375 …` → https://github.com/danpoyar/cswap/pull/47; `gh pr edit 47 --body-file` (исправлено число смежных: 36 из 49).
 - `python3 ~/projects/config/scripts/review-rounds.py judge --dir .` → кругов 0, следующий раунд 1, ok.
 - `claude --agent code-reviewer --effort max --permission-mode bypassPermissions --session-id <sid> --output-format json -p …` (фон run_in_background, timeout 3600).
