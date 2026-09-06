@@ -1906,7 +1906,10 @@ class ClaudeAccountSwitcher:
         and left the backup with a consumed one: a dead login on the next
         ``cswap run``. The bootstrap refuses the same shape before its own
         reconcile (CON-2355); this is the collector's and the locked
-        callers' guard.
+        callers' guard. A judgement that FAILS for any other reason — an
+        exception in the identity or drift check, the seed stamp, a broken
+        ``.claude.json`` — defers the same way (CON-2420): the question is
+        as undecidable, and a blind landing the same loss.
         """
         path = self._pending_rotation_path(account_num)
         try:
@@ -2027,9 +2030,10 @@ class ClaudeAccountSwitcher:
         """``(ahead, unreadable)`` — the session profile's credential when
         the profile ran PAST a spilled adoption (CON-2100), the bytes the
         landing must write instead of the sidecar's, or ``(None, None)`` to
-        land the sidecar as before; ``(None, error)`` when the profile
-        exists but cannot be read right now — the judgement is undecidable
-        and the landing must be deferred (CON-2375).
+        land the sidecar as before; ``(None, error)`` when the judgement is
+        undecidable and the landing must be deferred — the profile exists
+        but cannot be read right now (CON-2375), or the judge itself failed
+        (CON-2420).
 
         A spill tagged ``SPILL_ORIGIN_PROFILE`` holds the generation the
         profile had at spill time. Between the spill and its landing the
@@ -2057,7 +2061,11 @@ class ClaudeAccountSwitcher:
         spilled generation (the plain landing), the spill's predecessor (a
         profile re-seeded from the old backup — the sidecar is the newer
         one), its own seed stamp (a profile still AT its seed never rotated —
-        the heal's rule). Never raises.
+        the heal's rule). Never raises: a judge that fails for any other
+        reason (an exception in the identity or drift check, the seed stamp,
+        a broken ``.claude.json``) is reported as ``unreadable`` too — the
+        question is as undecidable as over a locked Keychain, and a blind
+        landing is the same loss (CON-2420).
         """
         from claude_swap.session import (
             read_profile_generation,
@@ -2094,13 +2102,21 @@ class ClaudeAccountSwitcher:
             ):
                 return None, None
             return profile, None
-        except Exception:
+        except Exception as exc:
+            # CON-2420 (review of PR #47): a judge that FAILS — an exception
+            # in the identity or drift check, the seed stamp, a broken
+            # `.claude.json` — leaves the question exactly as undecidable as
+            # an unreadable Keychain entry. Landing the sidecar blind ran the
+            # write hook's idle branch over the profile's copy, possibly the
+            # family's only newest generation: defer instead, and name the
+            # cause (traceback included — it is the operator's lead).
             self._logger.warning(
                 "Could not judge account %s's session profile while landing "
-                "its spilled adoption; landing the spilled generation as-is",
+                "its spilled adoption; deferring the landing instead of "
+                "landing the spilled generation blind (CON-2420)",
                 account_num, exc_info=True,
             )
-            return None, None
+            return None, f"judgement failed ({type(exc).__name__}: {exc})"
 
     def _stamp_profile_generation(
         self, session_dir: Path, fingerprint: str, account_num: str
