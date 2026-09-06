@@ -3,14 +3,15 @@
 создан: 2026-09-06 21:29 +0200 · сессия: fix-con-2420 · посадка: session:Yor
 
 ## Где стоп
-- Фикс + тест + FORK.md готовы, полный сьют зелёный (2199 passed), origin/main слит (up to date). Следующий шаг: коммит, пуш, PR; затем ревьюер code-reviewer effort max (риск-зона auth), вердикт-файл .proofs/review-verdict-fix-con-2420.json; мерж руками (без --auto), CI main, деплой дверью scripts/deploy.sh main, финал Done.
+- Ревью р.1: approve, 0 Important, 2 нита (sid в $CLAUDE_JOB_DIR/tmp/review-sid.txt; вердикт .proofs/review-verdict-fix-con-2420.json на head bf4541f). Ниты починены (тексты deferral в switcher.py «read and judged»; время коммента в этом файле), тикет-сосед DAN-144 на тексты refresh/reseed/session. Дальше: раунд 2 продолжением ревьюера «только подтверди фикс» на новом head → коммит вердикта р.2 → мерж руками (squash, без --auto) → CI main → деплой scripts/deploy.sh main → перевести CON-2420 в Done дверью статусов.
 
 ## Проверено
 - Проблема жива на HEAD ee24e95: except-ветка switcher.py:2098–2104 → `return None, None` (сажает сайдкар вслепую).
 - Дверь дублей ticket_similarity.py door: ярусов дубль/тот же хозяин нет (макс 0.07). ADR в репо нет (docs/ отсутствует).
 - Базовый прогон TestSpilledAdoptionReconcile на HEAD: 10 passed.
-- Коммент в тикет: критерий + практики + варианты (A defer без предела — выбран) + границы — положен 06-09 ~21:45.
+- Коммент в тикет: критерий + практики + варианты (A defer без предела — выбран) + границы — положен 06-09 21:33 +0200 (createdAt Linear 19:33:29Z; первый коммит 21:37:54 +0200).
 - Красная проба показана комментом (FileNotFoundError на копии профиля — хук снёс её после слепой посадки).
+- Ревью р.1 (code-reviewer effort max, CLI): «фактических нет, 2 нита», можно принимать; ниты — тексты deferral только про Keychain (в границах — починил в switcher.py; вне границ — DAN-144), время коммента границ в этом файле (починил). Сьюты switch_heal/refresh/reseed/bootstrap_family_guard после правки — 106 passed.
 - Фикс: switcher.py except-ветка `_profile_generation_past_spill` → `(None, "judgement failed (…)")`; тест зелёный; полный pytest 2199 passed, 3 skipped, 1 xfailed (75 с); merge origin/main — Already up to date, conflict-markers 0.
 
 ## Отвергнуто

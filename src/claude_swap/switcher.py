@@ -1834,10 +1834,10 @@ class ClaudeAccountSwitcher:
 
         Returns the credential bytes the caller should fetch with, or None
         when a spill exists but could not be reconciled this pass (lock
-        contention, or a spilled adoption whose profile cannot be read right
-        now — CON-2375): the on-disk generation is the spill's consumed
-        predecessor, so the caller must defer instead of touching the
-        network with it. Never raises.
+        contention, or a spilled adoption whose profile cannot be read —
+        CON-2375 — or judged — CON-2420 — right now): the on-disk
+        generation is the spill's consumed predecessor, so the caller must
+        defer instead of touching the network with it. Never raises.
         """
         path = self._pending_rotation_path(account_num)
         if not path.exists():
@@ -1862,10 +1862,10 @@ class ClaudeAccountSwitcher:
         (the session bootstrap, ``cswap refresh``, the reseed door). Returns
         the bytes to continue with — under the held lock there is no
         contention to defer for — or ``None`` when the landing itself is
-        deferred: a spilled ADOPTION whose profile cannot be read right now
-        (CON-2375). The sidecar then stays, the backup is untouched and the
-        caller must defer too — the bytes it holds are the spill's consumed
-        predecessor."""
+        deferred: a spilled ADOPTION whose profile cannot be read (CON-2375)
+        or judged (CON-2420) right now. The sidecar then stays, the backup
+        is untouched and the caller must defer too — the bytes it holds are
+        the spill's consumed predecessor."""
         if not self._pending_rotation_path(account_num).exists():
             return creds
         return self._reconcile_spilled_rotation_locked(account_num, email, creds)
@@ -1954,7 +1954,8 @@ class ClaudeAccountSwitcher:
                         "Account %s: the session profile could not be read "
                         "while landing its spilled adoption (%s); deferring "
                         "the landing — the sidecar stays until the profile "
-                        "can be read (CON-2375).", account_num, unreadable,
+                        "can be read and judged (CON-2375, CON-2420).",
+                        account_num, unreadable,
                     )
                     return None
                 if ahead is not None:
