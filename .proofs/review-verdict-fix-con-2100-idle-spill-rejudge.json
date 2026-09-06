@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2100",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "e9ac0fb0e87e4884b53bea3d0a6e1c1415b33739",
+  "summary": "р.2: фактических нет, ниты р.1 №2-4 починены и подтверждены (35 passed), №1 и №5 приняты автором без правки; можно принимать; альтернативы: judged",
+  "findings": []
+}
