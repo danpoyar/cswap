@@ -1363,11 +1363,12 @@ class SessionManager:
     def _unreadable_stale_message(account_num: str, email: str) -> str:
         return (
             f"Account-{account_num} ({email}): the profile is marked for "
-            "re-seeding (its backup changed while it was live), but its own "
-            "credential cannot be read right now (Keychain busy) — the "
-            "family's newest generation may live only in that unreadable "
-            "entry, and the stored backup (empty or the seed generation) "
-            "cannot judge it. Not adopting, not invalidating and not POSTing; "
+            "re-seeding (its backup changed while it was live, or its "
+            "machine-shared integrations fell behind), but its own credential "
+            "cannot be read right now (Keychain busy) — the family's newest "
+            "generation may live only in that unreadable entry, and no state "
+            "of the stored backup (empty, the seed generation or a newer one) "
+            "can judge it. Not adopting, not invalidating and not POSTing; "
             "the marker is kept for a later run. Retry shortly (CON-2374)."
         )
 

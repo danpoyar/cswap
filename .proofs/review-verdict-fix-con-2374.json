@@ -1,0 +1,22 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2374",
+  "verdict": "approve",
+  "round": 1,
+  "head_sha": "b096a757e2c7a3ffdf39278dbfbb167a3f4c9144",
+  "summary": "фактических нет, 2 нита; можно принимать; альтернативы: judged; спот-чек 16 passed воспроизведён, красный тест на origin/main воспроизведён (маркер снесён, лог Invalidated session credentials for account 2)",
+  "findings": [
+    {
+      "severity": "nit",
+      "message": "_unreadable_stale_message уже кода: «its backup changed while it was live» — маркер ставит и парити-путь CON-1432 (session.py:747); «the stored backup (empty or the seed generation)» — отказ теперь и над бэкапом новее seed-штампа. Сообщение пользователю называет две причины из трёх и одну форму бэкапа из трёх.",
+      "file": "src/claude_swap/session.py",
+      "line": 1365
+    },
+    {
+      "severity": "nit",
+      "message": "Новый тест пинит только форму бэкапа \"\"; докстринг обещает «whatever the backup bytes say», а форма «бэкап новее seed-штампа + профиль нечитаем» (та самая цена из Альтернативы 1: раньше wipe+reseed, теперь отказ) без пина — рефакторинг, который снова спросит байты бэкапа, вернёт wipe молча при зелёном тесте.",
+      "file": "tests/test_bootstrap_family_guard.py",
+      "line": 556
+    }
+  ]
+}

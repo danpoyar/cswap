@@ -586,6 +586,38 @@ class TestOneReadFeedsAdoptionAndGuard:
         assert "keychain" in str(refused.value).lower()
         assert "no stored credentials" not in str(refused.value)
 
+    def test_stale_marker_over_unreadable_profile_and_readded_backup_defers(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """The one form whose outcome CON-2374 changed (review r.1, nit 2):
+        the backup moved past the seed stamp (slot re-added) while the
+        profile is unreadable. The seed guard calls that decidable and the
+        old branch wiped the unreadable entry blind; now the profile read
+        alone decides — deferred, whatever the backup bytes say. Pinned so a
+        refactor that asks the backup again cannot bring the wipe back
+        under a green suite."""
+        # The marker came from the backup-write hook's LIVE branch (deferred
+        # invalidation); the session has since exited. The store's pure write
+        # stands in for the re-add — the switcher wrapper would run that hook's
+        # idle branch and invalidate the profile before the run under test.
+        readded = _creds("at-readded", "rt-readded")
+        switcher._store._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, readded)
+        mark_session_stale(rotated_profile)
+
+        with _busy_keychain(rotated_profile), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert (rotated_profile / STALE_MARKER).exists()  # deferred, not lost
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == readded
+
     def test_stale_marker_over_readable_profile_adopts_then_reseeds(
         self, manager, switcher, rotated_profile, probe_times_out, post_spy,
     ):
