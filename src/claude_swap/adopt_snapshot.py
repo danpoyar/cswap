@@ -31,7 +31,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
+from claude_swap.process_detection import _ENV_TOKEN_BOUNDARY, config_dir_matcher
 
 # pid ppid "Sat Sep  5 09:48:00 2026" argv+env — the lstart field is five
 # space-separated words, so the line is matched, not split.
@@ -39,16 +41,22 @@ _PS_LINE = re.compile(
     r"^\s*(\d+)\s+(\d+)\s+"
     r"([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$"
 )
-# First environment token: ``ps -E`` appends ``NAME=value`` words after argv.
-# A flag like ``--effort=max`` starts with ``-`` and is not a boundary; an env
-# value holding a space truncates the parse (documented limit of the ps probe
-# in process_detection.py) and can only under-report.
-_ENV_BOUNDARY = re.compile(r"\s(?=[A-Za-z_][A-Za-z0-9_]*=)")
+# The argv/environment boundary is process_detection._ENV_TOKEN_BOUNDARY:
+# ``ps -E`` appends ``NAME=value`` words after argv, a flag like
+# ``--effort=max`` starts with ``-`` and is not a boundary. An env value that
+# itself holds a space yields words without ``=``, which the env parse skips;
+# a value holding `` word=`` text is split there and can only under-report.
 _MDAT = re.compile(r'"mdat"<timedate>=0x[0-9A-Fa-f]+\s+"(\d{14})Z')
 _VERSIONS_DIR = "/.local/share/claude/versions/"
 
 COMMAND_CHARS = 120
 PROCESS_CAP = 300
+# ``security find-generic-password`` exit status for "item not found"
+# (errSecItemNotFound, live on macOS 26); every other non-zero is a failure.
+SECURITY_RC_NOT_FOUND = 44
+# ``lstart`` is parsed in the C locale ("Sat Sep  5 09:48:00 2026"); a
+# localized ps ("dom.  6 sept.") would parse nothing and say nothing.
+_C_LOCALE_ENV = {"LC_ALL": "C", "LANG": "C"}
 
 
 # The daemon runs under launchd with a short PATH (no /usr/sbin, where lsof
@@ -89,7 +97,7 @@ def parse_ps_claude(text: str, *, cap: int = PROCESS_CAP) -> list[dict]:
         if not m:
             continue
         pid, ppid, started, rest = m.groups()
-        parts = _ENV_BOUNDARY.split(rest, maxsplit=1)
+        parts = _ENV_TOKEN_BOUNDARY.split(rest, maxsplit=1)
         argv = parts[0].strip()
         argv0 = argv.split(None, 1)[0] if argv else ""
         if not _is_claude_binary(argv0):
@@ -112,6 +120,12 @@ def parse_ps_claude(text: str, *, cap: int = PROCESS_CAP) -> list[dict]:
         if len(procs) >= cap:
             break
     return procs
+
+
+def count_ps_lines(text: str) -> int:
+    """How many lines of ``ps`` output the parser understands at all — zero
+    on non-empty output means the format is not the C-locale one."""
+    return sum(1 for line in text.splitlines() if _PS_LINE.match(line))
 
 
 def parse_security_mdat(text: str) -> str | None:
@@ -163,16 +177,6 @@ def _file_summary(path: Path, *, identity: bool) -> dict:
     return out
 
 
-def _matches_dir(value: str | None, wanted: Path | None) -> bool:
-    if value is None or wanted is None:
-        return False
-    if value == str(wanted):
-        return True
-    try:
-        return Path(value).resolve() == wanted.resolve()
-    except OSError:
-        return False
-
 
 def collect_adopt_snapshot(
     config_path: Path,
@@ -190,7 +194,9 @@ def collect_adopt_snapshot(
     t0 = time.monotonic()
     errors: list[str] = []
 
-    def run(name: str, cmd: list[str]) -> subprocess.CompletedProcess | None:
+    def run(
+        name: str, cmd: list[str], env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess | None:
         try:
             return runner(
                 cmd,
@@ -198,6 +204,7 @@ def collect_adopt_snapshot(
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_s,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             errors.append(f"{name}: timed out after {timeout_s}s")
@@ -216,8 +223,17 @@ def collect_adopt_snapshot(
         )
         if result is None:
             return info
-        if result.returncode != 0:
+        if result.returncode == SECURITY_RC_NOT_FOUND:
             info["present"] = False
+            return info
+        if result.returncode != 0:
+            # Anything but "no such item" (locked/unavailable Keychain) is a
+            # failed probe, not an absent item — say so.
+            stderr = (result.stderr or "").strip().splitlines()
+            errors.append(
+                f"security: rc={result.returncode}"
+                f"{': ' + stderr[0] if stderr else ''}"
+            )
             return info
         info["present"] = True
         info["mdat"] = parse_security_mdat(result.stdout or "")
@@ -229,9 +245,21 @@ def collect_adopt_snapshot(
               "-o", "pid=,ppid=,lstart=,command="]
     procs: list[dict] = []
     truncated = False
-    result = run("ps", ps_cmd)
+    result = run("ps", ps_cmd, env={**os.environ, **_C_LOCALE_ENV})
     if result is not None:
-        procs = parse_ps_claude(result.stdout or "", cap=ps_cap)
+        stdout = result.stdout or ""
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip().splitlines()
+            errors.append(
+                f"ps: rc={result.returncode}{': ' + stderr[0] if stderr else ''}"
+            )
+        total = len(stdout.splitlines())
+        parsed = count_ps_lines(stdout)
+        if total and not parsed:
+            errors.append(
+                f"ps: parsed 0 of {total} lines — unexpected format (locale?)"
+            )
+        procs = parse_ps_claude(stdout, cap=ps_cap)
         truncated = len(procs) >= ps_cap
         if platform != "darwin" and os.path.isdir("/proc/self"):
             for p in procs:
@@ -252,6 +280,9 @@ def collect_adopt_snapshot(
     if result is not None:
         openers = parse_lsof(result.stdout or "")  # rc 1 = nobody holds it
 
+    on_profile = (
+        config_dir_matcher(session_dir) if session_dir is not None else (lambda _v: False)
+    )
     lock_path = config_path.with_name(config_path.name + ".lock")
     lock = _file_summary(lock_path, identity=False)
     lock.pop("path", None)
@@ -271,7 +302,9 @@ def collect_adopt_snapshot(
             "withoutConfigDir": [p["pid"] for p in procs if p["configDir"] is None],
             "withTokenEnv": [p["pid"] for p in procs if p["tokenEnv"]],
             "onAdoptedProfile": [
-                p["pid"] for p in procs if _matches_dir(p["configDir"], session_dir)
+                p["pid"]
+                for p in procs
+                if p["configDir"] is not None and on_profile(p["configDir"])
             ],
             "truncated": truncated,
             "list": procs,
@@ -286,7 +319,6 @@ def collect_adopt_snapshot(
 def default_adopt_snapshot(*, config_path: Path, session_dir: Path | None, **_: object) -> dict:
     """The engine's collector: live tools, the Keychain names Claude Code and
     cswap derive for the active store and the adopted slot's profile."""
-    from claude_swap import macos_keychain
     from claude_swap.session import keychain_service_name
 
     profile_service = (

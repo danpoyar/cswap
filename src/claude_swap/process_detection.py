@@ -189,6 +189,16 @@ def pids_with_config_dir(
         # so membership never needs the environment there.
         return None
 
+    matches = config_dir_matcher(config_dir)
+    if os.path.isdir("/proc/self"):
+        return _pids_with_config_dir_proc(unique, matches)
+    return _pids_with_config_dir_ps(unique, matches)
+
+
+def config_dir_matcher(config_dir: Path) -> Callable[[str], bool]:
+    """``value == config_dir``, literally or resolved: a profile reached
+    through a symlinked spelling still matches. Shared by the membership
+    probe above and the adopt-time snapshot (adopt_snapshot.py)."""
     wanted_raw = str(config_dir)
     try:
         wanted_resolved = str(config_dir.resolve())
@@ -203,9 +213,7 @@ def pids_with_config_dir(
         except OSError:
             return False
 
-    if os.path.isdir("/proc/self"):
-        return _pids_with_config_dir_proc(unique, matches)
-    return _pids_with_config_dir_ps(unique, matches)
+    return matches
 
 
 def _pids_with_config_dir_proc(

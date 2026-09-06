@@ -549,7 +549,7 @@ class AdoptSnapshotEvent(AutoSwitchEvent):
             f"{' (' + ', '.join(map(str, without)) + ')' if without else ''}, "
             f"{len(on_profile)} on Account-{self.to_ref.get('number')}'s profile; "
             f"config mtime {cfg.get('mtime')}; live Keychain mdat {live.get('mdat')}; "
-            f"profile Keychain mdat {prof.get('mdat')}; "
+            f"profile Keychain mdat {prof.get('mdat') if prof else 'n/a'}; "
             f"open handles: {openers or 'none'}"
             f"{'; probe errors: ' + '; '.join(errors) if errors else ''}"
         )

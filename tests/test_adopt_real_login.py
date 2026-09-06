@@ -15,9 +15,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from claude_swap.adopt_snapshot import default_adopt_snapshot
 from claude_swap.autoswitch import (
     AdoptRealLoginEvent,
     AdoptSnapshotEvent,
+    AutoSwitchEngine,
     TickOutcome,
 )
 from tests.test_autoswitch import EngineHarness, _usage
@@ -152,3 +154,9 @@ class TestAdoptSnapshot:
         h.engine = h._make_engine(adopt_snapshot=lambda **kw: {"never": True})
         h.tick_with_usage(HEALTHY)
         assert [e for e in h.events if isinstance(e, AdoptSnapshotEvent)] == []
+
+    def test_engine_defaults_to_the_live_collector(self, temp_home):
+        # The harness stubs the collector; the daemon must get the real one.
+        h = _harness(temp_home, live=1, record=1)
+        engine = AutoSwitchEngine(h.switcher, h.settings, h.events.append, clock=h.clock)
+        assert engine._adopt_snapshot is default_adopt_snapshot

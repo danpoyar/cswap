@@ -17,12 +17,16 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import adopt_snapshot
 from claude_swap.adopt_snapshot import (
     collect_adopt_snapshot,
+    count_ps_lines,
+    default_adopt_snapshot,
     parse_lsof,
     parse_ps_claude,
     parse_security_mdat,
 )
+from claude_swap.session import keychain_service_name
 
 PS_OUT = """\
   101     1 Sat Sep  5 09:48:00 2026 /Users/u/.local/bin/claude --bg CLAUDE_CONFIG_DIR=/tmp/prof/23-x HOME=/Users/u PATH=/x
@@ -31,6 +35,13 @@ PS_OUT = """\
   104     1 Fri Sep  4 22:50:37 2026 /bin/zsh -c source snapshot.sh CLAUDE_CONFIG_DIR=/tmp/prof/23-x
   105   103 Sat Sep  5 10:00:00 2026 /Applications/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host x CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SECRET HOME=/Users/u
   106     1 Sat Sep  5 10:00:00 2026 /usr/bin/python3 /Users/u/bin/cswap auto CLAUDE_CONFIG_DIR=/tmp/prof/32-y
+"""
+
+# What a localized ps (LC_ALL=es_ES.UTF-8) prints for lstart — review r1 ran
+# it live: 0 of 948 lines matched and the snapshot said nothing.
+PS_OUT_ES = """\
+  101     1 dom.  6 sept. 09:48:00 2026 /Users/u/.local/bin/claude --bg CLAUDE_CONFIG_DIR=/tmp/prof/23-x HOME=/Users/u
+  103     1 vie.  5 sept. 22:50:37 2026 claude daemon run HOME=/Users/u
 """
 
 SECURITY_OUT = """\
@@ -74,6 +85,11 @@ class TestParsers:
         assert parse_security_mdat(SECURITY_OUT) == "2026-09-05T23:58:07Z"
         assert parse_security_mdat("no such attribute") is None
 
+    def test_count_ps_lines_sees_only_the_c_locale_format(self):
+        assert count_ps_lines(PS_OUT) == 6
+        assert count_ps_lines(PS_OUT_ES) == 0
+        assert count_ps_lines("") == 0
+
     def test_lsof_field_output(self):
         assert parse_lsof("p123\ncclaude\np456\ncjq\n") == [
             {"pid": 123, "command": "claude"},
@@ -84,16 +100,20 @@ class TestParsers:
 
 def _runner_factory(outputs: dict, *, raise_for: set | None = None):
     calls: list[list[str]] = []
+    envs: dict[str, dict | None] = {}
 
     def runner(cmd, **kwargs):
         calls.append(list(cmd))
         name = Path(cmd[0]).name
+        envs[name] = kwargs.get("env")
         if raise_for and name in raise_for:
             raise OSError(f"{name} missing")
-        stdout, rc = outputs.get(name, ("", 1))
-        return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="")
+        stdout, rc, *rest = outputs.get(name, ("", 1))
+        stderr = rest[0] if rest else ""
+        return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr=stderr)
 
     runner.calls = calls  # type: ignore[attr-defined]
+    runner.envs = envs  # type: ignore[attr-defined]
     return runner
 
 
@@ -163,6 +183,50 @@ class TestCollect:
                 assert "-w" not in call
                 assert call[1] == "find-generic-password"
 
+    def test_ps_runs_in_the_c_locale(self, config_file: Path):
+        runner = _runner_factory({"ps": (PS_OUT, 0), "security": (SECURITY_OUT, 0), "lsof": ("", 1)})
+        collect_adopt_snapshot(
+            config_file, session_dir=None, keychain_account="u",
+            runner=runner, platform="darwin",
+        )
+        env = runner.envs["ps"]
+        assert env["LC_ALL"] == "C" and env["LANG"] == "C"
+        assert "PATH" in env  # the rest of the environment is inherited
+
+    def test_localized_ps_output_is_an_error_not_silence(self, config_file: Path):
+        # Review r1 (major): a non-C locale parsed nothing and reported nothing.
+        runner = _runner_factory({"ps": (PS_OUT_ES, 0), "security": (SECURITY_OUT, 0), "lsof": ("", 1)})
+        snap = collect_adopt_snapshot(
+            config_file, session_dir=None, keychain_account="u",
+            runner=runner, platform="darwin",
+        )
+        assert snap["processes"]["claude"] == 0
+        assert any(e.startswith("ps: parsed 0 of 2 lines") for e in snap["errors"])
+
+    def test_ps_nonzero_exit_is_an_error_line(self, config_file: Path):
+        runner = _runner_factory({"ps": ("", 1, "ps: illegal option"), "security": (SECURITY_OUT, 0), "lsof": ("", 1)})
+        snap = collect_adopt_snapshot(
+            config_file, session_dir=None, keychain_account="u",
+            runner=runner, platform="darwin",
+        )
+        assert snap["processes"]["list"] == []
+        assert "ps: rc=1: ps: illegal option" in snap["errors"]
+
+    def test_locked_keychain_is_an_error_not_an_absent_item(self, config_file: Path):
+        # rc 44 = errSecItemNotFound (absent, silent); any other rc is a failed probe.
+        runner = _runner_factory({
+            "ps": ("", 0),
+            "security": ("", 36, "security: SecKeychainSearchCopyNext: User interaction is not allowed."),
+            "lsof": ("", 1),
+        })
+        snap = collect_adopt_snapshot(
+            config_file, session_dir=None, keychain_account="u",
+            runner=runner, platform="darwin",
+        )
+        assert snap["keychainLive"]["present"] is None
+        assert snap["keychainLive"]["mdat"] is None
+        assert any(e.startswith("security: rc=36: security: SecKeychainSearchCopyNext") for e in snap["errors"])
+
     def test_missing_tools_are_errors_not_exceptions(self, config_file: Path):
         runner = _runner_factory({}, raise_for={"ps", "security", "lsof"})
         snap = collect_adopt_snapshot(
@@ -213,3 +277,38 @@ class TestCollect:
         )
         assert snap["keychainLive"] == {"service": "Claude Code-credentials", "present": None, "mdat": None, "skipped": "not macOS"}
         assert all(Path(c[0]).name != "security" for c in runner.calls)
+
+
+class TestDefaultCollector:
+    """The daemon's collector wires the live tool names the tests stub."""
+
+    def test_default_passes_profile_service_and_account(self, tmp_path: Path, monkeypatch):
+        seen: dict = {}
+
+        def fake_collect(config_path, **kwargs):
+            seen["config_path"] = config_path
+            seen.update(kwargs)
+            return {"ok": True}
+
+        monkeypatch.setattr(adopt_snapshot, "collect_adopt_snapshot", fake_collect)
+        monkeypatch.setattr(adopt_snapshot.macos_keychain, "keychain_account_name", lambda: "u")
+        session_dir = tmp_path / "prof" / "23-x"
+        out = default_adopt_snapshot(
+            config_path=tmp_path / ".claude.json", session_dir=session_dir, prior=None, to_ref={}
+        )
+        assert out == {"ok": True}
+        assert seen["config_path"] == tmp_path / ".claude.json"
+        assert seen["session_dir"] == session_dir
+        assert seen["keychain_account"] == "u"
+        assert seen["profile_service"] == keychain_service_name(session_dir)
+
+    def test_default_without_profile(self, tmp_path: Path, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            adopt_snapshot, "collect_adopt_snapshot",
+            lambda config_path, **kw: seen.update(kw) or {},
+        )
+        monkeypatch.setattr(adopt_snapshot.macos_keychain, "keychain_account_name", lambda: "u")
+        default_adopt_snapshot(config_path=tmp_path / ".claude.json", session_dir=None)
+        assert seen["profile_service"] is None
+        assert seen["session_dir"] is None
