@@ -3,7 +3,7 @@
 создан: 2026-09-06 14:18 +0200 · сессия: fix-con-2355 · посадка: session:Yor
 
 ## Где стоп
-- Фикс и тесты зелёные локально (15/15 в tests/test_bootstrap_family_guard.py); идёт полный pytest форка, предполёт (merge origin/main) и ревью риск-зоны (code-reviewer effort max). Дальше: PR «Fixes CON-2355», мерж руками после вердикта, CI main, перевести CON-2355 в Done дверью статусов.
+- Ревью р.1 (code-reviewer effort max, sid 85a6af0a-…): «можно принимать», Important 0, 2 Minor вне объёма → отдельные тикеты (stale-marker ветка над бэкапом ""; проход коллектора над нечитаемым профилем). Вердикт .proofs/review-verdict-fix-con-2355.json. Дальше: пуш вердикта → CI PR #45 → мерж руками (squash) → CI main → деплой scripts/deploy.sh main → перевести CON-2355 в Done дверью статусов.
 
 ## Проверено
 - Красная проба: tests/test_bootstrap_family_guard.py::TestPendingProfileSpillOverUnreadableProfile::test_unreadable_profile_with_pending_profile_spill_refuses_and_lands_nothing → «DID NOT RAISE SessionError», post_spy=[at-spilled] (коммент в тикете 06-09 ~14:40).
@@ -21,5 +21,7 @@
 - Проход коллектора (`_reconcile_spilled_rotation` через `_fetch_account_usage`) сажает сайдкар при нечитаемом профиле «как раньше» (пин CON-2100) — тот же класс потери; вне объёма, в «Что спроектировано плохо».
 
 ## Команды, которые уже гоняли
+- claude --agent code-reviewer --effort max -p (раунд 1, sid 85a6af0a-…) → 22 хода, финальный ответ отклонён safeguard «[cyber]» (req_011CenCX7f33KugeBFppQ9Zo); повтор — claude --resume <sid> с просьбой нейтральной формулировки итога (14:43).
+- CI PR #45: test pass, test-windows pass, macos-keychain skipping (PR-стадия).
 - env -u FORCE_COLOR timeout 600 uv run --group dev pytest -q tests/test_bootstrap_family_guard.py → 13 passed (база), 1 failed/1 passed (красный), 15 passed (после фикса).
 - python3 ~/projects/config/scripts/ticket_similarity.py door … --exclude CON-2355 → rc=0, стопа нет.
