@@ -6193,6 +6193,27 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
                     return
+            if report.profile_ahead and not even_if_live:
+                # CON-2345 (review r.1 nit): the stored copy here is EXPIRED
+                # while the session's is fresh — say so, and name the
+                # override that lands the session's generation, as the
+                # CON-2030 refusal does; the generic text below would call
+                # a possibly valid re-login "a dead login".
+                raise LiveSessionRefusal(
+                    f"Account-{account_num} ({email}) has a live session-mode "
+                    f"Claude instance (PID {report.detail}) whose login "
+                    "generation is fresh while the stored backup's has "
+                    "expired — activating the stored copy would land an "
+                    "expired login. For a terminal on this slot run: cswap "
+                    f"run {account_num}; to bring the default login here "
+                    f"onto the session's generation run: cswap switch "
+                    f"{account_num} --even-if-live (the login and the "
+                    "session then share one generation until the next "
+                    "rotation).",
+                    account_num=account_num,
+                    email=email,
+                    pids=pids,
+                )
             # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
             # menu bar shows it with a copy button — instead of a failed action.
             raise LiveSessionRefusal(

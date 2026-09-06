@@ -508,10 +508,16 @@ class TestLiveSessionOutranksTheOrderingOracles:
             s, backup_expires=EXPIRED_MS
         )
 
-        # Without the override a live session owning the family is refused.
-        with patch.object(s, "_live_session_pids", return_value=[4242]):
-            with pytest.raises(LiveSessionRefusal):
-                s.switch_to(TARGET_NUM, json_output=True)
+        # Without the override a live session owning the family is refused —
+        # naming the shape and the override (review r.1 nit), not "a dead
+        # login" the generic text would claim of a possibly valid re-login.
+        with (
+            patch.object(s, "_live_session_pids", return_value=[4242]),
+            pytest.raises(LiveSessionRefusal) as refusal,
+        ):
+            s.switch_to(TARGET_NUM, json_output=True)
+        assert "--even-if-live" in str(refusal.value)
+        assert "stored backup's has expired" in str(refusal.value)
         assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == stale_backup
         assert (session_dir / STALE_MARKER).exists()
         no_network.assert_not_called()
@@ -588,17 +594,50 @@ class TestLiveSessionOutranksTheOrderingOracles:
         from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
 
         s = _make_switcher(temp_home)
-        _superseded_profile(s, backup_expires=EXPIRED_MS)
+        _stale_backup, live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
         no_expiry = json.dumps(
             {"claudeAiOauth": {"accessToken": "at-new-2", "refreshToken": "rt-new-2"}}
         )
-        s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, no_expiry)
+        # Written UNDER the live session (review r.1, Major 1): an idle
+        # write hook would drop the profile's copy and the heal would stop
+        # at "profile holds no credential" before ever judging the expiry.
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, no_expiry)
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == live_family
+        assert (session_dir / STALE_MARKER).exists()
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+
+        assert report.outcome == BACKUP_CURRENT
+        assert report.detail == "profile marked stale — the backup is the newer login"
+        assert report.profile_ahead is False
+        no_network.assert_not_called()
+
+    def test_profile_still_at_its_seed_is_not_evidence(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """The session never rotated (profile == seed stamp): a backup written
+        after the seeding is the newer login by construction (re-add/
+        re-login), however expired its access token — the oracles stand."""
+        from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
+
+        s = _make_switcher(temp_home)
+        _stale_backup, live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(live_family), encoding="utf-8"
+        )
 
         with patch.object(s, "_live_session_pids", return_value=[4242]):
             report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
 
         assert report.outcome == BACKUP_CURRENT
         assert report.profile_ahead is False
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == live_family
         no_network.assert_not_called()
 
     def test_idle_profile_is_still_judged_by_the_oracles(

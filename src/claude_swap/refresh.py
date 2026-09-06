@@ -176,6 +176,20 @@ def _live_generation_outranks(profile_oauth: dict, backup: str | None) -> bool:
     of life; a backup nobody refreshed since it expired is not. Anything
     weaker (both fresh, both expired, an unknown expiry) is NOT evidence —
     the oracles keep their verdict.
+
+    Known price (review r.1 of PR #43): "expired" is not "consumed". An
+    INDEPENDENT login parked in the backup under a live session (a re-login
+    in the global store, backed up by the daemon on its way out) is
+    refreshed by nobody — the daemon skips a slot with a live session, the
+    parked refresh is refused — so after one access-token lifetime it reads
+    "expired" too, and the ``--even-if-live`` return home adopts the
+    session's family over it: no dead landing, but the login and the
+    session then share one family (two stores, one dies at the next
+    rotation — the price ADR 0020 of the config repo already accepts for
+    the home slot). Telling the two apart would take POSTing the backup's
+    grant, which this code base never does under a live session (a consumed
+    grant re-presented is the account-death shape). The shape disappears
+    once the orchestrator runs on the global login instead of a profile.
     """
     profile_expires = profile_oauth.get("expiresAt")
     if not isinstance(profile_expires, (int, float)) or is_oauth_token_expired(
@@ -519,7 +533,16 @@ def heal_backup_before_activation(
     newer = _backup_is_newer(session_dir, backup)
     profile_ahead = False
     if newer is not None:
-        if pids and full_pair and _live_generation_outranks(profile_oauth, backup):
+        if (
+            pids
+            and full_pair
+            # A profile still AT its seed generation never rotated: its
+            # session proved nothing, and a backup written after the seeding
+            # is the newer login by construction (re-add/re-login) — the
+            # evidence below is reserved for a session that ran ahead.
+            and profile_fp != read_seed_fingerprint(session_dir)
+            and _live_generation_outranks(profile_oauth, backup)
+        ):
             # CON-2345: the oracles are presumptions; a live session with a
             # FRESH generation over an EXPIRED backup is evidence. Reported
             # as the live session below (refusal, skip — or the explicit
