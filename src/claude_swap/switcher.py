@@ -327,6 +327,14 @@ class ClaudeAccountSwitcher:
         # (slot, email) so a slot reused for a different account in a
         # long-lived process warns afresh.
         self._provenance_warned: set[tuple[str, str]] = set()
+        # Identity-only write detector (CON-2332): the live config names one
+        # slot while the live token pair is another slot's stored lineage.
+        # ``identity_only_write`` is the current verdict for the engine
+        # (``{"identity", "owner", "recorded"}`` or None); ``_identity_only_seen``
+        # keys the episode (identity slot, owner slot, lineage fingerprint) so
+        # the WARN fires once and the backup scan is not repeated every tick.
+        self.identity_only_write: dict | None = None
+        self._identity_only_seen: tuple[str, str, str] | None = None
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -1630,6 +1638,16 @@ class ClaudeAccountSwitcher:
         prior = data.get("activeAccountNumber")
         prior_num = str(prior) if prior is not None else None
         if prior_num == str(account_num):
+            self._clear_identity_only_write()
+            return (False, prior_num)
+        # Lineage guard (CON-2332): the config naming this slot is not a
+        # login to follow when the live token pair is ANOTHER slot's stored
+        # lineage — someone wrote an identity without its pair. Adopting
+        # would make every record consumer treat the pair's owner as
+        # inactive (``refresh --all`` would rotate its backup under the live
+        # store, killing the family). Refusing needs no lock: nothing is
+        # written, and the next tick re-judges.
+        if self._identity_only_write(str(account_num), prior_num) is not None:
             return (False, prior_num)
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
@@ -1638,6 +1656,7 @@ class ClaudeAccountSwitcher:
             prior = data.get("activeAccountNumber")
             prior_num = str(prior) if prior is not None else None
             if prior_num == str(account_num):
+                self._clear_identity_only_write()
                 return (False, prior_num)
             identity = self._get_current_account()
             if identity is None:
@@ -1652,6 +1671,7 @@ class ClaudeAccountSwitcher:
                 f"Adopted the real login into the record: activeAccountNumber "
                 f"{prior_num} -> {account_num} (moved outside cswap)"
             )
+            self._clear_identity_only_write()
             return (True, prior_num)
 
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
@@ -2266,6 +2286,92 @@ class ClaudeAccountSwitcher:
         """
         identity = self._get_current_account()
         return identity is not None and identity == (email, org_uuid or "")
+
+    def _identity_only_write(
+        self, identity_slot: str, recorded: str | None, live: str | None = None
+    ) -> dict | None:
+        """Detect an identity-only write into the live store (CON-2332).
+
+        ``~/.claude.json`` names ``identity_slot`` — but is the live token
+        pair that slot's? Its lineage (refresh-token fingerprint) is compared
+        with every OTHER managed slot's stored backup, the recorded active
+        slot first (the measured shape: 05-09 the record's own pair sat
+        under Account-23's identity). A match means something wrote one
+        identity without its pair; the caller must neither adopt the slot
+        nor seed its backup — the home-pin sensor's ``switch --even-if-live``
+        that follows would otherwise land the older generation of the pair's
+        owner and the family's next refresh dies (``invalid_grant``).
+
+        Returns ``{"identity", "owner", "recorded"}`` (slot strings) and
+        publishes it as :attr:`identity_only_write` for the engine's event;
+        ``None`` — and clears that state — when the live pair is empty,
+        unreadable, or no other slot owns it. ``live`` defaults to the live
+        store's current bytes. Warns ONCE per episode (same identity, owner
+        and lineage) and caches the verdict so the backup scan is not
+        repeated every tick. Never raises.
+        """
+        try:
+            if live is None:
+                live = self._read_credentials()
+        except Exception:
+            live = None
+        fp = oauth.credential_fingerprint(live) if live else None
+        if not live or not fp:
+            self._clear_identity_only_write()
+            return None
+        seen = self._identity_only_seen
+        if seen is not None and seen[0] == identity_slot and seen[2] == fp:
+            owner = seen[1]
+        else:
+            owner = self._lineage_owner(live, fp, exclude=identity_slot, first=recorded)
+            if owner is None:
+                self._clear_identity_only_write()
+                return None
+            self._identity_only_seen = (identity_slot, owner, fp)
+            self._logger.warning(
+                "identity-only write: live credential belongs to Account-%s, "
+                "identity says Account-%s — something wrote Account-%s's "
+                "identity into the live store without its token pair; "
+                "adoption and backup resync refused (record kept at "
+                "Account-%s, Account-%s's backup untouched).",
+                owner, identity_slot, identity_slot,
+                recorded if recorded is not None else "(none)", identity_slot,
+            )
+        state = {"identity": identity_slot, "owner": owner, "recorded": recorded}
+        self.identity_only_write = state
+        return state
+
+    def _clear_identity_only_write(self) -> None:
+        self.identity_only_write = None
+        self._identity_only_seen = None
+
+    def _lineage_owner(
+        self, live: str, fp: str, *, exclude: str, first: str | None
+    ) -> str | None:
+        """Slot (other than ``exclude``) whose stored backup carries the
+        live credential's lineage — bytes or refresh-token fingerprint —
+        or ``None``. ``first`` is checked before the rest. Unreadable
+        backups are skipped: a slot that cannot be read cannot own it."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        order = [
+            num for num in ([first] if first is not None else [])
+            if num in accounts and num != exclude
+        ]
+        order += [num for num in accounts if num != exclude and num not in order]
+        for num in order:
+            email = accounts[num].get("email", "")
+            if not email:
+                continue
+            try:
+                backup = self._read_account_credentials(num, email)
+            except Exception:
+                continue
+            if backup and (
+                backup == live or oauth.credential_fingerprint(backup) == fp
+            ):
+                return num
+        return None
 
     @staticmethod
     def _find_account_slot(
@@ -3912,6 +4018,19 @@ class ClaudeAccountSwitcher:
                 == oauth.credential_fingerprint(backup)
             ):
                 return  # same lineage — nothing drifted
+            # Lineage guard (CON-2332): the identity re-check below only
+            # proves the config names this slot. When the served pair is
+            # ANOTHER slot's stored lineage, the config write was
+            # identity-only and this "rotation" is that slot's family —
+            # seeding it here poisoned Account-23's backup with Account-32's
+            # pair on 05-09. Refuse before any lock is taken.
+            recorded = (self._get_sequence_data() or {}).get("activeAccountNumber")
+            if self._identity_only_write(
+                str(account_num),
+                str(recorded) if recorded is not None else None,
+                live=creds,
+            ) is not None:
+                return
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),

@@ -469,6 +469,45 @@ class SwitchEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class IdentityOnlyWriteEvent(AutoSwitchEvent):
+    """The live login's identity and its token pair belong to different
+    slots (CON-2332): ``~/.claude.json`` names ``identity`` while the live
+    credential's lineage is ``owner``'s stored backup. Something wrote an
+    identity into the live store without its pair. The engine refuses the
+    adoption (record stays at ``recorded``) and the switcher refuses to seed
+    ``identity``'s backup with ``owner``'s pair (05-09: that write poisoned
+    Account-23's backup with Account-32's family). Emitted once per episode
+    — the same identity/owner/lineage on later ticks stays silent until the
+    live store becomes consistent again.
+    """
+
+    kind: ClassVar[str] = "identity-only-write"
+    identity: dict  # account_ref shape: the slot the config names
+    owner: dict  # account_ref shape: the slot whose backup holds the live pair
+    recorded: dict | None  # account_ref shape, or None (no recorded active)
+
+    def _fields(self) -> dict:
+        return {
+            "identity": self.identity,
+            "owner": self.owner,
+            "recorded": self.recorded,
+        }
+
+    def human(self) -> str:
+        kept = (
+            f"Account-{self.recorded.get('number')}" if self.recorded else "(none)"
+        )
+        return (
+            "WARN: identity-only write: the live login says "
+            f"Account-{self.identity.get('number')} ({self.identity.get('email')}) "
+            "but the live credential belongs to "
+            f"Account-{self.owner.get('number')} ({self.owner.get('email')}) — "
+            f"record kept at {kept}, no backup touched; something wrote an "
+            "identity into the live store without its token pair"
+        )
+
+
+@dataclass(frozen=True)
 class AdoptRealLoginEvent(AutoSwitchEvent):
     """The record's active slot was reconciled with the real login (CON-1581).
 
@@ -1042,6 +1081,8 @@ class AutoSwitchEngine:
         switcher.set_poll_policy_inputs(settings.threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
+        # Last identity-only write reported (CON-2332): one event per episode.
+        self._identity_only_reported: dict | None = None
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         # Where the quiet gate looks for session transcripts; injectable for
@@ -1553,6 +1594,7 @@ class AutoSwitchEngine:
             # every real tick; dry-run must not write anything, same as the
             # quarantine release above.
             adopted, prior = self.switcher.adopt_active_account(current)
+            self._report_identity_only_write(adopted, prior, active_ref)
             if adopted:
                 prior_ref = (
                     _ref(prior, self.switcher.account_email(prior))
@@ -4222,6 +4264,33 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+
+    def _report_identity_only_write(
+        self, adopted: bool, prior: str | None, active_ref: dict
+    ) -> None:
+        """Say once per episode that the adoption was refused because the
+        live pair belongs to another slot (CON-2332); silent while the same
+        episode persists, reset once the live store is consistent again."""
+        state = None if adopted else self.switcher.identity_only_write
+        if state is None:
+            self._identity_only_reported = None
+            return
+        if state == self._identity_only_reported:
+            return
+        self._identity_only_reported = state
+        owner = str(state["owner"])
+        recorded = state.get("recorded")
+        self._emit(
+            IdentityOnlyWriteEvent(
+                identity=dict(active_ref),
+                owner=_ref(owner, self.switcher.account_email(owner)),
+                recorded=(
+                    _ref(recorded, self.switcher.account_email(recorded))
+                    if recorded is not None
+                    else None
+                ),
+            )
+        )
 
     # -- loop -------------------------------------------------------------------
 

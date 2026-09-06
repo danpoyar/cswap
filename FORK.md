@@ -475,6 +475,27 @@ read in one sitting.
   (profile layout, Keychain timeouts, the CON-1329 token hybrid); offer
   upstream after it survives the fleet.
 
+- Identity-only writes are never followed (CON-2332, 2026-09-06). The engine
+  judged "the real login" by `~/.claude.json`'s `oauthAccount` alone; when
+  something wrote ONE identity there while the Keychain kept another slot's
+  token pair (05-09, three times: identity 23 over Account-32's pair), it
+  adopted the record 32→23 and `_resync_rotated_backup` — identity re-check
+  green, full pair present — seeded Account-23's backup with Account-32's
+  family; the home-pin sensor's `switch --even-if-live` then landed the older
+  generation, the family's next refresh answered `invalid_grant` and Claude
+  Code wiped the live store (failover cascade all evening). Now the live
+  pair's lineage (refresh-token fingerprint) is compared with every OTHER
+  managed slot's stored backup — the recorded active slot first — before
+  either write: a match refuses the adoption (record kept) and the resync
+  (backup untouched), WARNs once per episode (`identity-only write: live
+  credential belongs to Account-A, identity says Account-B`) and the daemon
+  logs one `identity-only-write` event (`identity`, `owner`, `recorded`)
+  followed by the CON-2323 forensic snapshot. A consistent manual `/login`
+  (identity and pair of the same slot) is adopted exactly as before; an
+  empty live store still follows the identity. Tests:
+  `tests/test_identity_only_write.py`. The writer itself is CON-2323's hunt;
+  this closes the poisoning path.
+
 ## Syncing with upstream
 
 ```
