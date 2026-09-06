@@ -818,7 +818,7 @@ class TestSpilledAdoptionReconcile:
         to adopt the newest generation — that landing is now the profile's
         own.)"""
         s = _make_switcher(temp_home)
-        backup, profile, session_dir = _rotated_profile(s)
+        backup, _profile, session_dir = _rotated_profile(s)
         _spilled_adoption(s)
         profile_3 = _creds("at-profile-3", "rt-profile-3")
         (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
@@ -973,6 +973,40 @@ class TestSpilledAdoptionReconcile:
         assert report.outcome == BACKUP_CURRENT
         no_network.assert_not_called()
 
+    def test_unreadable_profile_keychain_lands_the_sidecar_as_before_and_says_so(
+        self, temp_home, mock_claude_config, no_network, caplog
+    ):
+        """An existing-but-unreadable keychain entry is not "no profile": the
+        plaintext under it may be the consumed seed, so the re-judge is
+        skipped (logged) and the sidecar lands exactly as before CON-2100 —
+        the hook's idle branch drops the profile's copy."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        spill = _spilled_adoption(s)
+        (session_dir / ".credentials.json").write_text(
+            _creds("at-profile-3", "rt-profile-3"), encoding="utf-8"
+        )
+
+        with (
+            patch(
+                "claude_swap.session.read_profile_generation",
+                return_value=(None, "keychain unavailable"),
+            ),
+            caplog.at_level("WARNING", logger="claude-swap"),
+        ):
+            _collect_pass(s, backup, pids=[])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
+        assert not spill.exists()
+        assert not (session_dir / ".credentials.json").exists()
+        assert s.list_unclaimed_credentials() == {}
+        assert any(
+            "could not be read while landing its spilled adoption" in r.getMessage()
+            and "keychain unavailable" in r.getMessage()
+            for r in caplog.records
+        ), "the skipped judgement must be said aloud"
+        no_network.assert_not_called()
+
     def test_profile_reseeded_from_the_predecessor_before_the_reconcile_still_lands_the_sidecar(
         self, temp_home, mock_claude_config, no_network
     ):
@@ -1028,7 +1062,7 @@ class TestSpilledAdoptionReconcile:
         `cswap run` would destroy that newest generation. Liveness is judged
         once, by the hook: the marker it left IS the proof."""
         s = _make_switcher(temp_home)
-        backup, profile, session_dir = _rotated_profile(s)
+        backup, _profile, session_dir = _rotated_profile(s)
         _spilled_adoption(s)
         profile_3 = _creds("at-profile-3", "rt-profile-3")
         (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")

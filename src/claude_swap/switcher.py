@@ -1906,8 +1906,9 @@ class ClaudeAccountSwitcher:
                 if ahead is not None:
                     landing = ahead
             self._write_account_credentials(account_num, email, landing)
+            stashed = False
             if landing is not spilled:
-                self._stash_superseded_spill(
+                stashed = self._stash_superseded_spill(
                     account_num, spilled, superseded_by="profile-generation"
                 )
             path.unlink(missing_ok=True)
@@ -1924,7 +1925,11 @@ class ClaudeAccountSwitcher:
                     f"Reconciled account {account_num}'s spilled adoption by "
                     "landing the session profile's newer generation in the "
                     "backup; the spilled generation is superseded and "
-                    "preserved as an unclaimed copy"
+                    + (
+                        "preserved as an unclaimed copy"
+                        if stashed
+                        else "dropped (the unclaimed stash refused it)"
+                    )
                 )
             return landing
         # The backup moved past the spill's predecessor (re-login / re-add).
@@ -1936,14 +1941,16 @@ class ClaudeAccountSwitcher:
 
     def _stash_superseded_spill(
         self, account_num: str, spilled: str, *, superseded_by: str
-    ) -> None:
+    ) -> bool:
         """Preserve a superseded spill's bytes as an unclaimed safety copy
         (never destroy a possibly-live refresh token); a failed stash is
         logged and the spill dropped — the landing is not held hostage to
         the diagnostics store. ``superseded_by`` names what outran the spill:
         ``"backup"`` (re-login / re-add moved the backup past the spill's
         predecessor) or ``"profile-generation"`` (the session profile rotated
-        past the spilled adoption, CON-2100)."""
+        past the spilled adoption, CON-2100). Returns whether the copy was
+        stashed, so the caller's landing line does not claim a copy that
+        was dropped (review r.1 of PR #44, nit)."""
         try:
             self._store._write_unclaimed_credential(spilled, {
                 "reason": "superseded-rotation-spill",
@@ -1951,11 +1958,13 @@ class ClaudeAccountSwitcher:
                 "configSlot": account_num,
                 "fingerprint": oauth.credential_fingerprint(spilled),
             })
+            return True
         except Exception:
             self._logger.warning(
                 "Superseded rotation spill for account %s could not "
                 "be stashed; dropping it", account_num,
             )
+            return False
 
     def _profile_generation_past_spill(
         self,
