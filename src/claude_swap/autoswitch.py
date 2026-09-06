@@ -68,6 +68,7 @@ from claude_swap.settings import (
     settings_path,
     with_overrides,
 )
+from claude_swap.adopt_snapshot import default_adopt_snapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -496,6 +497,61 @@ class AdoptRealLoginEvent(AutoSwitchEvent):
             f"is Account-{self.to_ref.get('number')} "
             f"({self.to_ref.get('email')}) — moved outside cswap (manual "
             "/login)"
+        )
+
+
+@dataclass(frozen=True)
+class AdoptSnapshotEvent(AutoSwitchEvent):
+    """Forensic snapshot taken right after an adoption (CON-2323).
+
+    An adoption without a ``/login`` means something wrote a foreign
+    identity into the live store, and by the next tick the writer may be
+    gone. The snapshot (``claude_swap.adopt_snapshot``) records the process
+    table of Claude Code binaries with their ``CLAUDE_CONFIG_DIR``, the
+    config file's mtime and identity, Keychain item dates and open handles
+    — never a secret. ``error`` names a collector that failed outright; the
+    adoption itself is never held up by it.
+    """
+
+    kind: ClassVar[str] = "adopt-real-login-snapshot"
+    prior: dict | None
+    to_ref: dict
+    snapshot: dict | None
+    error: str | None = None
+
+    def _fields(self) -> dict:
+        fields: dict = {
+            "from": self.prior,
+            "to": self.to_ref,
+            "snapshot": self.snapshot,
+        }
+        if self.error:
+            fields["error"] = self.error
+        return fields
+
+    def human(self) -> str:
+        if self.error:
+            return f"Adopt snapshot failed: {self.error}"
+        snap = self.snapshot or {}
+        procs = snap.get("processes") or {}
+        without = procs.get("withoutConfigDir") or []
+        on_profile = procs.get("onAdoptedProfile") or []
+        cfg = snap.get("configFile") or {}
+        live = snap.get("keychainLive") or {}
+        prof = snap.get("keychainProfile") or {}
+        openers = ", ".join(
+            f"{o.get('command')}({o.get('pid')})" for o in snap.get("openers") or []
+        )
+        errors = snap.get("errors") or []
+        return (
+            f"Adopt snapshot: {procs.get('claude', 0)} claude process(es), "
+            f"{len(without)} without CLAUDE_CONFIG_DIR"
+            f"{' (' + ', '.join(map(str, without)) + ')' if without else ''}, "
+            f"{len(on_profile)} on Account-{self.to_ref.get('number')}'s profile; "
+            f"config mtime {cfg.get('mtime')}; live Keychain mdat {live.get('mdat')}; "
+            f"profile Keychain mdat {prof.get('mdat')}; "
+            f"open handles: {openers or 'none'}"
+            f"{'; probe errors: ' + '; '.join(errors) if errors else ''}"
         )
 
 
@@ -1013,9 +1069,15 @@ class AutoSwitchEngine:
         claude_projects_dir: Path | None = None,
         overrides: dict[str, object] | None = None,
         park: ParkChannel | None = None,
+        adopt_snapshot: Callable[..., dict] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Forensic collector run right after an adoption (CON-2323);
+        # injectable so tests never touch ps/security/lsof.
+        self._adopt_snapshot = (
+            adopt_snapshot if adopt_snapshot is not None else default_adopt_snapshot
+        )
         # Live settings tracking. ``_settings_base`` is what the engine was
         # constructed with, ``_settings_file`` the file as it read at that
         # moment, and ``_settings_pins`` the values named explicitly (a CLI
@@ -1561,6 +1623,11 @@ class AutoSwitchEngine:
                 )
                 self._emit(
                     AdoptRealLoginEvent(prior=prior_ref, to_ref=dict(active_ref))
+                )
+                self._emit(
+                    self._adopt_snapshot_event(
+                        prior_ref, dict(active_ref), current, current_email
+                    )
                 )
 
         entries, usage, headroom = self._collect_scheduled_usage(
@@ -4219,6 +4286,34 @@ class AutoSwitchEngine:
         if earliest is None:
             return None
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
+
+    def _adopt_snapshot_event(
+        self,
+        prior_ref: dict | None,
+        to_ref: dict,
+        account_num: str,
+        email: str | None,
+    ) -> AdoptSnapshotEvent:
+        """Run the forensic collector for an adoption (CON-2323). A collector
+        that raises becomes an event with ``error`` — the tick goes on."""
+        try:
+            session_dir = (
+                self.switcher._session_dir(account_num, email) if email else None
+            )
+            snapshot = self._adopt_snapshot(
+                config_path=self.switcher._get_claude_config_path(),
+                session_dir=session_dir,
+                prior=prior_ref,
+                to_ref=to_ref,
+            )
+            return AdoptSnapshotEvent(prior=prior_ref, to_ref=to_ref, snapshot=snapshot)
+        except Exception as e:  # noqa: BLE001 — diagnostics never take the tick down
+            return AdoptSnapshotEvent(
+                prior=prior_ref,
+                to_ref=to_ref,
+                snapshot=None,
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)

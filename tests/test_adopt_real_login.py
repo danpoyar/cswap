@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from claude_swap.autoswitch import AdoptRealLoginEvent, TickOutcome
+from claude_swap.autoswitch import (
+    AdoptRealLoginEvent,
+    AdoptSnapshotEvent,
+    TickOutcome,
+)
 from tests.test_autoswitch import EngineHarness, _usage
 
 EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
@@ -96,3 +100,55 @@ class TestAdoptGuards:
         assert adopted is True
         assert prior == "2"
         assert h.active_number() == 3
+
+
+class TestAdoptSnapshot:
+    """CON-2323: the adoption moment is captured, and never breaks the tick."""
+
+    def test_snapshot_event_follows_the_adopt_event(self, temp_home):
+        calls: list[dict] = []
+
+        def fake_snapshot(**kwargs):
+            calls.append(kwargs)
+            return {"processes": {"claude": 2}, "errors": []}
+
+        h = _harness(temp_home, live=3, record=1)
+        h.engine = h._make_engine(adopt_snapshot=fake_snapshot)
+        outcome = h.tick_with_usage(HEALTHY)
+        assert outcome is TickOutcome.NO_ACTION
+        (adopt,) = _adopts(h)
+        snaps = [e for e in h.events if isinstance(e, AdoptSnapshotEvent)]
+        assert len(snaps) == 1
+        assert h.events.index(snaps[0]) == h.events.index(adopt) + 1
+        (call,) = calls
+        assert call["config_path"] == h.switcher._get_claude_config_path()
+        assert call["session_dir"] == h.switcher._session_dir("3", EMAILS[3])
+        payload = snaps[0].to_json()
+        assert payload["event"] == "adopt-real-login-snapshot"
+        assert payload["from"] == {"number": 1, "email": EMAILS[1]}
+        assert payload["to"] == {"number": 3, "email": EMAILS[3]}
+        assert payload["snapshot"] == {"processes": {"claude": 2}, "errors": []}
+        assert "error" not in payload
+        assert "2 claude" in snaps[0].human()
+
+    def test_collector_failure_never_breaks_the_tick(self, temp_home):
+        def broken(**kwargs):
+            raise RuntimeError("boom")
+
+        h = _harness(temp_home, live=3, record=1)
+        h.engine = h._make_engine(adopt_snapshot=broken)
+        outcome = h.tick_with_usage(HEALTHY)
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+        assert len(_adopts(h)) == 1
+        (snap,) = [e for e in h.events if isinstance(e, AdoptSnapshotEvent)]
+        payload = snap.to_json()
+        assert payload["snapshot"] is None
+        assert "boom" in payload["error"]
+        assert "boom" in snap.human()
+
+    def test_no_snapshot_without_adoption(self, temp_home):
+        h = _harness(temp_home, live=1, record=1)
+        h.engine = h._make_engine(adopt_snapshot=lambda **kw: {"never": True})
+        h.tick_with_usage(HEALTHY)
+        assert [e for e in h.events if isinstance(e, AdoptSnapshotEvent)] == []
