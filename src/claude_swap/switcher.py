@@ -3402,6 +3402,7 @@ class ClaudeAccountSwitcher:
         *,
         locked: bool = False,
         profile_read: tuple[str | None, str | None] | None = None,
+        profile_ahead: bool = False,
     ) -> bool:
         """Fold the session profile's login family back into backup before the
         profile is wiped or re-seeded with the inference token (CON-1329,
@@ -3429,6 +3430,14 @@ class ClaudeAccountSwitcher:
         adopt off the same read, or an intermittent Keychain timeout skips
         the adoption here and passes the guard there. Without it the profile
         is read best-effort (``read_session_credentials``).
+        ``profile_ahead`` — the heal's live verdict (CON-2345:
+        ``heal_backup_before_activation`` found, under a LIVE session, the
+        profile's generation fresh and the backup's expired): the seed guard
+        below ("the backup moved past the seed, so it is the newer family")
+        is a presumption from fingerprints, and live evidence outranks it.
+        Only the ``--even-if-live`` activation passes it; the bootstrap and
+        reseed callers keep the guard — an idle profile's old family must
+        never overwrite a re-login.
         Returns True when a generation was adopted INTO THE BACKUP; False when
         there was nothing to adopt or the pair spilled (backup unchanged).
         """
@@ -3458,9 +3467,10 @@ class ClaudeAccountSwitcher:
         if fp_profile == fp_backup:
             return False
         seed = read_seed_fingerprint(session_dir)
-        if backup and seed and seed != fp_backup:
+        if backup and seed and seed != fp_backup and not profile_ahead:
             # Backup moved past the profile's seed (re-added since): it is
             # the newer family; the profile's generation is the stale one.
+            # Unless the heal saw it alive and the backup dead (CON-2345).
             return False
         if locked:
             self.write_account_credentials(account_num, email, profile)
@@ -6141,8 +6151,17 @@ class ClaudeAccountSwitcher:
                 # fleet seat (critic C2 of that ADR). Adopt the profile's
                 # newer generation into the backup — no POST, the seed stamp
                 # re-stamped, the live profile untouched — and land THAT
-                # generation, never the consumed one.
-                adopted = self.adopt_profile_family(account_num, email, org_uuid)
+                # generation, never the consumed one. ``profile_ahead``
+                # (CON-2345): the heal saw the session's generation fresh over
+                # an EXPIRED backup while the ordering oracles (stale marker,
+                # seed stamp) called the backup newer — live evidence lifts
+                # the adoption's seed guard; the marker goes with the
+                # re-stamp. Live 2026-09-06: the guard's return home landed
+                # the consumed backup three times before this.
+                adopted = self.adopt_profile_family(
+                    account_num, email, org_uuid,
+                    profile_ahead=report.profile_ahead,
+                )
                 if adopted:
                     # Belt and braces: land only what the backup now holds
                     # equals the profile — an adoption that did not reach
@@ -6174,6 +6193,27 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
                     return
+            if report.profile_ahead and not even_if_live:
+                # CON-2345 (review r.1 nit): the stored copy here is EXPIRED
+                # while the session's is fresh — say so, and name the
+                # override that lands the session's generation, as the
+                # CON-2030 refusal does; the generic text below would call
+                # a possibly valid re-login "a dead login".
+                raise LiveSessionRefusal(
+                    f"Account-{account_num} ({email}) has a live session-mode "
+                    f"Claude instance (PID {report.detail}) whose login "
+                    "generation is fresh while the stored backup's has "
+                    "expired — activating the stored copy would land an "
+                    "expired login. For a terminal on this slot run: cswap "
+                    f"run {account_num}; to bring the default login here "
+                    f"onto the session's generation run: cswap switch "
+                    f"{account_num} --even-if-live (the login and the "
+                    "session then share one generation until the next "
+                    "rotation).",
+                    account_num=account_num,
+                    email=email,
+                    pids=pids,
+                )
             # Typed (CON-1595): the TUI offers `cswap run N` and execs it, the
             # menu bar shows it with a copy button — instead of a failed action.
             raise LiveSessionRefusal(

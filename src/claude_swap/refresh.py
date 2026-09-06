@@ -97,6 +97,12 @@ class RefreshReport:
     # Whether the post-refresh live usage read succeeded (the "last seen"
     # proof). Only meaningful for ``REFRESHED``.
     usage_read: bool = False
+    # ``LIVE_SESSION`` only (CON-2345): the ordering oracles called the backup
+    # the newer generation, but the LIVE session's copy is fresh while the
+    # backup's is expired — live evidence the oracles cannot outrank. The
+    # ``--even-if-live`` activation adopts the session's generation past the
+    # seed guard on this verdict; every other caller refuses/skips as usual.
+    profile_ahead: bool = False
 
 
 def _read_profile_credentials(
@@ -151,6 +157,52 @@ def _backup_is_newer(session_dir: Path, backup: str) -> str | None:
     if seed and backup and seed != credential_fingerprint(backup):
         return "backup rewritten after the profile was seeded — the backup is newer"
     return None
+
+
+def _live_generation_outranks(profile_oauth: dict, backup: str | None) -> bool:
+    """Live evidence that a LIVE session's generation, not the backup, is the
+    slot's usable login (CON-2345): the profile's access token is fresh while
+    the backup's has EXPIRED — both expiries known.
+
+    The ordering oracles (``_backup_is_newer``) are presumptions from
+    fingerprints: the stale marker says "the backup was rewritten under a
+    live session", the seed stamp says "the backup moved after seeding" —
+    neither says the backup is still ALIVE. Live 2026-09-06: the daemon's
+    failover backed the home slot up from the global store (a generation the
+    orchestrator's profile session had already rotated past — the marker was
+    set), and the fleet guard's ``switch 32 --even-if-live`` landed that
+    consumed backup three times in a row while the session kept a fresh
+    generation. A fresh token under a session that keeps rotating is proof
+    of life; a backup nobody refreshed since it expired is not. Anything
+    weaker (both fresh, both expired, an unknown expiry) is NOT evidence —
+    the oracles keep their verdict.
+
+    Known price (review r.1 of PR #43): "expired" is not "consumed". An
+    INDEPENDENT login parked in the backup under a live session (a re-login
+    in the global store, backed up by the daemon on its way out) is
+    refreshed by nobody — the daemon skips a slot with a live session, the
+    parked refresh is refused — so after one access-token lifetime it reads
+    "expired" too, and the ``--even-if-live`` return home adopts the
+    session's family over it: no dead landing, but the login and the
+    session then share one family (two stores, one dies at the next
+    rotation — the price ADR 0020 of the config repo already accepts for
+    the home slot). Telling the two apart would take POSTing the backup's
+    grant, which this code base never does under a live session (a consumed
+    grant re-presented is the account-death shape). The shape disappears
+    once the orchestrator runs on the global login instead of a profile.
+    """
+    profile_expires = profile_oauth.get("expiresAt")
+    if not isinstance(profile_expires, (int, float)) or is_oauth_token_expired(
+        profile_expires
+    ):
+        return False
+    backup_oauth = extract_oauth_data(backup) if backup else None
+    if not backup_oauth or not backup_oauth.get("accessToken"):
+        return False
+    backup_expires = backup_oauth.get("expiresAt")
+    return isinstance(backup_expires, (int, float)) and is_oauth_token_expired(
+        backup_expires
+    )
 
 
 def refresh_account(
@@ -421,7 +473,12 @@ def heal_backup_before_activation(
       stamp that no longer matches the backup means the backup moved after
       the profile was seeded. Either way the backup wins, and the superseded
       profile copy is dropped when no session is live (what
-      ``setup_session`` would do on the next ``cswap run`` anyway).
+      ``setup_session`` would do on the next ``cswap run`` anyway). Under a
+      LIVE session the oracles are outranked by live evidence (CON-2345,
+      ``_live_generation_outranks``): a fresh profile generation over an
+      EXPIRED backup is reported as ``LIVE_SESSION`` with ``profile_ahead``
+      instead — the ``--even-if-live`` activation adopts it, everything
+      else refuses or skips, and nothing lands the dead backup.
     - ``RESYNCED`` — the profile's generation is fresh: adopted into the
       backup as-is (no POST, no grant consumed). The write invalidates the
       idle profile's credential material, so the family ends up with ONE
@@ -462,25 +519,51 @@ def heal_backup_before_activation(
     if backup and credential_fingerprint(backup) == profile_fp:
         return out(BACKUP_CURRENT)
     pids = switcher._live_session_pids(account_num, email)
+    profile_oauth = extract_oauth_data(profile_creds)
+    full_pair = bool(
+        profile_oauth
+        and profile_oauth.get("accessToken")
+        and profile_oauth.get("refreshToken")
+    )
 
     # Who ran ahead? Inequality alone cannot tell (review r.1, CON-1579) —
     # the two ordering oracles decide (``_backup_is_newer``); the superseded
     # profile copy is dropped when no session is live (what ``setup_session``
     # would do on the next ``cswap run`` anyway).
     newer = _backup_is_newer(session_dir, backup)
+    profile_ahead = False
     if newer is not None:
-        if not pids:
-            switcher._invalidate_session_credentials(account_num, email)
-        return out(BACKUP_CURRENT, newer)
+        if (
+            pids
+            and full_pair
+            # A profile still AT its seed generation never rotated: its
+            # session proved nothing, and a backup written after the seeding
+            # is the newer login by construction (re-add/re-login) — the
+            # evidence below is reserved for a session that ran ahead.
+            and profile_fp != read_seed_fingerprint(session_dir)
+            and _live_generation_outranks(profile_oauth, backup)
+        ):
+            # CON-2345: the oracles are presumptions; a live session with a
+            # FRESH generation over an EXPIRED backup is evidence. Reported
+            # as the live session below (refusal, skip — or the explicit
+            # ``--even-if-live`` adoption), never as "backup current".
+            profile_ahead = True
+        else:
+            if not pids:
+                switcher._invalidate_session_credentials(account_num, email)
+            return out(BACKUP_CURRENT, newer)
 
-    profile_oauth = extract_oauth_data(profile_creds)
-    if not profile_oauth or not (
-        profile_oauth.get("accessToken") and profile_oauth.get("refreshToken")
-    ):
+    if not full_pair:
         # Not a full OAuth pair: nothing safer than the backup to offer.
         return out(BACKUP_CURRENT, "profile credential is not a full token pair")
     if pids:
-        return out(LIVE_SESSION, ", ".join(str(p) for p in pids))
+        return RefreshReport(
+            account_num,
+            email,
+            LIVE_SESSION,
+            ", ".join(str(p) for p in pids),
+            profile_ahead=profile_ahead,
+        )
 
     if is_oauth_token_expired(profile_oauth.get("expiresAt")):
         report = _refresh_resolved(switcher, account_num, email, org_uuid)
