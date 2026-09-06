@@ -420,6 +420,122 @@ class TestHomePinHolds:
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
 
+class TestHomeUnknownEndToEnd:
+    """The ticket's acceptance through the REAL collector (review r1: the
+    engine and the collector were proven apart; the seam between them is
+    where the hole was). Home active; the usage-store row is quarantined on
+    an older generation with the strike's backoff still live; the live store
+    holds a newer generation of the family."""
+
+    def _harness(self, temp_home, monkeypatch):
+        from claude_swap.usage_store import FetchRecord
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = _harness(temp_home, live=1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        old_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-old", "refreshToken": "rt-old",
+        }})
+        from claude_swap import oauth
+        identity = {"1": (HOME, "")}
+        # The strike that condemned the OLD generation, seconds ago: its
+        # failure backoff is live (the shape the sensor's return leaves).
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                credential_fingerprint=oauth.credential_fingerprint(old_gen),
+            )},
+            identity,
+        )
+        entry = h.switcher._usage_store.entries(identity)["1"]
+        assert entry.token_dead() and entry.in_backoff(h.clock.now)
+        return h
+
+    @staticmethod
+    def _candidates_ok(num, email, creds, is_active=False, persist_credentials=None):
+        from claude_swap import oauth
+        return oauth.UsageOutcome(_usage(40 if is_active else 10))
+
+    def test_new_generation_is_probed_in_the_same_tick_and_the_pin_holds(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ) as fetch:
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert [c.args[0] for c in fetch.call_args_list].count("1") >= 1
+        assert not _switches(h)
+        assert _reasons(h) == ["home-pinned"]
+        assert not h.switcher._usage_store.entries({"1": (HOME, "")})["1"].token_dead()
+
+    def test_deferred_probe_holds_the_pin_through_three_ticks(
+        self, temp_home, monkeypatch
+    ):
+        # Form (2) of the ticket: the active-token refresh is deferred under
+        # the family's other copy's locks, pass after pass.
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(sentinel=USAGE_TOKEN_EXPIRED),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ):
+            for _ in range(4):
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(30.0)
+        assert not _switches(h)
+        assert h.active_number() == 1
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_transient_probe_holds_the_pin_through_three_ticks(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(error="refresh-failed"),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ):
+            for _ in range(4):
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(30.0)
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_dead_new_generation_still_fails_over(self, temp_home, monkeypatch):
+        # The probe ran and the server condemned the new generation too:
+        # a verdict — three such ticks escape exactly as before.
+        from claude_swap import oauth
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        live = (h.temp_home / ".claude" / ".credentials.json").read_text()
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(
+                error="invalid_grant",
+                credential_fingerprint=oauth.credential_fingerprint(live),
+            ),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ), patch.object(h.engine, "_session_quiet", return_value=(True, "")):
+            outcomes = []
+            for _ in range(3):
+                outcomes.append(h.engine.tick())
+                h.clock.advance(30.0)
+        assert outcomes[:2] == [TickOutcome.NO_ACTION, TickOutcome.NO_ACTION]
+        assert outcomes[2] is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+
+
 class TestReturnHome:
     def test_returns_as_soon_as_home_reads(self, temp_home):
         # Away from home (the failover landing), home's usage reads again:

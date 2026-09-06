@@ -660,12 +660,14 @@ class UsageStore:
           due plans and stale impossible plans win, but valid future plans do
           not.
 
-        ``parole`` names quarantined slots granted a probe: only the
-        dead-strikes gate is skipped for them — the failure backoff still
-        paces retries, and the row itself stays untouched (only the probe's
-        outcome may move it; rationale at the collector,
-        ``_collect_usage_entries``). Claim fencing still applies: two
-        collectors can never double-probe.
+        ``parole`` names quarantined slots granted a probe: the dead-strikes
+        gate is skipped for them, and so is the backoff the strike itself
+        wrote (it paces the condemned generation, not the never-tried one —
+        CON-2340, see ``_row_eligible``); a backoff from the probe's own
+        transient failure still paces retries, and the row itself stays
+        untouched (only the probe's outcome may move it; rationale at the
+        collector, ``_collect_usage_entries``). Claim fencing still applies:
+        two collectors can never double-probe.
         """
         nums = list(nums)
         if not nums:

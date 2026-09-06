@@ -3949,6 +3949,73 @@ class TestDeadTokenQuarantine:
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
         assert entries["2"].parole_pending is False
 
+    def _fresh_info(self):
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-new", "refreshToken": "rt-new",
+            "expiresAt": 32503680000000,
+        }})
+        return [(2, "test@example.com", "Org", "", False, fresh, "")]
+
+    def _make_dead_old_gen(self, switcher):
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
+        )
+        self._expire_backoff(switcher)
+
+    def test_deferred_parole_probe_reads_as_pending(self, temp_home):
+        # Review r1 (CON-2340): the probe WON the claim but the locked
+        # refresh deferred (credential locks held elsewhere — the profile
+        # session of the same family) → a sentinel, no verdict. The row stays
+        # quarantined on the OLD lineage and reads "re-login needed", but the
+        # new generation is still untried: pending, not dead.
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead_old_gen(switcher)
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)},
+        ) as run:
+            entries = switcher._collect_usage_entries(self._fresh_info())
+        run.assert_called_once()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].parole_pending is True
+
+    def test_transient_parole_probe_reads_as_pending(self, temp_home):
+        # Same with a transient POST failure: no verdict, the generation is
+        # still untried (its own backoff now paces the next try).
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead_old_gen(switcher)
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(error="refresh-failed")},
+        ):
+            entries = switcher._collect_usage_entries(self._fresh_info())
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].parole_pending is True
+
+    def test_dead_parole_probe_is_a_verdict(self, temp_home):
+        # invalid_grant on the new generation re-stamps the lineage: that IS
+        # the verdict — nothing pending, the engine may count it.
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead_old_gen(switcher)
+        fp_new = oauth.credential_fingerprint(self._fresh_info()[0][5])
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(
+                error="invalid_grant", credential_fingerprint=fp_new,
+            )},
+        ):
+            entries = switcher._collect_usage_entries(self._fresh_info())
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].parole_pending is False
+        assert entries["2"].dead_token_fingerprint == fp_new
+
     def test_transient_parole_probe_is_backoff_paced(self, temp_home):
         # CR2-F1 (round 2): a parole probe that dies TRANSIENTLY (network)
         # moves neither strikes nor stamp — the slot stays parole-eligible.
