@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2332",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "609b91d9c8c358aef80cc677d8d0ddc623adfa2c",
+  "summary": "раунд 2 (дифф фикса 7602833..HEAD): открытых Important нет; major р.1 «размер: нужна виза Yor» снят правилом памяти решений harness.review (Yor 06-09 03:05) и словом Yor в CON-2332 03:11 (+0200) → Dismissed; minor 2 (граница по времени — полная ротация внутри эпизода снимала страж) закрыт липким эпизодом с профильным оракулом раз на родословную (TestEpisodeAcrossRotation, 4 кейса); minor 3 (ложный отказ при дубле своей семьи в чужом бэкапе) закрыт сверкой своего бэкапа первой (TestAdoptOwnLineage); ниты названы в FORK.md и теле PR; спот-чек 27 passed (17 identity_only + 10 adopt_real_login) сходится с автором; альтернативы: judged",
+  "findings": []
+}
