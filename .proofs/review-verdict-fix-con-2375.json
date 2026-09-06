@@ -1,0 +1,28 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2375",
+  "verdict": "approve",
+  "round": 1,
+  "head_sha": "3c0fa177181a07a9a73ea62bfe5bb96e94afdc0c",
+  "summary": "фактических нет, 3 нита; красный→зелёный воспроизведён живьём (4 failed на коде origin/main через -o pythonpath, 103+286 passed на ветке); все 5 вызывающих reconcile обрабатывают None до ветки «нет кредов»; альтернативы: judged — принято с нитом (except-ветка _profile_generation_past_spill как неназванная развилка)",
+  "findings": [
+    {
+      "severity": "nit",
+      "message": "Размер диффа 436 строк (+392/−44 без .proofs) — над порогом нарезки 200, ниже p90 500 (review-verdict-check.sh --size)",
+      "file": "src/claude_swap/switcher.py",
+      "line": 1
+    },
+    {
+      "severity": "nit",
+      "message": "Хелпер _keychain_busy_at_the_landing скопирован дословно в три файла тестов (test_refresh.py, test_reseed.py, test_bootstrap_family_guard.py) при живом tests/conftest.py — один хозяин в conftest",
+      "file": "tests/test_refresh.py",
+      "line": 553
+    },
+    {
+      "severity": "nit",
+      "message": "Развилка не названа в «Альтернативах»: except-ветка _profile_generation_past_spill возвращает (None, None) → «landing the spilled generation as-is» — упавший суд (не нечитаемый Keychain) по-прежнему сажает сайдкар вслепую тем же классом потери; предсуществующее, вне объёма тикета — кандидат в тикет",
+      "file": "src/claude_swap/switcher.py",
+      "line": 2100
+    }
+  ]
+}

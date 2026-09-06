@@ -20,6 +20,7 @@ import pytest
 
 from claude_swap import oauth
 from claude_swap.exceptions import SwitchError
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.models import Platform
 from claude_swap.oauth import RefreshOutcome
 from claude_swap.session import SEED_FINGERPRINT_FILE, STALE_MARKER
@@ -741,7 +742,7 @@ def _collect_pass(s: ClaudeAccountSwitcher, backup: str, pids: list[int]):
             return_value=oauth.UsageOutcome({"five_hour": {"pct": 9}}),
         ),
     ):
-        s._fetch_account_usage(
+        return s._fetch_account_usage(
             (int(TARGET_NUM), TARGET_EMAIL, "Org", "", False, backup, "")
         )
 
@@ -973,19 +974,26 @@ class TestSpilledAdoptionReconcile:
         assert report.outcome == BACKUP_CURRENT
         no_network.assert_not_called()
 
-    def test_unreadable_profile_keychain_lands_the_sidecar_as_before_and_says_so(
+    def test_unreadable_profile_keychain_defers_the_landing_and_keeps_every_copy(
         self, temp_home, mock_claude_config, no_network, caplog
     ):
-        """An existing-but-unreadable keychain entry is not "no profile": the
-        plaintext under it may be the consumed seed, so the re-judge is
-        skipped (logged) and the sidecar lands exactly as before CON-2100 —
-        the hook's idle branch drops the profile's copy."""
+        """CON-2375 (review of PR #45): an existing-but-unreadable keychain
+        entry is not "no profile" — the profile may hold the family's newest
+        generation and the sidecar its consumed predecessor. Landing the
+        sidecar anyway (the pin CON-2100 left) ran the write hook's idle
+        branch, which dropped the profile's copy — the only copy of the
+        newest generation — and left the backup with the consumed one: the
+        next `cswap run` bootstrapped a dead login. The landing is DEFERRED
+        instead: the sidecar stays for the next pass, the profile's copy and
+        the backup are untouched, nothing is stashed, the collector fetches
+        nothing with the consumed backup and says why. The next pass with a
+        readable profile lands the profile's generation (the CON-2100 rule)."""
         s = _make_switcher(temp_home)
         backup, profile, session_dir = _rotated_profile(s)
         spill = _spilled_adoption(s)
-        (session_dir / ".credentials.json").write_text(
-            _creds("at-profile-3", "rt-profile-3"), encoding="utf-8"
-        )
+        sidecar = spill.read_text(encoding="utf-8")
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
 
         with (
             patch(
@@ -994,17 +1002,41 @@ class TestSpilledAdoptionReconcile:
             ),
             caplog.at_level("WARNING", logger="claude-swap"),
         ):
-            _collect_pass(s, backup, pids=[])
+            record = _collect_pass(s, backup, pids=[])
 
-        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile
-        assert not spill.exists()
-        assert not (session_dir / ".credentials.json").exists()
+        assert record.sentinel == USAGE_TOKEN_EXPIRED, (
+            "the backup is the sidecar's consumed predecessor — nothing may "
+            "be fetched with it while the landing is deferred"
+        )
+        assert spill.read_text(encoding="utf-8") == sidecar, (
+            "the sidecar must stay for the next pass"
+        )
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == profile_3, "the profile's copy — the family's newest — must survive"
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == backup
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(backup)
         assert s.list_unclaimed_credentials() == {}
         assert any(
             "could not be read while landing its spilled adoption" in r.getMessage()
             and "keychain unavailable" in r.getMessage()
+            and "deferr" in r.getMessage()
             for r in caplog.records
-        ), "the skipped judgement must be said aloud"
+        ), "the deferred landing must be said aloud"
+        no_network.assert_not_called()
+
+        # The next pass reads the profile: its generation lands, the sidecar
+        # is superseded into the unclaimed store (CON-2100).
+        _collect_pass(s, backup, pids=[])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile_3
+        assert not spill.exists()
+        assert not (session_dir / ".credentials.json").exists(), "one family, one copy"
+        assert [
+            e["fingerprint"] for e in s.list_unclaimed_credentials().values()
+        ] == [oauth.credential_fingerprint(profile)]
         no_network.assert_not_called()
 
     def test_profile_reseeded_from_the_predecessor_before_the_reconcile_still_lands_the_sidecar(

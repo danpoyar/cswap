@@ -311,6 +311,15 @@ def _refresh_resolved(
                 backup = switcher.reconcile_pending_rotation_locked(
                     account_num, email, backup
                 )
+                if backup is None:
+                    # CON-2375: a spilled adoption whose profile could not be
+                    # read by the landing (the read above saw no credential;
+                    # the Keychain went busy since) — deferred, sidecar kept.
+                    # Judged before NO_CREDENTIALS: the family is alive.
+                    return out(
+                        DEFERRED,
+                        "the spilled adoption's profile cannot be read right now",
+                    )
                 if not backup:
                     return out(NO_CREDENTIALS)
                 seed = read_seed_fingerprint(session_dir)

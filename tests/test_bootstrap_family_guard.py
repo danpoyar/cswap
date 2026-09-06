@@ -719,3 +719,77 @@ class TestPendingProfileSpillOverUnreadableProfile:
             oauth.credential_fingerprint(SPILLED_GEN)
         ]
         assert not _entry(switcher).token_dead()
+
+
+def _keychain_busy_at_the_landing(switcher):
+    """The profile reads fine for the caller's own read, and the Keychain
+    goes busy exactly at the landing's re-judge (CON-2100) inside
+    ``reconcile_pending_rotation_locked`` — the two-read race the locked
+    callers guard against (CON-2375). A context manager."""
+    from contextlib import contextmanager
+
+    from claude_swap import session as _session_mod
+
+    real_reconcile = switcher.reconcile_pending_rotation_locked
+    real_read = _session_mod.read_profile_generation
+    landing = {"on": False}
+
+    def reconcile(*args, **kwargs):
+        landing["on"] = True
+        try:
+            return real_reconcile(*args, **kwargs)
+        finally:
+            landing["on"] = False
+
+    def read(session_dir):
+        if landing["on"]:
+            return None, "keychain unavailable"
+        return real_read(session_dir)
+
+    @contextmanager
+    def gate():
+        with (
+            patch.object(switcher, "reconcile_pending_rotation_locked", reconcile),
+            patch.object(_session_mod, "read_profile_generation", read),
+        ):
+            yield
+
+    return gate()
+
+
+class TestKeychainBusyAtTheLanding:
+    """CON-2375: ``reconcile_pending_rotation_locked`` defers (``None``) when
+    the spilled ADOPTION's profile cannot be read at the landing. The
+    bootstrap's own read succeeded a moment earlier (CON-2355's guard did
+    not fire), so the deferral must be read as the same undecidable shape —
+    a transient refusal — and never as "no stored credentials", which would
+    send the operator to re-add a slot whose family is alive."""
+
+    def test_bootstrap_refuses_transiently_and_lands_nothing(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        # The profile holds the sidecar's predecessor (re-seeded from the
+        # old backup): readable, not ahead — the landing goes to re-judge it.
+        block_real_keychain.set_password(
+            keychain_service_name(rotated_profile),
+            macos_keychain.keychain_account_name(),
+            BACKUP,
+        )
+        spill = _pending_profile_spill(switcher)
+        sidecar = spill.read_text(encoding="utf-8")
+
+        with _keychain_busy_at_the_landing(switcher), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []  # nothing consumed
+        assert spill.read_text(encoding="utf-8") == sidecar  # sidecar untouched
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == BACKUP
+        assert _profile_entry(block_real_keychain, rotated_profile) == BACKUP
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert switcher.list_unclaimed_credentials() == {}
+        assert not _entry(switcher).token_dead()

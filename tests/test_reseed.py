@@ -754,3 +754,85 @@ class TestReseedCli:
             cli.main()
 
         assert "reseed <num|email>" in capsys.readouterr().out
+
+
+def _keychain_busy_at_the_landing(switcher):
+    """The profile reads fine for the caller's own read, and the Keychain
+    goes busy exactly at the landing's re-judge (CON-2100) inside
+    ``reconcile_pending_rotation_locked`` — the two-read race the locked
+    callers guard against (CON-2375). A context manager."""
+    from contextlib import contextmanager
+
+    from claude_swap import session as _session_mod
+
+    real_reconcile = switcher.reconcile_pending_rotation_locked
+    real_read = _session_mod.read_profile_generation
+    landing = {"on": False}
+
+    def reconcile(*args, **kwargs):
+        landing["on"] = True
+        try:
+            return real_reconcile(*args, **kwargs)
+        finally:
+            landing["on"] = False
+
+    def read(session_dir):
+        if landing["on"]:
+            return None, "keychain unavailable"
+        return real_read(session_dir)
+
+    @contextmanager
+    def gate():
+        with (
+            patch.object(switcher, "reconcile_pending_rotation_locked", reconcile),
+            patch.object(_session_mod, "read_profile_generation", read),
+        ):
+            yield
+
+    return gate()
+
+
+class TestSpilledAdoptionOverUnreadableProfile:
+    """CON-2375: ``reconcile_pending_rotation_locked`` defers (``None``) when
+    a spilled ADOPTION's profile cannot be read at the landing. The door read
+    the profile fine a moment earlier (it holds the sidecar's predecessor —
+    re-seeded from the old backup), so it reached the reconcile; it must
+    refuse DEFERRED with the sidecar, the backup and the profile untouched."""
+
+    def test_reseed_defers_when_the_landing_cannot_read_the_profile(
+        self, temp_home, post, live
+    ):
+        from claude_swap.reseed import DEFERRED, ReseedRefusal, reseed_account
+        from claude_swap.switcher import SPILL_ORIGIN_PROFILE
+
+        s = _make_switcher()
+        backup = _creds("at-backup", "rt-backup")
+        s.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = _profile(s, backup, seed_of=backup)
+        spill = s._pending_rotation_path(NUM)
+        spill.parent.mkdir(parents=True, exist_ok=True)
+        spill.write_text(
+            json.dumps(
+                {
+                    "credentials": _creds("at-spilled", "rt-spilled"),
+                    "predecessorFingerprint": oauth.credential_fingerprint(backup),
+                    "email": EMAIL,
+                    "createdAt": "2026-09-06T08:00:00Z",
+                    "origin": SPILL_ORIGIN_PROFILE,
+                }
+            ),
+            encoding="utf-8",
+        )
+        sidecar = spill.read_text(encoding="utf-8")
+
+        with _keychain_busy_at_the_landing(s), pytest.raises(ReseedRefusal) as exc:
+            reseed_account(s, NUM)
+
+        assert exc.value.outcome == DEFERRED
+        assert "deferred" in str(exc.value)
+        post.assert_not_called()
+        assert spill.read_text(encoding="utf-8") == sidecar  # sidecar untouched
+        assert s.read_account_credentials(NUM, EMAIL) == backup
+        assert _plaintext(session_dir) == backup
+        assert _stamp(session_dir) == oauth.credential_fingerprint(backup)
+        assert s.list_unclaimed_credentials() == {}
