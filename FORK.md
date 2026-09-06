@@ -29,6 +29,15 @@ read in one sitting.
   purpose: `move` is outside the fleet law this fork is maintained for, and
   the fix belongs upstream where the ordering was designed.
 
+- Forensic snapshot at `adopt-real-login` (`adopt_snapshot.py`, event
+  `adopt-real-login-snapshot`): an adoption without a `/login` means something
+  wrote a foreign identity into the live store, and on 2026-09-05 that happened
+  three times in 28 minutes with every trace gone by the next minute (CON-2323).
+  The daemon now records, in the same tick, every Claude Code process with its
+  `CLAUDE_CONFIG_DIR`/`HOME`, the config file's mtime and identity, the Keychain
+  items' mdat and `lsof` holders of `~/.claude.json` — attributes only, never a
+  secret; a failed probe is a line in `errors`, never a failed tick. Fleet-only
+  diagnostics; not sent upstream.
 - Quiet gate on voluntary switches (`autoswitch.py`): proactive/consume-first
   switches are held until no `~/.claude/projects/**/*.jsonl` transcript has
   been written for 5 minutes (`QUIET_WINDOW_S`), because prompt caches are
