@@ -1039,6 +1039,76 @@ class TestSpilledAdoptionReconcile:
         ] == [oauth.credential_fingerprint(profile)]
         no_network.assert_not_called()
 
+    def test_a_failed_profile_judgement_defers_the_landing_and_keeps_every_copy(
+        self, temp_home, mock_claude_config, no_network, caplog
+    ):
+        """CON-2420 (review of PR #47): the re-judge of the profile may fail
+        for a reason other than the Keychain — an exception in the identity
+        or drift check, the seed stamp, a broken ``.claude.json``. Who holds
+        the family's newest generation is then just as undecidable as over
+        an unreadable Keychain entry, yet the except branch landed the
+        sidecar as-is: the write hook's idle branch dropped the profile's
+        copy — the only copy of the newest generation — and left the backup
+        with the consumed one, a dead login on the next `cswap run`. A
+        failed judgement DEFERS exactly like the unreadable Keychain
+        (CON-2375): sidecar, profile copy, backup and seed stamp untouched,
+        nothing stashed, nothing fetched, the deferral and its cause said
+        aloud. The next pass with a working judge lands the profile's
+        generation (the CON-2100 rule)."""
+        s = _make_switcher(temp_home)
+        backup, profile, session_dir = _rotated_profile(s)
+        spill = _spilled_adoption(s)
+        sidecar = spill.read_text(encoding="utf-8")
+        profile_3 = _creds("at-profile-3", "rt-profile-3")
+        (session_dir / ".credentials.json").write_text(profile_3, encoding="utf-8")
+
+        with (
+            patch(
+                "claude_swap.session.session_identity_drifted",
+                side_effect=RuntimeError("identity judge exploded"),
+            ),
+            caplog.at_level("WARNING", logger="claude-swap"),
+        ):
+            record = _collect_pass(s, backup, pids=[])
+
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == profile_3, (
+            "the profile's copy — the family's newest generation — was "
+            "destroyed: the failed judgement landed the sidecar blind"
+        )
+        assert spill.read_text(encoding="utf-8") == sidecar, (
+            "the sidecar must stay for the next pass"
+        )
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == backup
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(backup)
+        assert s.list_unclaimed_credentials() == {}
+        assert record.sentinel == USAGE_TOKEN_EXPIRED, (
+            "the backup is the sidecar's consumed predecessor — nothing may "
+            "be fetched with it while the landing is deferred"
+        )
+        assert any(
+            "while landing its spilled adoption" in r.getMessage()
+            and "identity judge exploded" in r.getMessage()
+            and "deferr" in r.getMessage()
+            for r in caplog.records
+        ), "the deferred landing and its cause must be said aloud"
+        no_network.assert_not_called()
+
+        # The next pass judges the profile: its generation lands, the sidecar
+        # is superseded into the unclaimed store (CON-2100).
+        _collect_pass(s, backup, pids=[])
+
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == profile_3
+        assert not spill.exists()
+        assert not (session_dir / ".credentials.json").exists(), "one family, one copy"
+        assert [
+            e["fingerprint"] for e in s.list_unclaimed_credentials().values()
+        ] == [oauth.credential_fingerprint(profile)]
+        no_network.assert_not_called()
+
     def test_profile_reseeded_from_the_predecessor_before_the_reconcile_still_lands_the_sidecar(
         self, temp_home, mock_claude_config, no_network
     ):

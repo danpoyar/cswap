@@ -373,6 +373,24 @@ read in one sitting.
   the two-read race between the caller's read and the landing's.
   Fleet-shaped (profiles are this fork's session mode).
 
+- The spilled-adoption landing DEFERS over a FAILED profile judgement too,
+  not only an unreadable Keychain (CON-2420, 2026-09-06; review of PR #47).
+  `_profile_generation_past_spill`'s catch-all answered `(None, None)` —
+  "land the sidecar as-is" — whenever the re-judge raised for a reason
+  other than the Keychain (an exception in the identity or drift check, the
+  seed stamp, a broken `.claude.json`): the write hook's idle branch then
+  dropped the profile's copy — possibly the family's only newest generation
+  — and the backup kept the consumed sidecar generation, a dead login on
+  the next `cswap run`. CON-2375 closed the loss for the unreadable Keychain
+  only. The except branch now answers `(None, "judgement failed (…)")`, the
+  same deferral: nothing written, sidecar / profile copy / seed stamp kept
+  for the next pass, the cause logged with its traceback; the collector
+  answers `token expired`, `cswap refresh` / reseed answer DEFERRED, the
+  bootstrap refuses. A persistent cause (a broken `.claude.json`) defers for
+  good — the slot is visibly `token expired` and the log names the cause —
+  rather than land blind after a count. Fleet-shaped (profiles are this
+  fork's session mode).
+
 - `switch` REFUSES a slot whose live `cswap run` session shares the stored
   login, and the daemon judges a live-session slot by what its profile holds
   (CON-2030, 2026-09-04). Live incident 2026-09-03 19:09: the operator

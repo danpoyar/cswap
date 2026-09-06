@@ -1,0 +1,9 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2420",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "d681956eb9a8cf201d0d11b8c4d96a95b94e03a9",
+  "summary": "раунд 2: оба нита р.1 починены (тексты deferral — read or judged; время коммента границ), открытых Important нет; альтернативы: judged; можно принимать",
+  "findings": []
+}
