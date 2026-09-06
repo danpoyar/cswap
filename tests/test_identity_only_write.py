@@ -302,6 +302,35 @@ class TestEngineIdentityOnly:
         assert len(_identity_only_events(h)) == 2
         assert h.active_number() == 1
 
+    def test_identity_only_write_takes_the_forensic_snapshot(self, temp_home):
+        # CON-2323 hunts the writer of exactly this shape; with the adoption
+        # refused there is no adopt-real-login to hang its snapshot on, so
+        # the snapshot follows the identity-only report (once per episode).
+        from claude_swap.autoswitch import AdoptSnapshotEvent
+
+        calls: list[dict] = []
+
+        def fake_snapshot(**kwargs):
+            calls.append(kwargs)
+            return {"processes": {"claude": 1}, "errors": []}
+
+        h = _harness(temp_home, identity=3, pair_of=1, record=1)
+        h.engine = h._make_engine(adopt_snapshot=fake_snapshot)
+
+        h.tick_with_usage(HEALTHY)
+        h.clock.advance(60)
+        h.tick_with_usage(HEALTHY)
+
+        (report,) = _identity_only_events(h)
+        (snap,) = [e for e in h.events if isinstance(e, AdoptSnapshotEvent)]
+        assert h.events.index(snap) == h.events.index(report) + 1
+        (call,) = calls
+        assert call["session_dir"] == h.switcher._session_dir("3", EMAILS[3])
+        payload = snap.to_json()
+        assert payload["from"] == {"number": 1, "email": EMAILS[1]}
+        assert payload["to"] == {"number": 3, "email": EMAILS[3]}
+        assert payload["snapshot"] == {"processes": {"claude": 1}, "errors": []}
+
     def test_consistent_manual_login_is_still_adopted(self, temp_home):
         # Regression guard for CON-1581: a real /login (identity AND pair of
         # the same slot) is adopted as before, with no identity-only report.

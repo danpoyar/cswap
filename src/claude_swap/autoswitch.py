@@ -1656,7 +1656,9 @@ class AutoSwitchEngine:
             # every real tick; dry-run must not write anything, same as the
             # quarantine release above.
             adopted, prior = self.switcher.adopt_active_account(current)
-            self._report_identity_only_write(adopted, prior, active_ref)
+            self._report_identity_only_write(
+                adopted, prior, active_ref, current, current_email
+            )
             if adopted:
                 prior_ref = (
                     _ref(prior, self.switcher.account_email(prior))
@@ -4361,11 +4363,19 @@ class AutoSwitchEngine:
         self.on_event(event)
 
     def _report_identity_only_write(
-        self, adopted: bool, prior: str | None, active_ref: dict
+        self,
+        adopted: bool,
+        prior: str | None,
+        active_ref: dict,
+        account_num: str,
+        email: str | None,
     ) -> None:
         """Say once per episode that the adoption was refused because the
         live pair belongs to another slot (CON-2332); silent while the same
-        episode persists, reset once the live store is consistent again."""
+        episode persists, reset once the live store is consistent again.
+        The CON-2323 forensic snapshot follows the report: an identity
+        written without its pair is exactly the writer that hunt is after,
+        and the refused adoption no longer raises ``adopt-real-login``."""
         state = None if adopted else self.switcher.identity_only_write
         if state is None:
             self._identity_only_reported = None
@@ -4375,15 +4385,21 @@ class AutoSwitchEngine:
         self._identity_only_reported = state
         owner = str(state["owner"])
         recorded = state.get("recorded")
+        recorded_ref = (
+            _ref(recorded, self.switcher.account_email(recorded))
+            if recorded is not None
+            else None
+        )
         self._emit(
             IdentityOnlyWriteEvent(
                 identity=dict(active_ref),
                 owner=_ref(owner, self.switcher.account_email(owner)),
-                recorded=(
-                    _ref(recorded, self.switcher.account_email(recorded))
-                    if recorded is not None
-                    else None
-                ),
+                recorded=recorded_ref,
+            )
+        )
+        self._emit(
+            self._adopt_snapshot_event(
+                recorded_ref, dict(active_ref), account_num, email
             )
         )
 
