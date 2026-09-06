@@ -1,0 +1,16 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2323",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "7e8b3afb5bce27645d95c52616345041a1d5eb43",
+  "summary": "р.2: Important р.1 (ps-проба молча даёт 0 процессов под не-C локалью / при rc≠0) починен — ps зовётся с env LC_ALL=C/LANG=C (adopt_snapshot.py:248), rc≠0 → «ps: rc=N: …», непустой stdout без разобранных строк → «ps: parsed 0 of N lines — unexpected format (locale?)» (count_ps_lines); закреплено тестами test_ps_runs_in_the_c_locale / test_localized_ps_output_is_an_error_not_silence / test_ps_nonzero_exit_is_an_error_line; спот-чек 2 passed; живой прогон коллектора под LC_ALL=es_ES.UTF-8: 86 процессов, errors [], в JSON нет sk-ant-. Minor р.1 тоже закрыты (security rc≠44 → errors; _ENV_TOKEN_BOUNDARY и config_dir_matcher из process_detection; TestDefaultCollector + test_engine_defaults_to_the_live_collector). Открыт только нит PLR0913 (автор оставил осознанно, у форка правил ruff нет). Important нет, фактических нет, можно принимать; альтернативы: n/a (судились в р.1)",
+  "findings": [
+    {
+      "severity": "nit",
+      "message": "ruff PLR0913 (канон config/ruff.toml): collect_adopt_snapshot — 9 параметров > 5; автор оставил осознанно (у форка правил ruff нет, швы явные для тестов) — не блокирует.",
+      "file": "src/claude_swap/adopt_snapshot.py",
+      "line": 181
+    }
+  ]
+}
