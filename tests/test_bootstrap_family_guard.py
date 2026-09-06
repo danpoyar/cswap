@@ -234,6 +234,18 @@ def _flaky_keychain(session_dir: Path, failures: int):
     return patch.object(macos_keychain, "get_password", flaky_get)
 
 
+def _keychain_timeout_on_backup(switcher):
+    """The slot BACKUP's Keychain read times out too — the overload is
+    machine-wide, not per item (CON-2374). ``_read_account_credentials``
+    swallows the KeychainError and reports the backup as ``""``, which is
+    byte-for-byte the same answer as "no backup stored"."""
+
+    def busy_read(account_num, email):
+        raise KeychainError("security find-generic-password timed out after 5.0s")
+
+    return patch.object(switcher._store, "_kc_read_backup", busy_read)
+
+
 def _profile_entry(block_real_keychain, session_dir: Path):
     return block_real_keychain.get_password(
         keychain_service_name(session_dir), macos_keychain.keychain_account_name()
@@ -540,6 +552,39 @@ class TestOneReadFeedsAdoptionAndGuard:
         ) == oauth.credential_fingerprint(BACKUP)
         assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
         assert not _entry(switcher).token_dead()
+
+    def test_stale_marker_over_unreadable_profile_and_empty_backup_keeps_the_family(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """RED before CON-2374 (review of PR #45): the same overload that
+        makes the profile unreadable makes the backup read ``""``; the seed
+        guard ruled ``not backup -> decidable``, the stale path adopted off a
+        swallowed read, invalidated the profile (its keychain copy — the
+        family's only newest generation — plaintext, marker and seed stamp
+        all gone) and the bootstrap then failed as "no stored credentials".
+        Now: an unreadable profile under a stale marker is never invalidated,
+        whatever the backup bytes say — the marker is kept for a later run."""
+        mark_session_stale(rotated_profile)
+
+        with _busy_keychain(rotated_profile), _keychain_timeout_on_backup(
+            switcher
+        ), pytest.raises(SessionError) as refused:
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []
+        assert (rotated_profile / STALE_MARKER).exists()  # deferred, not lost
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert (rotated_profile / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == BACKUP
+        assert not _entry(switcher).token_dead()
+        # Refused TRANSIENTLY (Keychain busy) — not "re-add the slot".
+        assert "keychain" in str(refused.value).lower()
+        assert "no stored credentials" not in str(refused.value)
 
     def test_stale_marker_over_readable_profile_adopts_then_reseeds(
         self, manager, switcher, rotated_profile, probe_times_out, post_spy,
