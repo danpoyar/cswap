@@ -304,6 +304,17 @@ def reseed_account(
                 backup = switcher.reconcile_pending_rotation_locked(
                     account_num, email, backup
                 )
+                if backup is None:
+                    # CON-2375: a spilled adoption whose profile the landing
+                    # could not read (readable a moment ago, above — the
+                    # Keychain went busy since): deferred, sidecar kept.
+                    raise refuse(
+                        DEFERRED,
+                        "the spilled adoption's profile cannot be read right "
+                        "now — its landing is deferred; retry shortly "
+                        "(CON-2375)",
+                        pids,
+                    )
                 backup_oauth = _full_pair(backup)
                 if backup_oauth is None:
                     raise refuse(

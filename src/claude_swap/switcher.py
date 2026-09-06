@@ -1834,7 +1834,8 @@ class ClaudeAccountSwitcher:
 
         Returns the credential bytes the caller should fetch with, or None
         when a spill exists but could not be reconciled this pass (lock
-        contention): the on-disk generation is the spill's consumed
+        contention, or a spilled adoption whose profile cannot be read right
+        now — CON-2375): the on-disk generation is the spill's consumed
         predecessor, so the caller must defer instead of touching the
         network with it. Never raises.
         """
@@ -1856,17 +1857,22 @@ class ClaudeAccountSwitcher:
 
     def reconcile_pending_rotation_locked(
         self, account_num: str, email: str, creds: str
-    ) -> str:
+    ) -> str | None:
         """Reconcile variant for callers already holding ``self.lock_file``
-        (the session bootstrap). Returns the bytes to continue with — under
-        the held lock there is no contention to defer for."""
+        (the session bootstrap, ``cswap refresh``, the reseed door). Returns
+        the bytes to continue with — under the held lock there is no
+        contention to defer for — or ``None`` when the landing itself is
+        deferred: a spilled ADOPTION whose profile cannot be read right now
+        (CON-2375). The sidecar then stays, the backup is untouched and the
+        caller must defer too — the bytes it holds are the spill's consumed
+        predecessor."""
         if not self._pending_rotation_path(account_num).exists():
             return creds
         return self._reconcile_spilled_rotation_locked(account_num, email, creds)
 
     def _reconcile_spilled_rotation_locked(
         self, account_num: str, email: str, creds: str
-    ) -> str:
+    ) -> str | None:
         """Body of the spill reconcile; caller holds ``self.lock_file``.
 
         The spill is applied when the backup is empty/unreadable (the spill
@@ -1889,6 +1895,18 @@ class ClaudeAccountSwitcher:
         is then the consumed predecessor, and the hook's idle branch would
         destroy the profile's copy — the family's only newest generation.
         The superseded sidecar is preserved as an unclaimed copy.
+
+        When that profile EXISTS but cannot be read right now (Keychain
+        busy/locked), who holds the newest generation is undecidable and
+        the landing is DEFERRED (CON-2375): nothing is written, the sidecar
+        stays for the next pass, and ``None`` tells the caller to defer as
+        well — the bytes it holds are the spill's consumed predecessor.
+        Landing the sidecar blind ran the hook's idle branch over the
+        profile's copy — possibly the only copy of the newest generation —
+        and left the backup with a consumed one: a dead login on the next
+        ``cswap run``. The bootstrap refuses the same shape before its own
+        reconcile (CON-2355); this is the collector's and the locked
+        callers' guard.
         """
         path = self._pending_rotation_path(account_num)
         try:
@@ -1925,9 +1943,17 @@ class ClaudeAccountSwitcher:
                 # CON-2100: the profile may have rotated past the spilled
                 # generation meanwhile (and exited) — land ITS generation, or
                 # the write hook's idle branch destroys the family's newest.
-                ahead = self._profile_generation_past_spill(
+                ahead, unreadable = self._profile_generation_past_spill(
                     account_num, email, spilled, predecessor
                 )
+                if unreadable is not None:
+                    self._logger.warning(
+                        "Account %s: the session profile could not be read "
+                        "while landing its spilled adoption (%s); deferring "
+                        "the landing — the sidecar stays until the profile "
+                        "can be read (CON-2375).", account_num, unreadable,
+                    )
+                    return None
                 if ahead is not None:
                     landing = ahead
             self._write_account_credentials(account_num, email, landing)
@@ -1997,10 +2023,13 @@ class ClaudeAccountSwitcher:
         email: str,
         spilled: str,
         predecessor: str | None,
-    ) -> str | None:
-        """The session profile's credential when the profile ran PAST a
-        spilled adoption (CON-2100) — the bytes the landing must write
-        instead of the sidecar's — or ``None`` to land the sidecar as before.
+    ) -> tuple[str | None, str | None]:
+        """``(ahead, unreadable)`` — the session profile's credential when
+        the profile ran PAST a spilled adoption (CON-2100), the bytes the
+        landing must write instead of the sidecar's, or ``(None, None)`` to
+        land the sidecar as before; ``(None, error)`` when the profile
+        exists but cannot be read right now — the judgement is undecidable
+        and the landing must be deferred (CON-2375).
 
         A spill tagged ``SPILL_ORIGIN_PROFILE`` holds the generation the
         profile had at spill time. Between the spill and its landing the
@@ -2021,9 +2050,10 @@ class ClaudeAccountSwitcher:
         The profile is "ahead" only when it is this slot's identity (not
         drifted), readable in ONE read (``read_profile_generation``: an
         existing-but-unreadable keychain entry is not "no profile" — the
-        plaintext under it may be the consumed seed — so the judgement is
-        skipped, logged, and the sidecar lands as before), a full OAuth pair
-        (not the inference token), and its fingerprint is none of: the
+        plaintext under it may be the consumed seed and the entry the
+        family's newest generation — so the judgement is undecidable and
+        reported as ``unreadable``, never "land the sidecar"), a full OAuth
+        pair (not the inference token), and its fingerprint is none of: the
         spilled generation (the plain landing), the spill's predecessor (a
         profile re-seeded from the old backup — the sidecar is the newer
         one), its own seed stamp (a profile still AT its seed never rotated —
@@ -2038,45 +2068,39 @@ class ClaudeAccountSwitcher:
         try:
             session_dir = self._session_dir(account_num, email)
             if not session_dir.is_dir():
-                return None
+                return None, None
             org_uuid = self.account_identity(account_num).get(
                 "organizationUuid", ""
             )
             if session_identity_drifted(session_dir, email, org_uuid):
-                return None
+                return None, None
             profile, err = read_profile_generation(session_dir)
             if profile is None:
-                if err is not None:
-                    self._logger.warning(
-                        "Account %s: the session profile could not be read "
-                        "while landing its spilled adoption (%s); landing the "
-                        "spilled generation as-is.", account_num, err,
-                    )
-                return None
+                return None, err
             if is_inference_token_credentials(profile):
-                return None
+                return None, None
             profile_oauth = oauth.extract_oauth_data(profile)
             if not (
                 profile_oauth
                 and profile_oauth.get("accessToken")
                 and profile_oauth.get("refreshToken")
             ):
-                return None
+                return None, None
             fp_profile = oauth.credential_fingerprint(profile)
             if not fp_profile or fp_profile in (
                 oauth.credential_fingerprint(spilled),
                 predecessor,
                 read_seed_fingerprint(session_dir),
             ):
-                return None
-            return profile
+                return None, None
+            return profile, None
         except Exception:
             self._logger.warning(
                 "Could not judge account %s's session profile while landing "
                 "its spilled adoption; landing the spilled generation as-is",
                 account_num, exc_info=True,
             )
-            return None
+            return None, None
 
     def _stamp_profile_generation(
         self, session_dir: Path, fingerprint: str, account_num: str

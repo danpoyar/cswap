@@ -548,3 +548,91 @@ class TestRefreshCli:
             cli._refresh_command(["--all", "--stale-min", "30", "--json"])
 
         assert run.call_args.args[1] == [NUM]
+
+
+def _keychain_busy_at_the_landing(switcher):
+    """The profile reads fine for the caller's own read, and the Keychain
+    goes busy exactly at the landing's re-judge (CON-2100) inside
+    ``reconcile_pending_rotation_locked`` — the two-read race the locked
+    callers guard against (CON-2375). A context manager."""
+    from contextlib import contextmanager
+
+    from claude_swap import session as _session_mod
+
+    real_reconcile = switcher.reconcile_pending_rotation_locked
+    real_read = _session_mod.read_profile_generation
+    landing = {"on": False}
+
+    def reconcile(*args, **kwargs):
+        landing["on"] = True
+        try:
+            return real_reconcile(*args, **kwargs)
+        finally:
+            landing["on"] = False
+
+    def read(session_dir):
+        if landing["on"]:
+            return None, "keychain unavailable"
+        return real_read(session_dir)
+
+    @contextmanager
+    def gate():
+        with (
+            patch.object(switcher, "reconcile_pending_rotation_locked", reconcile),
+            patch.object(_session_mod, "read_profile_generation", read),
+        ):
+            yield
+
+    return gate()
+
+
+class TestSpilledAdoptionOverUnreadableProfile:
+    """CON-2375: ``reconcile_pending_rotation_locked`` defers (``None``) when
+    a spilled ADOPTION's profile cannot be read at the landing. The refresh
+    read no credential in the profile a moment earlier, so it reached the
+    reconcile; it must answer DEFERRED — not NO_CREDENTIALS (the family is
+    alive in the sidecar) — and POST nothing: the backup it holds is the
+    sidecar's consumed predecessor."""
+
+    def test_refresh_defers_when_the_landing_cannot_read_the_profile(
+        self, temp_home
+    ):
+        from claude_swap.refresh import DEFERRED, refresh_account
+        from claude_swap.switcher import SPILL_ORIGIN_PROFILE
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-seed", refresh="rt-seed")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)  # the slot's profile, no credential now
+        spill = switcher._pending_rotation_path(NUM)
+        spill.parent.mkdir(parents=True, exist_ok=True)
+        spill.write_text(
+            json.dumps(
+                {
+                    "credentials": _creds(access="at-spilled", refresh="rt-spilled"),
+                    "predecessorFingerprint": oauth.credential_fingerprint(backup),
+                    "email": EMAIL,
+                    "createdAt": "2026-09-06T08:00:00Z",
+                    "origin": SPILL_ORIGIN_PROFILE,
+                }
+            ),
+            encoding="utf-8",
+        )
+        sidecar = spill.read_text(encoding="utf-8")
+
+        with (
+            _keychain_busy_at_the_landing(switcher),
+            patch("claude_swap.refresh.try_refresh_oauth_credentials") as post,
+            patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch,
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == DEFERRED
+        assert "cannot be read" in (report.detail or "")
+        post.assert_not_called()
+        fetch.assert_not_called()
+        assert spill.read_text(encoding="utf-8") == sidecar  # sidecar untouched
+        assert switcher.read_account_credentials(NUM, EMAIL) == backup
+        assert not (session_dir / ".credentials.json").exists()
+        assert switcher.list_unclaimed_credentials() == {}

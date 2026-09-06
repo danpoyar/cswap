@@ -1060,6 +1060,14 @@ class SessionManager:
         creds = self.switcher.reconcile_pending_rotation_locked(
             account_num, email, creds
         )
+        if creds is None:
+            # CON-2375: the landing's own read of the profile failed although
+            # the bootstrap's read above succeeded (the Keychain went busy
+            # between the two) — the reconcile deferred and the sidecar
+            # stays. The same undecidable shape as the guard above; judged
+            # before the "no credentials" line, which would send the
+            # operator to re-add a slot whose family is alive.
+            raise SessionError(self._undecidable_spill_message(account_num, email))
         if not creds:
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "

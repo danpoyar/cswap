@@ -330,9 +330,9 @@ read in one sitting.
   Liveness is not consulted — the rule holds for a live profile too (it
   lands the newest generation, as the direct adoption would, and the
   settling re-stamps the seed), and a second process scan would race the
-  hook's (review r.1 of PR #37). An unreadable keychain entry skips the
-  judgement and lands the sidecar as before (the plaintext under it may be
-  the consumed seed). Fleet-shaped (profiles are this fork's session mode).
+  hook's (review r.1 of PR #37). An unreadable keychain entry (the
+  plaintext under it may be the consumed seed) defers the landing instead
+  — CON-2375 below. Fleet-shaped (profiles are this fork's session mode).
 
 - The bootstrap refuses, transiently, to land a spilled ADOPTION over an
   UNREADABLE profile (CON-2355, 2026-09-06; review of PR #44). The bootstrap
@@ -352,6 +352,26 @@ read in one sitting.
   consulted: a Keychain timeout reads the backup as `""` too, and the
   stamp guard is blind over `""`. Fleet-shaped (profiles are this fork's
   session mode).
+
+- The spilled-adoption landing DEFERS over an UNREADABLE profile instead of
+  landing the sidecar blind (CON-2375, 2026-09-06; review of PR #45). The
+  collector pass (`_fetch_account_usage` → `_reconcile_spilled_rotation`)
+  and the locked reconcile callers landed a `profile-adoption` sidecar as-is
+  whenever `_profile_generation_past_spill` could not read the profile (the
+  pin CON-2100 left): the write hook's idle branch dropped the profile's
+  copy — possibly the family's only newest generation — and the backup kept
+  the consumed sidecar generation; the next `cswap run` bootstrapped a dead
+  login. CON-2355 closed the same loss for the bootstrap only.
+  `_profile_generation_past_spill` now answers `(ahead, unreadable)`; on
+  `unreadable` the locked reconcile writes nothing, keeps the sidecar for
+  the next pass and returns `None`, which the lock-free variant already
+  means as "defer" (the collector answers `token expired` and touches no
+  network with the consumed backup; autoswitch says "transient");
+  `reconcile_pending_rotation_locked` is `str | None` and its callers map
+  `None` to their own deferral before the "no credentials" line (bootstrap
+  → the CON-2355 refusal, `cswap refresh` → DEFERRED, reseed → DEFERRED) —
+  the two-read race between the caller's read and the landing's.
+  Fleet-shaped (profiles are this fork's session mode).
 
 - `switch` REFUSES a slot whose live `cswap run` session shares the stored
   login, and the daemon judges a live-session slot by what its profile holds
