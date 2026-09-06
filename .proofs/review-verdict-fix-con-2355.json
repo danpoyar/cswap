@@ -1,0 +1,12 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-2355",
+  "verdict": "approve",
+  "round": 1,
+  "head_sha": "e5e71877b635237ce5ec0dd0f10a2a989804372e",
+  "summary": "фактических в диффе нет, можно принимать; 2 minor вне объёма (пред-существующие, отдельным тикетом); альтернативы: judged",
+  "findings": [
+    {"severity": "minor", "message": "Вне объёма, пред-существующее (CON-1740): ветка stale-marker судит только _seed_backup_undecidable, который слеп при бэкапе, прочитанном как пустая строка (таймаут Keychain бэкапа): при нечитаемом профиле инвалидация копии профиля и штампа идёт до любого суда, новый страж CON-2355 в _bootstrap уже не видит поколения профиля. Отдельный тикет.", "file": "src/claude_swap/session.py", "line": 808},
+    {"severity": "minor", "message": "Вне объёма, пред-существующее и признано автором в progress: проход коллектора _fetch_account_usage → _reconcile_spilled_rotation сажает profile-origin сайдкар при нечитаемом профиле как есть (пин CON-2100). Отдельный тикет.", "file": "src/claude_swap/switcher.py", "line": 4400}
+  ]
+}

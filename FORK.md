@@ -334,6 +334,25 @@ read in one sitting.
   judgement and lands the sidecar as before (the plaintext under it may be
   the consumed seed). Fleet-shaped (profiles are this fork's session mode).
 
+- The bootstrap refuses, transiently, to land a spilled ADOPTION over an
+  UNREADABLE profile (CON-2355, 2026-09-06; review of PR #44). The bootstrap
+  reconciled a pending spill BEFORE its CON-1740 seed guard: with the
+  profile's Keychain entry unreadable the landing's re-judge (CON-2100) is
+  skipped, the sidecar lands, and the write hook's idle branch drops the
+  profile's copy — possibly the family's newest generation — together with
+  the seed stamp, so the guard read no stamp and passed, and the bootstrap
+  POSTed the sidecar's generation the session may already have consumed.
+  `_seed_credentials_from_backup` now judges this off the same
+  `read_profile_generation` read as the adoption, before the reconcile:
+  profile unreadable + a sidecar tagged `profile-adoption` waiting
+  (`pending_profile_spill`, read-only) → `SessionError`, nothing landed,
+  nothing POSTed, sidecar / profile copy / stamp intact — the shape the
+  other reconcile callers (`cswap refresh`, `cswap reseed`, autoswitch)
+  already defer on before their reconcile. The backup bytes are not
+  consulted: a Keychain timeout reads the backup as `""` too, and the
+  stamp guard is blind over `""`. Fleet-shaped (profiles are this fork's
+  session mode).
+
 - `switch` REFUSES a slot whose live `cswap run` session shares the stored
   login, and the daemon judges a live-session slot by what its profile holds
   (CON-2030, 2026-09-04). Live incident 2026-09-03 19:09: the operator

@@ -1034,6 +1034,25 @@ class SessionManager:
             account_num, email, org_uuid, locked=True, profile_read=profile_read
         )
         creds = self.switcher.read_account_credentials(account_num, email)
+        # CON-2355: a spilled ADOPTION — the profile's own generation waiting
+        # in the sidecar (CON-2075) — over an UNREADABLE profile is the
+        # undecidable shape too, and it must be judged BEFORE the reconcile
+        # below lands the spill: the landing's re-judge (CON-2100) cannot
+        # read the profile either and lands the sidecar as-is; the
+        # backup-write hook's idle branch then drops the profile's copy —
+        # possibly the family's newest generation — together with the seed
+        # stamp, after which the seed guard below reads no stamp, passes,
+        # and the bootstrap POSTs the sidecar's generation, which the
+        # session may already have consumed (review of PR #44). Judged off
+        # the same read as the adoption; the backup bytes are deliberately
+        # not consulted — a Keychain timeout reads the backup as "" as well
+        # (credentials.py), and the stamp guard is blind over "". The other
+        # reconcile callers (refresh, reseed, autoswitch) already defer
+        # before their reconcile on an unreadable profile.
+        if profile_read[1] is not None and self.switcher.pending_profile_spill(
+            account_num
+        ):
+            raise SessionError(self._undecidable_spill_message(account_num, email))
         # A pending spilled rotation supersedes the stored bytes (CON-849):
         # seeding the profile with the consumed predecessor would hand the
         # new claude a dead grant. The caller holds the store lock, so the
@@ -1319,6 +1338,18 @@ class SessionManager:
             "profile's claude. Not POSTing it and not overwriting the profile "
             "(a consumed grant replayed is the documented reuse signal). Retry "
             "shortly; the profile keeps its generation (CON-1740)."
+        )
+
+    @staticmethod
+    def _undecidable_spill_message(account_num: str, email: str) -> str:
+        return (
+            f"Account-{account_num} ({email}): the profile's own credential "
+            "cannot be read right now (Keychain busy) and its spilled adoption "
+            "is still waiting in the sidecar — the profile may already hold a "
+            "newer generation than the sidecar. Not landing the spill (the "
+            "landing would drop the profile's copy unread), not POSTing it and "
+            "not overwriting the profile. Retry shortly; the sidecar and the "
+            "profile keep their generations (CON-2355)."
         )
 
     def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:

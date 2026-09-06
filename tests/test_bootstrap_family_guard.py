@@ -59,7 +59,7 @@ from claude_swap.session import (
     mark_session_stale,
     session_dir_for,
 )
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import SPILL_ORIGIN_PROFILE, ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 from tests.test_session import (
     ACCOUNT_EMAIL,
@@ -554,4 +554,91 @@ class TestOneReadFeedsAdoptionAndGuard:
         assert not (session_dir / STALE_MARKER).exists()
         rotated = _creds("at-rotated", "rt-rotated")
         assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == rotated
+        assert not _entry(switcher).token_dead()
+
+
+SPILLED_GEN = _creds("at-spilled", "rt-spilled")  # the profile's generation at spill time
+
+
+def _pending_profile_spill(switcher) -> Path:
+    """A spilled ADOPTION hanging on the slot (CON-2075): the profile's
+    generation at spill time, tagged with the profile origin and the backup
+    (= the seed) as its predecessor. The session then rotated the family once
+    more (the fixture's keychain entry, PROFILE_GEN) and exited — the sidecar
+    is the consumed predecessor of the profile's copy (the CON-2100 shape)."""
+    path = switcher._pending_rotation_path(ACCOUNT_NUM)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "credentials": SPILLED_GEN,
+                "predecessorFingerprint": oauth.credential_fingerprint(BACKUP),
+                "email": ACCOUNT_EMAIL,
+                "createdAt": "2026-09-06T08:00:00Z",
+                "origin": SPILL_ORIGIN_PROFILE,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestPendingProfileSpillOverUnreadableProfile:
+    """CON-2355 (review of PR #44): the bootstrap reconciled a pending spill
+    BEFORE the CON-1740 seed guard. With the profile's Keychain unreadable
+    the landing's re-judge (CON-2100) is skipped, the sidecar lands, and the
+    backup-write hook's idle branch drops the profile's copy — the only copy
+    of the family's newest generation — AND the seed stamp. The guard then
+    read no stamp, passed, and the bootstrap seeded the profile with the
+    sidecar's generation, which the session had already consumed: a dead
+    login, the newest generation destroyed."""
+
+    def test_unreadable_profile_with_pending_profile_spill_refuses_and_lands_nothing(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+        block_real_keychain,
+    ):
+        """RED on main: no refusal — the sidecar lands, the keychain entry
+        (PROFILE_GEN) and the seed stamp are destroyed, and the consumed
+        spilled grant is POSTed."""
+        spill = _pending_profile_spill(switcher)
+        sidecar = spill.read_text(encoding="utf-8")
+
+        with _busy_keychain(rotated_profile), pytest.raises(
+            SessionError, match="(?i)keychain"
+        ):
+            manager.setup_session("2", share=False)
+
+        assert post_spy == []  # nothing consumed
+        assert spill.read_text(encoding="utf-8") == sidecar  # sidecar untouched
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == BACKUP
+        assert _profile_entry(block_real_keychain, rotated_profile) == PROFILE_GEN
+        assert (rotated_profile / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == BACKUP
+        assert (rotated_profile / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(BACKUP)
+        assert switcher.list_unclaimed_credentials() == {}
+        assert not _entry(switcher).token_dead()
+
+    def test_readable_profile_with_pending_profile_spill_adopts_the_profile_and_supersedes_the_sidecar(
+        self, manager, switcher, rotated_profile, probe_times_out, post_spy,
+    ):
+        """Pin (green before and after): Keychain readable — the profile's
+        newest generation is adopted, the sidecar is superseded into the
+        unclaimed store, and the one bootstrap POST consumes the ADOPTED
+        grant. The refusal above is about the unreadable case only."""
+        spill = _pending_profile_spill(switcher)
+
+        session_dir, _, _ = manager.setup_session("2", share=False)
+
+        assert post_spy == [PROFILE_GEN]
+        assert not spill.exists()
+        rotated = _creds("at-rotated", "rt-rotated")
+        assert switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == rotated
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == rotated
+        superseded = switcher.list_unclaimed_credentials()
+        assert [e["fingerprint"] for e in superseded.values()] == [
+            oauth.credential_fingerprint(SPILLED_GEN)
+        ]
         assert not _entry(switcher).token_dead()
