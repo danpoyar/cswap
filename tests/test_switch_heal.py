@@ -373,13 +373,18 @@ class TestSwitchRefusesDeadLanding:
 
 
 def _superseded_profile(s: ClaudeAccountSwitcher, profile_expires: int = FRESH_MS,
-                        marker: bool = True):
+                        marker: bool = True, backup_expires: int = FRESH_MS):
     """Review r.1 shape: the BACKUP is the newer login. A re-add/re-login while
     the profile's session was live rewrote the backup (B) and left the profile
     with its older family (A) plus the stale marker; the seed stamp names the
-    generation both copies started from (neither A nor B)."""
+    generation both copies started from (neither A nor B).
+
+    ``backup_expires=EXPIRED_MS`` is the CON-2345 shape: the same three
+    generations, but B is a parked copy nobody refreshed (the daemon's
+    failover backed the home slot up from the global store) while A is the
+    live session's fresh generation."""
     seed = _creds("at-seed-2", "rt-seed-2", expires=EXPIRED_MS)
-    new_login = _creds("at-new-2", "rt-new-2")
+    new_login = _creds("at-new-2", "rt-new-2", expires=backup_expires)
     s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, new_login)  # B
     session_dir = s._session_dir(TARGET_NUM, TARGET_EMAIL)
     session_dir.mkdir(parents=True)
@@ -478,6 +483,170 @@ class TestBackupNewerThanProfile:
         ) == "at-new-2"
         assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == old_family
         assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+
+class TestLiveSessionOutranksTheOrderingOracles:
+    """CON-2345 (live 2026-09-06 03:43–05:10 on the fleet machine): the
+    daemon's failover backed the home slot up from the global store under the
+    orchestrator's live profile session — stale marker set, backup a consumed
+    generation — and the fleet guard's `switch 32 --even-if-live` landed that
+    dead backup on every return (three returns, three failovers): both
+    ordering oracles (marker, seed stamp) said "the backup is newer" while the
+    LIVE session's generation was fresh and the backup's expired. Under a live
+    session that live evidence outranks the oracles: the heal reports the
+    live session (refusal without the override), and the `--even-if-live`
+    adoption lands the session's generation past the seed guard."""
+
+    def test_fresh_live_profile_over_expired_backup_is_adopted_under_even_if_live(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        from claude_swap.exceptions import LiveSessionRefusal
+
+        s = _make_switcher(temp_home)
+        stale_backup, live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
+
+        # Without the override a live session owning the family is refused.
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            with pytest.raises(LiveSessionRefusal):
+                s.switch_to(TARGET_NUM, json_output=True)
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == stale_backup
+        assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            result = s.switch_to(TARGET_NUM, json_output=True, even_if_live=True)
+
+        assert result["switched"] is True
+        landed = _live_path(temp_home).read_text(encoding="utf-8")
+        assert oauth.extract_access_token(landed) == "at-old-2", (
+            "the live session's fresh generation must land, never the expired backup"
+        )
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == live_family
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == live_family
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(live_family)
+        assert any("adopted the session's generation" in w for w in result.get("warnings", []))
+        no_network.assert_not_called()
+        assert s._get_sequence_data()["activeAccountNumber"] == int(TARGET_NUM)
+
+    def test_heal_reports_the_live_session_ahead_on_live_evidence(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        from claude_swap.refresh import LIVE_SESSION, heal_backup_before_activation
+
+        s = _make_switcher(temp_home)
+        _stale_backup, live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+
+        assert report.outcome == LIVE_SESSION
+        assert report.detail == "4242"
+        assert report.profile_ahead is True
+        # Judging mutates nothing: the live profile and the marker stay.
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == live_family
+        assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "profile_expires,backup_expires",
+        [
+            (FRESH_MS, FRESH_MS),  # both fresh: who ran ahead is undecidable
+            (EXPIRED_MS, EXPIRED_MS),  # both expired: no live evidence either way
+            (EXPIRED_MS, FRESH_MS),  # the backup is the fresh one
+        ],
+    )
+    def test_without_live_evidence_the_oracles_keep_their_verdict(
+        self, temp_home, mock_claude_config, no_network, profile_expires, backup_expires
+    ):
+        from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
+
+        s = _make_switcher(temp_home)
+        _stale_backup, live_family, session_dir = _superseded_profile(
+            s, profile_expires=profile_expires, backup_expires=backup_expires
+        )
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+
+        assert report.outcome == BACKUP_CURRENT
+        assert report.profile_ahead is False
+        assert (session_dir / ".credentials.json").read_text(encoding="utf-8") == live_family
+        assert (session_dir / STALE_MARKER).exists()
+        no_network.assert_not_called()
+
+    def test_backup_without_an_expiry_is_not_live_evidence(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
+
+        s = _make_switcher(temp_home)
+        _superseded_profile(s, backup_expires=EXPIRED_MS)
+        no_expiry = json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-new-2", "refreshToken": "rt-new-2"}}
+        )
+        s.write_account_credentials(TARGET_NUM, TARGET_EMAIL, no_expiry)
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+
+        assert report.outcome == BACKUP_CURRENT
+        assert report.profile_ahead is False
+        no_network.assert_not_called()
+
+    def test_idle_profile_is_still_judged_by_the_oracles(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """No live session: nothing rotates the profile any more, so the
+        oracles' verdict stands and the superseded copy is dropped as before
+        (the idle shape is CON-2100, not this ticket)."""
+        from claude_swap.refresh import BACKUP_CURRENT, heal_backup_before_activation
+
+        s = _make_switcher(temp_home)
+        stale_backup, _live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
+
+        with patch.object(s, "_live_session_pids", return_value=[]):
+            report = heal_backup_before_activation(s, TARGET_NUM, TARGET_EMAIL, "")
+
+        assert report.outcome == BACKUP_CURRENT
+        assert report.profile_ahead is False
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / STALE_MARKER).exists()
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == stale_backup
+        no_network.assert_not_called()
+
+    def test_adoption_past_the_seed_guard_needs_the_heal_verdict(
+        self, temp_home, mock_claude_config, no_network
+    ):
+        """The seed guard of ``adopt_profile_family`` stands for every other
+        caller (bootstrap, reseed): only the heal's live verdict lifts it."""
+        s = _make_switcher(temp_home)
+        stale_backup, live_family, session_dir = _superseded_profile(
+            s, backup_expires=EXPIRED_MS
+        )
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            assert s.adopt_profile_family(TARGET_NUM, TARGET_EMAIL, "") is False
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == stale_backup
+
+        with patch.object(s, "_live_session_pids", return_value=[4242]):
+            assert s.adopt_profile_family(
+                TARGET_NUM, TARGET_EMAIL, "", profile_ahead=True
+            ) is True
+        assert s.read_account_credentials(TARGET_NUM, TARGET_EMAIL) == live_family
+        assert not (session_dir / STALE_MARKER).exists()
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(live_family)
         no_network.assert_not_called()
 
 
