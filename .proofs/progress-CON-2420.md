@@ -3,7 +3,7 @@
 создан: 2026-09-06 21:29 +0200 · сессия: fix-con-2420 · посадка: session:Yor
 
 ## Где стоп
-- Ревью р.1: approve, 0 Important, 2 нита (sid в $CLAUDE_JOB_DIR/tmp/review-sid.txt; вердикт .proofs/review-verdict-fix-con-2420.json на head bf4541f). Ниты починены (тексты deferral в switcher.py «read and judged»; время коммента в этом файле), тикет-сосед DAN-144 на тексты refresh/reseed/session. Дальше: раунд 2 продолжением ревьюера «только подтверди фикс» на новом head → коммит вердикта р.2 → мерж руками (squash, без --auto) → CI main → деплой scripts/deploy.sh main → перевести CON-2420 в Done дверью статусов.
+- Ревью р.2 (продолжение той же сессии): approve на head d681956, открытых Important нет; вердикт-файл валиден. Дальше: пуш вердикта → CI PR зелёный → мерж руками `gh pr merge 48 --squash` (без --auto, риск-зона) → `gh run watch` на main → деплой `bash scripts/deploy.sh main` → финал-коммент (черновик $CLAUDE_JOB_DIR/tmp/final.md) → перевести CON-2420 в Done дверью статусов → finals-inbox put + SendMessage Yor.
 
 ## Проверено
 - Проблема жива на HEAD ee24e95: except-ветка switcher.py:2098–2104 → `return None, None` (сажает сайдкар вслепую).
@@ -12,6 +12,7 @@
 - Коммент в тикет: критерий + практики + варианты (A defer без предела — выбран) + границы — положен 06-09 21:33 +0200 (createdAt Linear 19:33:29Z; первый коммит 21:37:54 +0200).
 - Красная проба показана комментом (FileNotFoundError на копии профиля — хук снёс её после слепой посадки).
 - Ревью р.1 (code-reviewer effort max, CLI): «фактических нет, 2 нита», можно принимать; ниты — тексты deferral только про Keychain (в границах — починил в switcher.py; вне границ — DAN-144), время коммента границ в этом файле (починил). Сьюты switch_heal/refresh/reseed/bootstrap_family_guard после правки — 106 passed.
+- Ревью р.2: approve (head d681956), оба нита закрыты, спот-чек ревьюера 2 passed; review-verdict-check --dir OK.
 - Фикс: switcher.py except-ветка `_profile_generation_past_spill` → `(None, "judgement failed (…)")`; тест зелёный; полный pytest 2199 passed, 3 skipped, 1 xfailed (75 с); merge origin/main — Already up to date, conflict-markers 0.
 
 ## Отвергнуто

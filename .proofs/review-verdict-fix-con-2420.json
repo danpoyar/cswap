@@ -2,21 +2,8 @@
   "role": "code-reviewer",
   "ticket": "CON-2420",
   "verdict": "approve",
-  "round": 1,
-  "head_sha": "bf4541f1304798751007b02a71d3d61ebe6cfdf5",
-  "summary": "фактических нет, 2 нита; альтернативы: judged; можно принимать",
-  "findings": [
-    {
-      "severity": "nit",
-      "message": "Тексты о причине deferral называют только нечитаемый Keychain: docstrings _reconcile_spilled_rotation (1836-1838) и reconcile_pending_rotation_locked (1865-1866), warning 1954-1957 («could not be read … until the profile can be read (CON-2375)»); сообщения вызывающих refresh.py:321, reseed.py:313-315, session.py:1386-1387 («Keychain busy») — вне границ PR, отдельным тикетом. Оператор с битым .claude.json направляется к Keychain; настоящая причина только в строке лога.",
-      "file": "src/claude_swap/switcher.py",
-      "line": 1954
-    },
-    {
-      "severity": "nit",
-      "message": "Время коммента границ «положен 06-09 ~21:45» неверно: Linear createdAt 2026-09-06T19:33:29Z = 21:33:29 +0200, первый коммит 21:37:54 +0200 — порядок «коммент до коммита» соблюдён, цифра в файле нет.",
-      "file": ".proofs/progress-CON-2420.md",
-      "line": 12
-    }
-  ]
+  "round": 2,
+  "head_sha": "d681956eb9a8cf201d0d11b8c4d96a95b94e03a9",
+  "summary": "раунд 2: оба нита р.1 починены (тексты deferral — read or judged; время коммента границ), открытых Important нет; альтернативы: judged; можно принимать",
+  "findings": []
 }
