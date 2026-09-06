@@ -101,6 +101,9 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
+        # The adopt-time forensic collector (CON-2323) shells out to
+        # ps/security/lsof; the harness stubs it so ticks stay hermetic.
+        kwargs.setdefault("adopt_snapshot", lambda **_kw: {"stub": True})
         return AutoSwitchEngine(
             self.switcher,
             self.settings,
