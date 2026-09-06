@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
@@ -68,7 +68,7 @@ def _tool(name: str) -> str:
 
 
 def _iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _is_claude_binary(argv0: str) -> bool:
