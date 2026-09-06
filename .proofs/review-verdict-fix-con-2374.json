@@ -2,21 +2,8 @@
   "role": "code-reviewer",
   "ticket": "CON-2374",
   "verdict": "approve",
-  "round": 1,
-  "head_sha": "b096a757e2c7a3ffdf39278dbfbb167a3f4c9144",
-  "summary": "фактических нет, 2 нита; можно принимать; альтернативы: judged; спот-чек 16 passed воспроизведён, красный тест на origin/main воспроизведён (маркер снесён, лог Invalidated session credentials for account 2)",
-  "findings": [
-    {
-      "severity": "nit",
-      "message": "_unreadable_stale_message уже кода: «its backup changed while it was live» — маркер ставит и парити-путь CON-1432 (session.py:747); «the stored backup (empty or the seed generation)» — отказ теперь и над бэкапом новее seed-штампа. Сообщение пользователю называет две причины из трёх и одну форму бэкапа из трёх.",
-      "file": "src/claude_swap/session.py",
-      "line": 1365
-    },
-    {
-      "severity": "nit",
-      "message": "Новый тест пинит только форму бэкапа \"\"; докстринг обещает «whatever the backup bytes say», а форма «бэкап новее seed-штампа + профиль нечитаем» (та самая цена из Альтернативы 1: раньше wipe+reseed, теперь отказ) без пина — рефакторинг, который снова спросит байты бэкапа, вернёт wipe молча при зелёном тесте.",
-      "file": "tests/test_bootstrap_family_guard.py",
-      "line": 556
-    }
-  ]
+  "round": 2,
+  "head_sha": "930cffde6ea9d566459b4430c08585eea39e1580",
+  "summary": "раунд 2: оба нита р.1 закрыты (сообщение отказа называет оба источника маркера и три состояния бэкапа; тест пинит форму «бэкап пере-добавлен + профиль нечитаем» → отказ), открытых Important нет; можно принимать; альтернативы: judged (р.1); спот-чек 17 passed воспроизведён",
+  "findings": []
 }
