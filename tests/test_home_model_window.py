@@ -40,7 +40,9 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
 )
-from tests.test_autoswitch import EngineHarness, _scoped_usage
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+from claude_swap.usage_store import UsageEntry
+from tests.test_autoswitch import EngineHarness, _entry_for, _scoped_usage
 
 HOME = "home@example.com"
 EMAILS = {1: HOME, 2: "b@example.com", 3: "c@example.com"}
@@ -174,25 +176,36 @@ class TestHomeHoldsThroughBurnedModel:
     def test_burned_hold_at_home_resets_the_unhealthy_count(self, temp_home):
         # A burned window is not a dead token: it must reset the unhealthy
         # count the way any readable tick does (the default failover needs
-        # three unreadable ticks in a row). dead → burned → dead → dead must
-        # not fail over: the burned tick in between broke the streak, and
-        # only the two trailing dead ticks count.
+        # three dead-verdict ticks in a row). dead → burned → dead → dead
+        # must not fail over: the burned tick in between broke the streak,
+        # and only the two trailing dead ticks count. "Dead" is the
+        # collector's verdict — a quarantined lineage with no parole probe
+        # pending — not a bare unreadable tick, which the pin now holds
+        # (CON-2340).
         h = _harness(temp_home, live=1)
-        dead = {"1": None, "2": _scoped_usage(10.0, 20.0), "3": _scoped_usage(10.0, 30.0)}
+        now = h.clock.now
+        dead = {
+            "1": UsageEntry(
+                sentinel=USAGE_RELOGIN_REQUIRED, auth_dead_strikes=1,
+                dead_token_fingerprint="sha256:dead", last_error="invalid_grant",
+            ),
+            "2": _entry_for(_scoped_usage(10.0, 20.0), now),
+            "3": _entry_for(_scoped_usage(10.0, 30.0), now),
+        }
         burned = {
             "1": _scoped_usage(5.0, 100.0),
             "2": _scoped_usage(10.0, 20.0),
             "3": _scoped_usage(10.0, 30.0),
         }
-        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(dead) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(burned) is TickOutcome.NO_ACTION
         assert "home-pinned" in _reasons(h)
-        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
-        assert h.tick_with_usage(dead) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(dead) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(dead) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         assert _switches(h) == []
         # The third consecutive dead tick still fails over (CON-1070 escape).
-        assert h.tick_with_usage(dead) is TickOutcome.SWITCHED
+        assert h.tick_with_entries(dead) is TickOutcome.SWITCHED
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
 

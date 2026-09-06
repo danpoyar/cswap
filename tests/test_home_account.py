@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_swap.autoswitch import (
+    IDLE_HOLD_MAX_S,
     ConfigWarningEvent,
     ErrorEvent,
     NoSwitchEvent,
@@ -30,7 +31,12 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
 )
-from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.usage_store import UsageEntry
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -83,6 +89,27 @@ def _switches(h: EngineHarness) -> list[SwitchEvent]:
     return [e for e in h.events if isinstance(e, SwitchEvent)]
 
 
+def _dead_entry(**overrides) -> UsageEntry:
+    """The collector's VERDICT that the live generation is dead: the row is
+    quarantined, the stamped lineage is the one in the live store, so no
+    parole probe is pending (CON-2340)."""
+    fields = dict(
+        sentinel=USAGE_RELOGIN_REQUIRED,
+        auth_dead_strikes=1,
+        dead_token_fingerprint="sha256:dead",
+        last_error="invalid_grant",
+    )
+    fields.update(overrides)
+    return UsageEntry(**fields)
+
+
+def _pending_entry(now: float) -> UsageEntry:
+    """Quarantined row, but a NEWER generation sits in the live store and
+    its parole probe did not run this tick (backoff, lease held elsewhere):
+    "re-login needed" to every consumer, a pending probe to the engine."""
+    return _dead_entry(parole_pending=True, backoff_until=now + 120.0)
+
+
 class TestHomePinHolds:
     def test_consume_first_never_leaves_home(self, temp_home):
         # The bug shape: home resets latest, a rotational slot resets soonest
@@ -122,18 +149,154 @@ class TestHomePinHolds:
         assert _reasons(h) == ["home-pinned"]
 
     def test_dead_home_token_still_fails_over(self, temp_home):
-        # The one escape: the home login cannot authenticate at all. Three
-        # unreadable ticks (the unhealthyTicks default) escalate to failover
-        # exactly as without a pin.
+        # The one escape: the home login cannot authenticate at all — the
+        # collector's VERDICT (quarantined lineage, and the live store holds
+        # that very generation, so no parole is pending). Three such ticks
+        # (the unhealthyTicks default) escalate to failover exactly as
+        # without a pin (ADR 0020 part 1).
         h = _harness(temp_home, live=1)
-        usage = {"1": None, "2": _usage(10), "3": _usage(10)}
-        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
-        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
-        outcome = h.tick_with_usage(usage)
+        now = h.clock.now
+        entries = {
+            "1": _dead_entry(),
+            "2": _entry_for(_usage(10), now),
+            "3": _entry_for(_usage(10), now),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        outcome = h.tick_with_entries(entries)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() != 1
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
+
+    def test_unknown_home_usage_is_not_a_dead_token(self, temp_home):
+        # CON-2340 (06-09, three cycles in 22 min): the fleet sensor seats a
+        # fresh copy of the home family, the daemon cannot read its usage for
+        # three ticks (probe paced, lease held elsewhere, no fresh data) and
+        # leaves by failover — one second later the parole probe reads the
+        # slot alive and the sensor returns it. Unknown is not dead: with no
+        # verdict on the credential the pin holds, at the normal cadence, so
+        # the probe keeps getting its chance.
+        h = _harness(temp_home, live=1)
+        usage = {"1": None, "2": _usage(10), "3": _usage(10)}
+        for _ in range(5):  # past unhealthyTicks (3)
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            h.clock.advance(30.0)
+        assert h.active_number() == 1
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+        last = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert "not a dead-token verdict" in last.detail
+        assert h.engine._unhealthy_ticks == 0
+        assert not h.engine._idle_hold_slow  # normal cadence, not the idle crawl
+
+    def test_pending_parole_probe_holds_the_pin_until_the_probe_reads(
+        self, temp_home
+    ):
+        # The exact live shape: the row is quarantined from an older
+        # generation, the live store holds a newer one, and the probe has not
+        # run yet. "re-login needed" to every dashboard — but the engine sees
+        # the pending probe and holds; when the probe reads, the pin is plain
+        # home-pinned again with a clean counter.
+        h = _harness(temp_home, live=1)
+        now = h.clock.now
+        pending = {
+            "1": _pending_entry(now),
+            "2": _entry_for(_usage(10), now),
+            "3": _entry_for(_usage(10), now),
+        }
+        for _ in range(3):
+            assert h.tick_with_entries(pending) is TickOutcome.NO_ACTION
+            h.clock.advance(30.0)
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+        assert "parole" in [e for e in h.events if isinstance(e, NoSwitchEvent)][-1].detail
+        h.events.clear()
+        assert h.tick_with_usage(
+            {"1": _usage(40), "2": _usage(10), "3": _usage(10)}
+        ) is TickOutcome.NO_ACTION
+        assert _reasons(h) == ["home-pinned"]
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_transient_fetch_error_at_home_holds(self, temp_home):
+        # A network cause (timeout) proves nothing about the token either
+        # way: hold, do not count.
+        h = _harness(temp_home, live=1)
+        now = h.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_error="timeout", backoff_until=now + 60.0,
+                consecutive_failures=1,
+            ),
+            "2": _entry_for(_usage(10), now),
+            "3": _entry_for(_usage(10), now),
+        }
+        for _ in range(4):
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+            h.clock.advance(30.0)
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_keychain_unavailable_at_home_holds(self, temp_home):
+        # The live store could not be READ — nothing says the tokens are
+        # gone (that is USAGE_NO_CREDENTIALS, a verdict).
+        h = _harness(temp_home, live=1)
+        usage = {"1": USAGE_KEYCHAIN_UNAVAILABLE, "2": _usage(10), "3": _usage(10)}
+        for _ in range(4):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            h.clock.advance(30.0)
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_unknown_hold_has_a_ceiling(self, temp_home):
+        # Bounded like the idle-hold: past IDLE_HOLD_MAX_S without any
+        # verdict the plain unhealthy counting resumes and the third
+        # counted tick escapes — a home nobody can read forever is not a
+        # home the login can live on.
+        h = _harness(temp_home, live=1)
+        usage = {"1": None, "2": _usage(10), "3": _usage(10)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        h.clock.advance(IDLE_HOLD_MAX_S + 1.0)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+        reasons = _reasons(h)
+        assert reasons[0] == "home-unknown-hold"
+        assert reasons[-1] == "active-usage-unknown"
+
+    def test_expired_and_unknown_share_one_ceiling(self, temp_home):
+        # The idle-hold (token expired, refresh deferred) and the unknown
+        # hold measure from the FIRST unreadable tick at home: alternating
+        # shapes must not stack two 30-minute ceilings.
+        h = _harness(temp_home, live=1)
+        expired = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(10)}
+        unknown = {"1": None, "2": _usage(10), "3": _usage(10)}
+        assert h.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        h.clock.advance(IDLE_HOLD_MAX_S / 2)
+        assert h.tick_with_usage(expired) is TickOutcome.NO_ACTION
+        assert _reasons(h)[-1] == "active-idle"
+        h.clock.advance(IDLE_HOLD_MAX_S / 2 + 1.0)
+        # Past the shared ceiling: both shapes count now.
+        assert h.tick_with_usage(expired) is TickOutcome.NO_ACTION
+        assert _reasons(h)[-1] == "active-usage-unknown"
+        assert h.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(unknown) is TickOutcome.SWITCHED
+
+    def test_readable_home_resets_the_unknown_clock(self, temp_home):
+        # One readable tick in between is proof of life: the ceiling restarts.
+        h = _harness(temp_home, live=1)
+        unknown = {"1": None, "2": _usage(10), "3": _usage(10)}
+        assert h.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        h.clock.advance(IDLE_HOLD_MAX_S - 10.0)
+        assert h.tick_with_usage(
+            {"1": _usage(40), "2": _usage(10), "3": _usage(10)}
+        ) is TickOutcome.NO_ACTION
+        h.clock.advance(20.0)
+        for _ in range(3):
+            assert h.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert not _switches(h)
 
     def test_rate_limited_gauge_is_not_a_dead_token(self, temp_home):
         # CON-2267 (05-09: three failovers off the pinned home in one
@@ -204,10 +367,11 @@ class TestHomePinHolds:
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
 
-    def test_lifted_429_backoff_counts_toward_failover(self, temp_home):
+    def test_lifted_429_backoff_is_unknown_not_dead(self, temp_home):
         # A stale http-429 whose honoured backoff has already lifted proves
-        # nothing about the token now: without a fresh 429 the plain
-        # unhealthy counting resumes and the third tick escapes.
+        # nothing about the token now — neither alive (the 429 branch) nor
+        # dead: it is the unknown hold (CON-2340), bounded by the ceiling,
+        # after which the plain counting escapes.
         h = _harness(temp_home, live=1)
         now = h.clock.now
         entries = {
@@ -218,17 +382,27 @@ class TestHomePinHolds:
             "2": _entry_for(_usage(10), now),
             "3": _entry_for(_usage(10), now),
         }
+        for _ in range(3):
+            assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+        h.clock.advance(IDLE_HOLD_MAX_S + 1.0)
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
         assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
 
     def test_rate_limited_ticks_do_not_count_toward_failover(self, temp_home):
-        # Two unreadable-without-cause ticks, then an hour of 429, then one
-        # more unreadable tick: the 429 ticks neither grow nor reset the
-        # unhealthy counter — the third plain unreadable tick still escapes.
+        # Two dead-verdict ticks, then an hour of 429, then one more dead
+        # tick: the 429 ticks neither grow nor reset the unhealthy counter —
+        # the third counted tick still escapes. (Before CON-2340 the counted
+        # shape was a bare unreadable tick; that is now the unknown hold.)
         h = _harness(temp_home, live=1)
         now = h.clock.now
-        plain = {"1": None, "2": _usage(10), "3": _usage(10)}
+        plain = {
+            "1": _dead_entry(),
+            "2": _entry_for(_usage(10), now),
+            "3": _entry_for(_usage(10), now),
+        }
         limited = {
             "1": UsageEntry(
                 last_error="http-429", backoff_until=now + 3600.0,
@@ -237,14 +411,130 @@ class TestHomePinHolds:
             "2": _entry_for(_usage(10), now),
             "3": _entry_for(_usage(10), now),
         }
-        assert h.tick_with_usage(plain) is TickOutcome.NO_ACTION
-        assert h.tick_with_usage(plain) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(plain) is TickOutcome.NO_ACTION
+        assert h.tick_with_entries(plain) is TickOutcome.NO_ACTION
         for _ in range(3):
             assert h.tick_with_entries(limited) is TickOutcome.NO_ACTION
         assert h.engine._unhealthy_ticks == 2
-        assert h.tick_with_usage(plain) is TickOutcome.SWITCHED
+        assert h.tick_with_entries(plain) is TickOutcome.SWITCHED
         (switch,) = _switches(h)
         assert switch.trigger == "failover"
+
+class TestHomeUnknownEndToEnd:
+    """The ticket's acceptance through the REAL collector (review r1: the
+    engine and the collector were proven apart; the seam between them is
+    where the hole was). Home active; the usage-store row is quarantined on
+    an older generation with the strike's backoff still live; the live store
+    holds a newer generation of the family."""
+
+    def _harness(self, temp_home, monkeypatch):
+        from claude_swap.usage_store import FetchRecord
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = _harness(temp_home, live=1)
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        old_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-old", "refreshToken": "rt-old",
+        }})
+        from claude_swap import oauth
+        identity = {"1": (HOME, "")}
+        # The strike that condemned the OLD generation, seconds ago: its
+        # failure backoff is live (the shape the sensor's return leaves).
+        h.switcher._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                credential_fingerprint=oauth.credential_fingerprint(old_gen),
+            )},
+            identity,
+        )
+        entry = h.switcher._usage_store.entries(identity)["1"]
+        assert entry.token_dead() and entry.in_backoff(h.clock.now)
+        return h
+
+    @staticmethod
+    def _candidates_ok(num, email, creds, is_active=False, persist_credentials=None):
+        from claude_swap import oauth
+        return oauth.UsageOutcome(_usage(40 if is_active else 10))
+
+    def test_new_generation_is_probed_in_the_same_tick_and_the_pin_holds(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ) as fetch:
+            outcome = h.engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert [c.args[0] for c in fetch.call_args_list].count("1") >= 1
+        assert not _switches(h)
+        assert _reasons(h) == ["home-pinned"]
+        assert not h.switcher._usage_store.entries({"1": (HOME, "")})["1"].token_dead()
+
+    def test_deferred_probe_holds_the_pin_through_three_ticks(
+        self, temp_home, monkeypatch
+    ):
+        # Form (2) of the ticket: the active-token refresh is deferred under
+        # the family's other copy's locks, pass after pass.
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(sentinel=USAGE_TOKEN_EXPIRED),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ):
+            for _ in range(4):
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(30.0)
+        assert not _switches(h)
+        assert h.active_number() == 1
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_transient_probe_holds_the_pin_through_three_ticks(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(error="refresh-failed"),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ):
+            for _ in range(4):
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(30.0)
+        assert not _switches(h)
+        assert set(_reasons(h)) == {"home-unknown-hold"}
+
+    def test_dead_new_generation_still_fails_over(self, temp_home, monkeypatch):
+        # The probe ran and the server condemned the new generation too:
+        # a verdict — three such ticks escape exactly as before.
+        from claude_swap import oauth
+        from claude_swap.usage_store import FetchRecord
+        h = self._harness(temp_home, monkeypatch)
+        live = (h.temp_home / ".claude" / ".credentials.json").read_text()
+        with patch.object(
+            h.switcher, "_fetch_active_usage",
+            return_value=FetchRecord(
+                error="invalid_grant",
+                credential_fingerprint=oauth.credential_fingerprint(live),
+            ),
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=self._candidates_ok,
+        ), patch.object(h.engine, "_session_quiet", return_value=(True, "")):
+            outcomes = []
+            for _ in range(3):
+                outcomes.append(h.engine.tick())
+                h.clock.advance(30.0)
+        assert outcomes[:2] == [TickOutcome.NO_ACTION, TickOutcome.NO_ACTION]
+        assert outcomes[2] is TickOutcome.SWITCHED
+        (switch,) = _switches(h)
+        assert switch.trigger == "failover"
+
 
 class TestReturnHome:
     def test_returns_as_soon_as_home_reads(self, temp_home):

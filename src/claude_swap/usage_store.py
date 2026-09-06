@@ -240,6 +240,15 @@ class UsageEntry:
     # successful usage read (or a credential rewrite via clear_dead_token) —
     # "fixed" may never be inferred, only measured.
     token_expired_at: float | None = None
+    # Collector overlay (never persisted, CON-2340): the row is quarantined,
+    # the candidate credential is a generation the quarantine did NOT condemn
+    # (parole-eligible), and the probe did not run this pass — paced by a
+    # backoff, beaten to the fetch lease, or outside the engine's fetch set.
+    # "re-login needed" to every dashboard, but to the auto engine the
+    # difference between "a newer generation awaits its probe" (unknown) and
+    # "the live generation IS the condemned one" (a verdict): the home pin
+    # holds on the former and fails over only on the latter.
+    parole_pending: bool = False
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -651,12 +660,14 @@ class UsageStore:
           due plans and stale impossible plans win, but valid future plans do
           not.
 
-        ``parole`` names quarantined slots granted a probe: only the
-        dead-strikes gate is skipped for them — the failure backoff still
-        paces retries, and the row itself stays untouched (only the probe's
-        outcome may move it; rationale at the collector,
-        ``_collect_usage_entries``). Claim fencing still applies: two
-        collectors can never double-probe.
+        ``parole`` names quarantined slots granted a probe: the dead-strikes
+        gate is skipped for them, and so is the backoff the strike itself
+        wrote (it paces the condemned generation, not the never-tried one —
+        CON-2340, see ``_row_eligible``); a backoff from the probe's own
+        transient failure still paces retries, and the row itself stays
+        untouched (only the probe's outcome may move it; rationale at the
+        collector, ``_collect_usage_entries``). Claim fencing still applies:
+        two collectors can never double-probe.
         """
         nums = list(nums)
         if not nums:
@@ -851,12 +862,33 @@ def _row_eligible(
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes; ``parole``
     skips the quarantine gate for the collector's probe — the failure
-    backoff still applies, so a transiently-failed probe stays paced)."""
-    if not parole and int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    backoff still applies, so a transiently-failed probe stays paced).
+
+    One backoff is exempt for a parole (CON-2340): the one the permanent-auth
+    strike itself wrote. That backoff paces the CONDEMNED generation, while
+    the parole probe fetches a different, never-tried one (eligibility
+    already proved the candidate differs from the stamped lineage). On the
+    live fleet the strike's backoff turned "fresh generation seated on the
+    home slot" into three unknown ticks and a failover, with the probe
+    running one second after the login had left. A backoff written by the
+    probe's own transient failure (``lastError`` not a permanent auth error)
+    still paces it — a flaky network must not re-POST the same grant every
+    pass — and a strike that could not name its lineage exempts nothing:
+    there is no named generation the candidate provably differs from.
+    """
+    strikes = int(row.get("authDeadStrikes") or 0)
+    if not parole and strikes >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
-        return False
+        strike_backoff = (
+            parole
+            and strikes >= AUTH_DEAD_STRIKES
+            and row.get("lastError") in PERMANENT_AUTH_ERRORS
+            and bool(row.get("deadTokenFingerprint"))
+        )
+        if not strike_backoff:
+            return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
         _num_or_none(row.get("lastAttemptAt")),

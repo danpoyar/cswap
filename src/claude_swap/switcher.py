@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import logging
 import os
 import re
@@ -90,6 +91,7 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -4547,6 +4549,7 @@ class ClaudeAccountSwitcher:
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
+        accepted_records: dict[str, FetchRecord] = {}
         if claims:
             pre = entries
             records = self._run_usage_fetches(
@@ -4583,10 +4586,35 @@ class ClaudeAccountSwitcher:
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
-        return {
-            num: with_sentinel(entries[num], sentinels.get(num))
-            for num in info_by_num
-        }
+        # A parole-eligible row without a VERDICT this pass reads "re-login
+        # needed" like any dead row — but says a probe is pending, so the
+        # auto engine's home pin can tell "a newer generation awaits its
+        # probe" from "the live generation is the condemned one" (CON-2340).
+        # No verdict: the probe did not run (paced, beaten to the lease,
+        # outside the fetch set), or it ran and ended without one — the
+        # locked refresh deferred (a sentinel), a transient POST/fetch
+        # failure (an error that is not a permanent auth error), or a record
+        # the store did not accept — leaving the row quarantined on the OLD
+        # lineage (review r1). A verdict is a permanent-auth outcome (the
+        # strike re-stamps the lineage) or a success (the quarantine lifts).
+        pending = paroled - set(claims)
+        for num in paroled & set(claims):
+            record = accepted_records.get(num)
+            if record is None:
+                pending.add(num)
+            elif record.error in PERMANENT_AUTH_ERRORS:
+                continue
+            elif record.error is None and record.sentinel is None:
+                continue
+            else:
+                pending.add(num)
+        out: dict[str, UsageEntry] = {}
+        for num in info_by_num:
+            entry = with_sentinel(entries[num], sentinels.get(num))
+            if num in pending and entry.token_dead():
+                entry = replace(entry, parole_pending=True)
+            out[num] = entry
+        return out
 
     def _plans_after_fetch(
         self,
