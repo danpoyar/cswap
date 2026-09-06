@@ -3,7 +3,7 @@
 создан: 2026-09-06 21:29 +0200 · сессия: fix-con-2420 · посадка: session:Yor
 
 ## Где стоп
-- Ревью р.2 (продолжение той же сессии): approve на head d681956, открытых Important нет; вердикт-файл валиден. Дальше: пуш вердикта → CI PR зелёный → мерж руками `gh pr merge 48 --squash` (без --auto, риск-зона) → `gh run watch` на main → деплой `bash scripts/deploy.sh main` → финал-коммент (черновик $CLAUDE_JOB_DIR/tmp/final.md) → перевести CON-2420 в Done дверью статусов → finals-inbox put + SendMessage Yor.
+- ГОТОВО: PR #48 слит (squash) 06-09 21:53 +0200, sha main 8a0a25c; CI main run 34056298915 зелёный; деплой scripts/deploy.sh main → DEPLOY-OK (receipt 1788724589); CON-2420 в Done (финал-коммент с Проверка/Ревью/Альтернативы/ДОКЛАД); сосед DAN-144 (тексты deferral у вызывающих). Преемнику делать нечего.
 
 ## Проверено
 - Проблема жива на HEAD ee24e95: except-ветка switcher.py:2098–2104 → `return None, None` (сажает сайдкар вслепую).
