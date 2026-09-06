@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import logging
 import os
 import re
@@ -4583,10 +4584,19 @@ class ClaudeAccountSwitcher:
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
-        return {
-            num: with_sentinel(entries[num], sentinels.get(num))
-            for num in info_by_num
-        }
+        # A parole-eligible row whose probe did not run this pass (paced,
+        # beaten to the lease, outside the fetch set) reads "re-login needed"
+        # like any dead row — but says a probe is pending, so the auto
+        # engine's home pin can tell "a newer generation awaits its probe"
+        # from "the live generation is the condemned one" (CON-2340).
+        pending = paroled - set(claims)
+        out: dict[str, UsageEntry] = {}
+        for num in info_by_num:
+            entry = with_sentinel(entries[num], sentinels.get(num))
+            if num in pending and entry.token_dead():
+                entry = replace(entry, parole_pending=True)
+            out[num] = entry
+        return out
 
     def _plans_after_fetch(
         self,

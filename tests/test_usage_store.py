@@ -818,20 +818,42 @@ class TestDeadTokenQuarantine:
         clock.advance(10_000)  # past any backoff: the strikes gate must refuse
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
 
-    def test_reserve_parole_overrides_strikes_but_respects_backoff(
+    def test_parole_of_a_new_generation_is_not_paced_by_the_strikes_backoff(
         self, store, clock
     ):
-        # The parole skips only the quarantine gate; the failure backoff still
-        # paces probes — a transient probe outcome writes a normal backoff,
-        # and without this gate a flaky network would re-POST the same
-        # new-generation grant on every collector pass.
+        # CON-2340: the backoff a permanent-auth strike writes paces the
+        # CONDEMNED generation. A parole probe fetches a DIFFERENT, never-tried
+        # generation (eligibility already proved the candidate differs from
+        # the stamped lineage), so the strike's own backoff must not delay it
+        # — on the live fleet it turned "fresh generation seated on the home
+        # slot" into three unknown ticks and a failover, with the probe
+        # running one second AFTER the login had left.
         self._strike(store)
-        assert store.reserve(["1"], IDENT, respect_plans=True, parole={"1"}) == {}
-        clock.advance(10_000)  # past the strike's backoff: the probe is due
         won = store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})
         assert set(won) == {"1"}
         # The stamp survives the reservation — only the probe's OUTCOME moves it.
         assert store.entries(IDENT)["1"].dead_token_fingerprint == "sha256:aaa"
+
+    def test_parole_still_waits_out_a_transient_probe_backoff(self, store, clock):
+        # The probe's own transient failure writes a normal backoff, and that
+        # one still paces the parole — without it a flaky network would re-POST
+        # the same new-generation grant on every collector pass.
+        self._strike(store)
+        store.record({"1": FetchRecord(error="refresh-failed")}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=True, parole={"1"}) == {}
+        clock.advance(10_000)  # past the transient backoff: the probe is due
+        won = store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})
+        assert set(won) == {"1"}
+        assert store.entries(IDENT)["1"].dead_token_fingerprint == "sha256:aaa"
+
+    def test_legacy_strike_without_fingerprint_keeps_the_backoff(self, store, clock):
+        # A strike that could not name its lineage exempts nothing: there is
+        # no named generation the candidate provably differs from, so the
+        # one legacy parole runs only when the row is due.
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=True, parole={"1"}) == {}
+        clock.advance(10_000)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True, parole={"1"})) == {"1"}
 
     def test_strike_without_fingerprint_overwrites_stale_one(self, store):
         # A strike that cannot name its credential must CLEAR the stamp, not

@@ -3879,6 +3879,76 @@ class TestDeadTokenQuarantine:
             record = switcher._fetch_account_usage(info)
         assert record.credential_fingerprint == "sha256:successor"
 
+    def test_new_generation_is_probed_under_the_strikes_backoff(self, temp_home):
+        # CON-2340 (live 06-09, three cycles in 22 min): the sensor seated a
+        # fresh generation of the home family into the live store while the
+        # row still carried the strike's backoff; the probe waited it out,
+        # the engine counted three unknown ticks and failed over, and the
+        # parole ran one second AFTER the login had left. The strike's own
+        # backoff paces the condemned generation, not a new one: the probe
+        # must run in the very pass the new generation appears.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
+        )
+        # NOT _expire_backoff: the strike's backoff is live.
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-new", "refreshToken": "rt-new",
+            "expiresAt": 32503680000000,
+        }})
+        info = [(2, "test@example.com", "Org", "", False, fresh, "")]
+        usage = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}}
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(usage),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        fetch.assert_called_once()
+        assert entries["2"].sentinel is None
+        assert entries["2"].last_good == usage
+        assert entries["2"].parole_pending is False
+
+    def test_eligible_parole_that_lost_the_claim_reads_as_pending(self, temp_home):
+        # A paroled row whose probe did NOT run this pass (another collector
+        # holds the fetch lease) still reads "re-login needed" to every
+        # consumer — but the entry says a probe is pending, so the auto
+        # engine can tell "a newer generation awaits its probe" (unknown)
+        # from "the live generation IS the condemned one" (a verdict).
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(
+            switcher,
+            fingerprint=oauth.credential_fingerprint(self._dead_creds("rt-old")),
+        )
+        self._expire_backoff(switcher)
+        identity = {"2": ("test@example.com", "")}
+        # Another collector wins the lease first.
+        assert switcher._usage_store.reserve(
+            ["2"], identity, respect_plans=True, parole={"2"}
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-new", "refreshToken": "rt-new",
+            "expiresAt": 32503680000000,
+        }})
+        info = [(2, "test@example.com", "Org", "", False, fresh, "")]
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            entries = switcher._collect_usage_entries(info)
+        fetch.assert_not_called()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].parole_pending is True
+
+        # The condemned generation itself earns no parole: no probe pending.
+        info_dead = [(2, "test@example.com", "Org", "", False, self._dead_creds("rt-old"), "")]
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch2:
+            entries = switcher._collect_usage_entries(info_dead)
+        fetch2.assert_not_called()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].parole_pending is False
+
     def test_transient_parole_probe_is_backoff_paced(self, temp_home):
         # CR2-F1 (round 2): a parole probe that dies TRANSIENTLY (network)
         # moves neither strikes nor stamp — the slot stays parole-eligible.

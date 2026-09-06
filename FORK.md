@@ -570,3 +570,30 @@ Quota (`~/projects/quota`) drives cswap under a written law — allowed
 commands, no writes to Anthropic ever, `remove` only with a clearance. See
 `~/projects/quota/CLAUDE.md`. Changes here must not widen what that app can
 do by accident.
+
+- Unknown is not dead at the pinned home (CON-2340, 2026-09-06). After the
+  fleet sensor returned the login home (`switch --even-if-live` seating a
+  fresh copy of the home family), the daemon could not read the home's usage
+  for three ticks — the usage-store row still carried an older generation's
+  `invalid_grant` strike, and the parole probe of the NEW generation waited
+  out that strike's failure backoff — counted them as a dead token and left
+  by failover; one second later the parole read the slot alive and the
+  sensor returned it (three return↔failover cycles in 22 minutes). Two
+  changes. (1) `UsageStore.reserve`: a parole probe is no longer paced by
+  the backoff the permanent-auth strike itself wrote (`lastError` in
+  `PERMANENT_AUTH_ERRORS` with a stamped lineage) — that backoff paces the
+  condemned generation, the probe fetches a different, never-tried one; a
+  backoff written by the probe's own transient failure still paces it, and
+  a strike that could not name its lineage exempts nothing. (2) The engine's
+  home pin now tells a VERDICT from no evidence when the home's usage is
+  unreadable: quarantined lineage with no probe pending, tokens gone from
+  the live store, or an auth cause on the last attempt still count toward
+  failover as before (ADR 0020: only a dead token moves the login); a
+  pending parole probe (additive read-model field `UsageEntry.parole_pending`,
+  set by the collector when an eligible probe did not run this pass), a
+  transient cause, an unreadable keychain or no fresh read hold the pin at
+  the normal cadence (`no-switch home-unknown-hold`, additive reason) for
+  at most `IDLE_HOLD_MAX_S` from the first unreadable tick — one ceiling
+  shared with the expired-token idle-hold — after which the plain counting
+  resumes. Away from home nothing changes. Fleet-shaped (the home pin is
+  fork-only); the parole/backoff split is worth offering upstream.

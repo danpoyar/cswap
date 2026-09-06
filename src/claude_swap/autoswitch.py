@@ -53,7 +53,12 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.park import ParkChannel, ParkSession, WaveResult
 from claude_swap.process_detection import pids_with_config_dir
 from claude_swap.session import session_dir_for
-from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -70,7 +75,11 @@ from claude_swap.settings import (
 )
 from claude_swap.adopt_snapshot import default_adopt_snapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -1170,6 +1179,12 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # Unknown-hold at the pinned home (CON-2340): the first tick the
+        # home's usage was unreadable WITHOUT a dead-token verdict. Survives
+        # across ticks (elapsed-time cap shared with the idle-hold); cleared
+        # by a readable tick, a rate-limited (alive by construction) tick,
+        # or the login leaving the home slot.
+        self._home_unknown_since: float | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1752,6 +1767,8 @@ class AutoSwitchEngine:
         # the plain rotation.
         home = self._home_slot(settings)
         pin_active = home is not None and not self._home_inert(home, quarantined)
+        if not pin_active or current != home:
+            self._home_unknown_since = None
         if pin_active:
             if current != home:
                 outcome = self._return_home(
@@ -1764,6 +1781,7 @@ class AutoSwitchEngine:
             elif active_headroom is not None:
                 self._unhealthy_ticks = 0
                 self._idle_hold_since = None
+                self._home_unknown_since = None
                 burned = self._model_window_burned(
                     usage.get(current), threshold=settings.threshold
                 )
@@ -1805,6 +1823,7 @@ class AutoSwitchEngine:
                 # sentinel verdict on the credentials themselves (review r1:
                 # a stale http-429 on the row survives sentinel passes).
                 self._idle_hold_since = None
+                self._home_unknown_since = None
                 lifts = (entries[current].backoff_until or 0) - self.clock()
                 self._emit(
                     NoSwitchEvent(
@@ -1819,6 +1838,65 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
+            elif not self._home_dead_verdict(
+                entries.get(current), usage.get(current)
+            ):
+                # CON-2340 (06-09: three return↔failover cycles in 22 min):
+                # the home's usage is unreadable but NO verdict says its
+                # live credential is dead — no fresh read this tick (the
+                # lease held by another collector, a transient cause in
+                # backoff), a quarantined row whose NEWER live generation
+                # still awaits its parole probe, an unreadable keychain, or
+                # an expired token whose locked refresh was deferred. The
+                # sensor had just seated a fresh copy of the home family;
+                # three such ticks counted as "dead" drove failover, and the
+                # parole probe read the slot alive one second AFTER the
+                # login had left — then the sensor returned it, and so on.
+                # Unknown is not dead: hold the pin at the normal cadence
+                # (each tick is another chance for the probe or the
+                # refresh), bounded like the idle-hold — past IDLE_HOLD_MAX_S
+                # from the FIRST unreadable tick the plain counting resumes,
+                # so a home nobody can ever read still escapes. A dead
+                # verdict (quarantined lineage with no probe pending, tokens
+                # gone from the live store, an auth cause on the last
+                # attempt) skips this branch and counts as before (ADR 0020
+                # part 1: only a dead token moves the login).
+                now = self.clock()
+                if self._home_unknown_since is None:
+                    self._home_unknown_since = now
+                held = now - self._home_unknown_since
+                value = usage.get(current)
+                if value == USAGE_TOKEN_EXPIRED:
+                    # The idle-hold below owns the expired shape (slow
+                    # crawl); start its clock at the first unreadable tick
+                    # so the two holds share one ceiling instead of
+                    # stacking two.
+                    if self._idle_hold_since is None:
+                        self._idle_hold_since = self._home_unknown_since
+                elif held <= IDLE_HOLD_MAX_S:
+                    self._idle_hold_since = None
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="home-unknown-hold",
+                            detail=(
+                                f"the live login rests on Account-{home}; "
+                                "its usage is unknown ("
+                                + self._home_unknown_cause(
+                                    entries.get(current), value
+                                )
+                                + ") — not a dead-token verdict, so the pin "
+                                f"holds (unreadable for {int(held)} s of "
+                                f"{int(IDLE_HOLD_MAX_S)} s; CON-2340)"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                else:
+                    _logger.warning(
+                        "Home Account-%s unreadable for over %.0f minutes "
+                        "without a dead-token verdict; resuming unhealthy "
+                        "counting", home, IDLE_HOLD_MAX_S / 60,
+                    )
 
         early = False
         if active_headroom is not None:
@@ -2957,6 +3035,46 @@ class AutoSwitchEngine:
             return
         self._home_warned = key
         self._emit(ConfigWarningEvent(message=message))
+
+    @staticmethod
+    def _home_dead_verdict(entry, value) -> bool:
+        """Whether an unreadable home slot carries a VERDICT that its live
+        credential is dead — as opposed to no evidence (CON-2340).
+
+        Verdicts: the collector's "re-login needed" for a quarantined lineage
+        with NO parole probe pending (the live generation is the condemned
+        one; a pending probe means a newer generation is waiting its turn),
+        "no credentials" (the tokens are gone from the live store — Claude
+        Code's own invalid_grant wipe leaves exactly that; review r1 of
+        CON-2267: a sentinel on the credentials themselves wins), or an auth
+        cause on the last attempt (``http-401``, ``invalid_grant``,
+        ``no_refresh_token``). Everything else — token expired (the idle-hold
+        owns it), keychain unreadable, a transient cause, no fresh read —
+        is unknown.
+        """
+        if value == USAGE_NO_CREDENTIALS:
+            return True
+        if value == USAGE_RELOGIN_REQUIRED:
+            return not getattr(entry, "parole_pending", False)
+        if entry is None or getattr(entry, "sentinel", None) is not None:
+            return False
+        last_error = getattr(entry, "last_error", None)
+        return last_error == "http-401" or last_error in PERMANENT_AUTH_ERRORS
+
+    @staticmethod
+    def _home_unknown_cause(entry, value) -> str:
+        """One clause naming why the home's usage is unknown, for the log."""
+        if value == USAGE_RELOGIN_REQUIRED:
+            return (
+                "quarantined lineage, a newer credential generation awaits "
+                "its parole probe"
+            )
+        if isinstance(value, str):
+            return value
+        last_error = getattr(entry, "last_error", None) if entry else None
+        if last_error:
+            return f"last fetch error {last_error}"
+        return "no fresh usage read this tick"
 
     @staticmethod
     def _gauge_rate_limited(entry, now: float) -> bool:
