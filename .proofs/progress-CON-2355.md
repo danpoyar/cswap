@@ -3,7 +3,7 @@
 создан: 2026-09-06 14:18 +0200 · сессия: fix-con-2355 · посадка: session:Yor
 
 ## Где стоп
-- Ревью р.1 (code-reviewer effort max, sid 85a6af0a-…): «можно принимать», Important 0, 2 Minor вне объёма → отдельные тикеты (stale-marker ветка над бэкапом ""; проход коллектора над нечитаемым профилем). Вердикт .proofs/review-verdict-fix-con-2355.json. Дальше: пуш вердикта → CI PR #45 → мерж руками (squash) → CI main → деплой scripts/deploy.sh main → перевести CON-2355 в Done дверью статусов.
+- ГОТОВО: PR #45 слит (3fb9e1c), CI main зелёный (run 34034340578), деплой DEPLOY-OK, CON-2355 переведён в Done финал-комментом 06-09 ~14:57; находки ревью → CON-2374, CON-2375. Преемнику делать нечего.
 
 ## Проверено
 - Красная проба: tests/test_bootstrap_family_guard.py::TestPendingProfileSpillOverUnreadableProfile::test_unreadable_profile_with_pending_profile_spill_refuses_and_lands_nothing → «DID NOT RAISE SessionError», post_spy=[at-spilled] (коммент в тикете 06-09 ~14:40).
