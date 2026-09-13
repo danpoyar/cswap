@@ -33,6 +33,72 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
 
+# Plain-language notes keyed by ``usageStatus`` (CON-2639). One table for every
+# surface — the human ``list`` renderer, the menu bar and the JSON projection
+# (``usageStatusText``) — so a state is described identically everywhere, and
+# an operator never has to decode a status token to learn what to do.
+STATUS_NOTES = {
+    "token_expired": "token expired — refresh with: cswap refresh",
+    "api_key": "API key (no quota)",
+    "keychain_unavailable": "keychain unavailable — locked or in use; try again",
+    "relogin_required": "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    "no_credentials": "no credentials stored for this slot — run: cswap add",
+}
+
+# Plain-language notes for the fetch-error kinds ``oauth._classify_usage_error``
+# yields (``http-NNN`` / ``timeout`` / ``network`` / ``bad-response`` / an
+# exception type name). The kind stays beside the note for logs, scripts and
+# grep; the note says what happened and what to do. HTTP meanings follow the
+# API error table (https://docs.claude.com/en/api/errors). ``http-429`` on the
+# usage gauge is the endpoint's per-token polling budget (see poll_policy), not
+# the account's own window — its note must never read as "limit reached".
+FETCH_ERROR_NOTES = {
+    "http-401": "token rejected (expired or revoked) — re-login needed",
+    "http-402": "billing problem — subscription unpaid",
+    "http-403": "access denied — organization disabled Claude Code or no permission",
+    "http-404": "usage endpoint not found — update cswap",
+    "http-429": "usage gauge rate-limited (too many polls) — cswap backs off and retries",
+    "http-529": "Anthropic overloaded — retrying",
+    "timeout": "Anthropic did not answer in time — retrying",
+    "network": "network problem — retrying",
+    "bad-response": "unexpected reply from Anthropic — retrying",
+}
+
+
+def explain_fetch_error(kind: str | None) -> str | None:
+    """Plain-language note for a fetch-error kind, ``None`` for no error.
+
+    Unknown kinds still get a sentence: HTTP 5xx is a server-side failure
+    (retried), any other HTTP status is a rejected request, and a bare
+    exception name is a failed fetch — the kind is quoted so the log can be
+    searched for it.
+    """
+    if not kind:
+        return None
+    note = FETCH_ERROR_NOTES.get(kind)
+    if note:
+        return note
+    if kind.startswith("http-5"):
+        return f"Anthropic server error ({kind}) — retrying"
+    if kind.startswith("http-"):
+        return f"request rejected by Anthropic ({kind}) — see claude-swap.log"
+    return f"usage fetch failed ({kind}) — see claude-swap.log"
+
+
+def status_note(status: str, last_error: str | None, consecutive_failures: int) -> str | None:
+    """``usageStatusText`` for a non-``ok`` status: the sentinel's note, or for
+    ``unavailable`` the reason the measurement is missing (the open failure
+    streak's note, else "no successful measurement yet")."""
+    if status == "ok":
+        return None
+    note = STATUS_NOTES.get(status)
+    if note:
+        return note
+    if status == "unavailable":
+        why = explain_fetch_error(last_error) if consecutive_failures > 0 else None
+        return "usage unavailable — " + (why or "no successful measurement yet")
+    return None
+
 
 def _iso_utc(ts: float) -> str:
     """Epoch seconds → ISO-8601 UTC with a ``Z`` suffix (the schema-wide
@@ -198,7 +264,8 @@ def last_good_usage_fields(
 
 def fetch_failure_fields(last_error: str | None, consecutive_failures: int) -> dict:
     """Why a slot's measurement stopped moving, when it is a failure rather
-    than the scheduler's own cadence.
+    than the scheduler's own cadence — the kind plus its plain-language note
+    (``lastErrorText``, CON-2639).
 
     Without it a consumer cannot tell a deliberately parked account (at its
     limit, next poll scheduled for the reset) from one whose token died hours
@@ -208,7 +275,11 @@ def fetch_failure_fields(last_error: str | None, consecutive_failures: int) -> d
     """
     if not last_error or consecutive_failures <= 0:
         return {}
-    return {"lastError": last_error, "consecutiveFailures": consecutive_failures}
+    return {
+        "lastError": last_error,
+        "lastErrorText": explain_fetch_error(last_error),
+        "consecutiveFailures": consecutive_failures,
+    }
 
 
 def account_row(
@@ -242,6 +313,12 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    # Additive (CON-2639): the plain-language note for a non-ok status, so a
+    # dashboard prints "token expired — refresh with: cswap refresh" instead of
+    # the bare status token. Absent on ok rows.
+    text = status_note(status, last_error, consecutive_failures)
+    if text is not None:
+        row["usageStatusText"] = text
     # Additive: when the expired state was first measured (CON-1024), so a
     # dashboard can render "Token expired · <age>" instead of guessing.
     if status == "token_expired" and token_expired_at is not None:

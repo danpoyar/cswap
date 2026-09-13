@@ -32,7 +32,9 @@ from claude_swap.switcher import (
     ClaudeAccountSwitcher,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
+    SENTINEL_NOTES,
     _format_usage_lines,
+    _usage_entry_lines,
 )
 
 
@@ -6300,7 +6302,7 @@ class TestFormatUsageLines:
         fable = lines[2]
         assert fable.startswith("Fable:")
         assert "100%" in fable
-        assert fable.rstrip().endswith("(!)")  # at/over limit marker
+        assert fable.rstrip().endswith("(!) limit reached")  # at/over limit, in words (CON-2639)
 
     def test_scoped_under_limit_has_no_marker(self):
         usage = {"scoped": [{"name": "Fable", "pct": 40.0, "clock": "21:59", "countdown": "3h"}]}
@@ -6315,7 +6317,7 @@ class TestFormatUsageLines:
     def test_scoped_without_clock_renders_pct_only(self):
         usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
         lines = _format_usage_lines(usage)
-        assert lines == ["Fable: 100%  (!)"]
+        assert lines == ["Fable: 100%  (!) limit reached"]
 
     def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
         # A measurement served from the store hours after its fetch still
@@ -8973,3 +8975,43 @@ class TestLiveSessionSharesLoginJudge:
             encoding="utf-8",
         )
         assert self._judge(s) is True
+
+
+class TestUsageEntryLinesPlainLanguage:
+    """CON-2639: `cswap list` shows the plain-language note beside a failure
+    code instead of the bare code — an operator does not decode ``http-429``,
+    and a gauge rate-limit must not read as the account's own limit."""
+
+    def test_no_measurement_shows_note_beside_code(self):
+        entry = UsageEntry(last_error="http-429", consecutive_failures=4)
+        text = "\n".join(_usage_entry_lines(entry))
+        assert "usage unavailable — usage gauge rate-limited" in text
+        assert "(http-429)" in text
+
+    def test_no_measurement_without_error_stays_short(self):
+        assert _usage_entry_lines(UsageEntry()) == ["usage unavailable"]
+
+    def test_last_good_with_open_streak_adds_gauge_line(self):
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}}, fetched_at=time.time(), age_s=5.0,
+            last_error="http-429", consecutive_failures=4,
+        )
+        lines = _usage_entry_lines(entry)
+        assert len(lines) == 2
+        assert lines[0].startswith("├ 5h:")
+        assert lines[-1].startswith("└ gauge: usage gauge rate-limited")
+        assert lines[-1].endswith("(http-429)")
+
+    def test_last_good_without_streak_has_no_gauge_line(self):
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}}, fetched_at=time.time(), age_s=5.0,
+            last_error="http-429", consecutive_failures=0,
+        )
+        lines = _usage_entry_lines(entry)
+        assert len(lines) == 1
+        assert lines[0].startswith("└ 5h:")
+        assert "gauge:" not in lines[0]
+
+    def test_sentinel_note_unchanged(self):
+        lines = _usage_entry_lines(UsageEntry(sentinel=USAGE_TOKEN_EXPIRED))
+        assert lines[0] == SENTINEL_NOTES[USAGE_TOKEN_EXPIRED]

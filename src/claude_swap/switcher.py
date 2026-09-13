@@ -29,6 +29,7 @@ from claude_swap import oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    STATUS_NOTES,
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
@@ -36,6 +37,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
     account_ref,
     account_row,
+    explain_fetch_error,
     last_good_usage_fields,
     usage_fields,
     usage_freshness_fields,
@@ -160,7 +162,8 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
-        marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
+        # In words, not a bare glyph (CON-2639): the operator reads "limit reached".
+        marker = "  (!) limit reached" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
@@ -175,11 +178,13 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # Public: the TUI renders the same wording so both surfaces describe a state
 # identically (e.g. owned-and-expired means Claude Code will refresh, not that
 # the user must re-login).
+# Wording lives in ``json_output.STATUS_NOTES`` (keyed by ``usageStatus``) so the
+# JSON projection's ``usageStatusText`` and this renderer cannot drift apart.
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — refresh with: cswap refresh",
-    USAGE_API_KEY: "API key (no quota)",
-    USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    USAGE_TOKEN_EXPIRED: STATUS_NOTES["token_expired"],
+    USAGE_API_KEY: STATUS_NOTES["api_key"],
+    USAGE_KEYCHAIN_UNAVAILABLE: STATUS_NOTES["keychain_unavailable"],
+    USAGE_RELOGIN_REQUIRED: STATUS_NOTES["relogin_required"],
 }
 
 
@@ -224,13 +229,18 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             and entry.fetched_at is not None
         ):
             lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        # An open failure streak behind served last-good numbers is otherwise
+        # invisible here (only the JSON carried it): say what is failing and
+        # what it means, code beside the note (CON-2639).
+        if entry.last_error and entry.consecutive_failures > 0:
+            lines.append(f"gauge: {explain_fetch_error(entry.last_error)} ({entry.last_error})")
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
         ]
     detail = "usage unavailable"
     if entry.last_error:
-        detail += f" ({entry.last_error})"
+        detail += f" — {explain_fetch_error(entry.last_error)} ({entry.last_error})"
     return [dimmed(detail)]
 
 

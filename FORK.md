@@ -675,3 +675,12 @@ Quota (`~/projects/quota`) drives cswap under a written law — allowed
 commands, no writes to Anthropic ever, `remove` only with a clearance. See
 `~/projects/quota/CLAUDE.md`. Changes here must not widen what that app can
 do by accident.
+
+- Plain-language notes beside failure codes (CON-2639): `json_output.STATUS_NOTES`
+  / `FETCH_ERROR_NOTES` + `explain_fetch_error()` are the one wording table for
+  `cswap list` (the human renderer and the additive JSON fields `usageStatusText`
+  / `lastErrorText`); `list` prints `usage unavailable — <note> (http-429)`, a
+  `gauge: <note> (<kind>)` line under served last-good numbers while a failure
+  streak is open, and `(!) limit reached` on a maxed per-model window. `http-429`
+  on the usage gauge is the endpoint's polling budget, so its note never reads as
+  the account's own limit. Worth sending upstream.

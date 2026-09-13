@@ -13,8 +13,15 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    STATUS_NOTES,
+    USAGE_API_KEY,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
     account_row,
     error_envelope,
+    explain_fetch_error,
     usage_fields,
     usage_to_json,
 )
@@ -777,3 +784,84 @@ class TestListPayloadNextPoll:
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["nextPollAt"] == "2023-11-14T22:13:20Z"
         assert "nextPollAt" not in by_num[2]
+
+
+class TestPlainLanguageNotes:
+    """CON-2639: every failure code carries a plain-language note beside it.
+
+    The code (``http-429``) stays for logs, scripts and grep; the note says
+    what happened and what to do, so an operator reading ``--list`` output or
+    a dashboard built on it never has to decode an HTTP status. ``http-429``
+    on the usage gauge is the polling budget of the endpoint, not the
+    account's own window — the note must not read as "limit reached".
+    """
+
+    def test_known_kinds_have_actionable_notes(self):
+        assert "rate-limited" in explain_fetch_error("http-429")
+        assert "retries" in explain_fetch_error("http-429")
+        assert "limit reached" not in explain_fetch_error("http-429")
+        assert "organization" in explain_fetch_error("http-403")
+        assert "billing" in explain_fetch_error("http-402")
+        assert "re-login" in explain_fetch_error("http-401")
+        assert "retrying" in explain_fetch_error("timeout")
+        assert "retrying" in explain_fetch_error("network")
+        assert "retrying" in explain_fetch_error("bad-response")
+
+    def test_unknown_kinds_fall_back_by_family(self):
+        assert "server error" in explain_fetch_error("http-503")
+        assert "overloaded" in explain_fetch_error("http-529")
+        assert "server error" in explain_fetch_error("http-500")
+        assert "http-418" in explain_fetch_error("http-418")
+        assert "ValueError" in explain_fetch_error("ValueError")
+        assert explain_fetch_error(None) is None
+        assert explain_fetch_error("") is None
+
+    def test_row_carries_last_error_text_beside_the_code(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="http-429", consecutive_failures=3,
+        )
+        assert row["lastError"] == "http-429"
+        assert row["lastErrorText"] == explain_fetch_error("http-429")
+        assert row["usageStatus"] == "unavailable"
+        assert row["usageStatusText"].startswith("usage unavailable — ")
+        assert explain_fetch_error("http-429") in row["usageStatusText"]
+
+    def test_no_streak_no_text(self):
+        row = account_row(
+            1, "a@example.com", "", "", False, None,
+            last_error="http-429", consecutive_failures=0,
+        )
+        assert "lastErrorText" not in row
+        assert row["usageStatusText"] == "usage unavailable — no successful measurement yet"
+
+    def test_sentinel_statuses_carry_their_note(self):
+        for sentinel, status in (
+            (USAGE_TOKEN_EXPIRED, "token_expired"),
+            (USAGE_API_KEY, "api_key"),
+            (USAGE_KEYCHAIN_UNAVAILABLE, "keychain_unavailable"),
+            (USAGE_RELOGIN_REQUIRED, "relogin_required"),
+            (USAGE_NO_CREDENTIALS, "no_credentials"),
+        ):
+            row = account_row(1, "a@example.com", "", "", False, sentinel)
+            assert row["usageStatus"] == status
+            assert row["usageStatusText"] == STATUS_NOTES[status]
+
+    def test_ok_row_has_no_status_text(self):
+        row = account_row(
+            3, "c@example.com", "", "", False, {"five_hour": {"pct": 10.0}},
+            usage_fetched_at=1700000000.0, usage_age_s=12.0,
+        )
+        assert row["usageStatus"] == "ok"
+        assert "usageStatusText" not in row
+        assert "lastErrorText" not in row
+
+    def test_ok_row_failing_now_carries_error_text_only(self):
+        row = account_row(
+            3, "c@example.com", "", "", False, {"five_hour": {"pct": 10.0}},
+            usage_fetched_at=1700000000.0, usage_age_s=12.0,
+            last_error="timeout", consecutive_failures=2,
+        )
+        assert row["usageStatus"] == "ok"
+        assert "usageStatusText" not in row
+        assert row["lastErrorText"] == explain_fetch_error("timeout")
