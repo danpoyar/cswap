@@ -504,6 +504,56 @@ class TestRefreshWithoutLanding:
         assert report.outcome == LIVE_SESSION
         post.assert_not_called()
 
+    def test_refresh_reseeds_idle_revoked_shape_profile_from_backup(
+        self, temp_home
+    ):
+        # No process behind the profile any more (the zombie was reaped),
+        # the cleared shape is still there: the backup is the only family —
+        # refresh it and reseed the profile bootstrap-shaped; the old verdict
+        # "no refresh token → relogin-required" condemned a live re-login.
+        from claude_swap.refresh import REFRESHED, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-readded", refresh="rt-readded")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "expiresAt": 0}}),
+            encoding="utf-8",
+        )
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(_creds(access="at-old", refresh="rt-old"))
+            or "",
+            encoding="utf-8",
+        )
+        rotated = self._rotated()
+
+        with (
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
+            ) as post,
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(USAGE),
+            ),
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == REFRESHED
+        assert "revoked shape" in (report.detail or "")
+        post.assert_called_once()
+        assert post.call_args.args[0] == backup
+        assert switcher.read_account_credentials(NUM, EMAIL) == rotated
+        # Reseeded bootstrap-shaped: plaintext seed = the refreshed generation.
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == rotated
+        assert (session_dir / SEED_FINGERPRINT_FILE).read_text(
+            encoding="utf-8"
+        ) == oauth.credential_fingerprint(rotated)
+
     def test_refresh_keeps_seed_guard_under_credentialless_live_profile(
         self, temp_home
     ):

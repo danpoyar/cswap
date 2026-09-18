@@ -331,10 +331,22 @@ def _refresh_resolved(
                     return out(LIVE_SESSION)
 
             profile_creds = None
+            revoked_profile = False
             if profile_owned and live_orphan is None:
                 profile_creds, err = _read_profile_credentials(session_dir)
                 if profile_creds is None and err is not None:
                     return out(DEFERRED, err)
+                if profile_creds is not None and not _holds_login_family(
+                    profile_creds
+                ):
+                    # The same cleared shape with no process behind it: the
+                    # profile holds no family, the backup is the slot's only
+                    # generation. Refresh it and reseed the profile below,
+                    # exactly as a fresh bootstrap would — judging the shape
+                    # as "no refresh token → relogin-required" condemned a
+                    # slot whose re-added backup was alive.
+                    profile_creds = None
+                    revoked_profile = True
 
             token_profile = False
             if profile_creds is not None and is_inference_token_credentials(
@@ -370,6 +382,11 @@ def _refresh_resolved(
                     return out(NO_CREDENTIALS)
                 seed = read_seed_fingerprint(session_dir)
                 if seed and seed == credential_fingerprint(backup):
+                    if revoked_profile or (live_orphan and "revoked shape" in live_orphan):
+                        # The profile's family died (cleared shape) and this
+                        # backup is its consumed seed: nothing alive to POST —
+                        # only a human re-login helps (unchanged verdict).
+                        return out(RELOGIN_REQUIRED, "no refresh token")
                     # The profile's family is the slot's newest generation but
                     # is unreadable/absent while its seed (= this backup) is a
                     # consumed grant — POSTing it is the account-death shape.
@@ -455,7 +472,16 @@ def _refresh_resolved(
             # A successful rotation is proof the lineage is alive: lift any
             # stale quarantine state the same way a re-login does.
             switcher._usage_store.clear_dead_token([account_num], identity)
-            return out(REFRESHED, live_orphan)
+            return out(
+                REFRESHED,
+                live_orphan
+                or (
+                    "profile held a revoked shape (no refresh token); "
+                    "reseeded from the refreshed backup"
+                    if revoked_profile
+                    else None
+                ),
+            )
     except LockError:
         # Covers ClaudeCodeLockTimeout too (a live claude mid-refresh on
         # this profile): the credential is being handled — never steal.
