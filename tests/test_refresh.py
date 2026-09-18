@@ -379,6 +379,188 @@ class TestRefreshWithoutLanding:
         assert report.outcome == "live-session"
         post.assert_not_called()
 
+    def test_refresh_heals_backup_under_credentialless_live_profile(
+        self, temp_home
+    ):
+        # CON-3156 (slot 35, 17/18-09): a claude process still runs against
+        # the profile (bg-pty-host of a session whose login expired), but the
+        # profile holds NO credential at all — neither a Keychain entry nor a
+        # plaintext seed (``cswap add`` after the re-login invalidated it).
+        # Such a process owns no token family: the backup is the slot's only
+        # generation and must be refreshed, or the slot stays dead behind a
+        # ``live-session`` verdict forever (the healer waits for a healthy
+        # gauge that this very verdict prevents).
+        from claude_swap.refresh import REFRESHED, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-readded", refresh="rt-readded")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        # The seed stamp names the generation the dead session was born
+        # from — an OLDER family than the re-added backup.
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(_creds(access="at-old", refresh="rt-old"))
+            or "",
+            encoding="utf-8",
+        )
+        rotated = self._rotated()
+
+        with (
+            patch.object(switcher, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
+            ) as post,
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(USAGE),
+            ),
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == REFRESHED
+        assert "4242" in (report.detail or "")
+        post.assert_called_once()
+        assert post.call_args.args[0] == backup
+        assert switcher.read_account_credentials(NUM, EMAIL) == rotated
+        # The live process keeps its (empty) profile: no reseed under it.
+        assert not (session_dir / ".credentials.json").exists()
+
+    def test_refresh_heals_backup_under_revoked_shape_live_profile(
+        self, temp_home
+    ):
+        # Slot 35 (18-09) exactly: the profile's entry EXISTS but holds the
+        # cleared shape Claude Code leaves behind an expired login (no
+        # refresh token, expiresAt 0) — `list --token-status` calls it
+        # profile "missing"; the refresh must agree and heal the backup.
+        from claude_swap.refresh import REFRESHED, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-readded", refresh="rt-readded")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "expiresAt": 0}}),
+            encoding="utf-8",
+        )
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(_creds(access="at-old", refresh="rt-old"))
+            or "",
+            encoding="utf-8",
+        )
+        rotated = self._rotated()
+
+        with (
+            patch.object(switcher, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials",
+                return_value=oauth.RefreshOutcome(rotated, None),
+            ) as post,
+            patch(
+                "claude_swap.oauth.try_fetch_usage_for_account",
+                return_value=oauth.UsageOutcome(USAGE),
+            ),
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == REFRESHED
+        assert "revoked shape" in (report.detail or "")
+        post.assert_called_once()
+        assert post.call_args.args[0] == backup
+        assert switcher.read_account_credentials(NUM, EMAIL) == rotated
+        # The cleared shape stays where the live process left it.
+        assert json.loads(
+            (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        ) == {"claudeAiOauth": {"accessToken": "", "expiresAt": 0}}
+
+    def test_refresh_keeps_live_session_verdict_for_token_profile(
+        self, temp_home
+    ):
+        # A profile running on the attached inference token (CON-1329)
+        # holds no family by design — but the process IS legitimately live
+        # on it: unchanged ``live-session`` verdict, nothing POSTed.
+        from claude_swap.refresh import LIVE_SESSION, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-login", refresh="rt-login")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-tok"}}),
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(switcher, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials"
+            ) as post,
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == LIVE_SESSION
+        post.assert_not_called()
+
+    def test_refresh_keeps_seed_guard_under_credentialless_live_profile(
+        self, temp_home
+    ):
+        # Same shape, but the backup IS the generation that seeded the
+        # profile: the process may hold its rotated successor in memory
+        # only — POSTing the seed is the account-death shape. Still deferred.
+        from claude_swap.refresh import DEFERRED, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-seed", refresh="rt-seed")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+        (session_dir / SEED_FINGERPRINT_FILE).write_text(
+            oauth.credential_fingerprint(backup) or "", encoding="utf-8"
+        )
+
+        with (
+            patch.object(switcher, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials"
+            ) as post,
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == DEFERRED
+        post.assert_not_called()
+
+    def test_refresh_defers_to_live_session_when_profile_unreadable(
+        self, temp_home
+    ):
+        # A Keychain entry that EXISTS but cannot be read is still the
+        # process's family (a consumed predecessor may sit below it): the
+        # live process owns it — unchanged ``live-session`` verdict.
+        from claude_swap.refresh import LIVE_SESSION, refresh_account
+
+        switcher = _make_switcher()
+        backup = _creds(access="at-readded", refresh="rt-readded")
+        switcher.write_account_credentials(NUM, EMAIL, backup)
+        session_dir = switcher._session_dir(NUM, EMAIL)
+        session_dir.mkdir(parents=True)
+
+        with (
+            patch.object(switcher, "_live_session_pids", return_value=[4242]),
+            patch(
+                "claude_swap.refresh._read_profile_credentials",
+                return_value=(None, "keychain entry unreadable"),
+            ),
+            patch(
+                "claude_swap.refresh.try_refresh_oauth_credentials"
+            ) as post,
+        ):
+            report = refresh_account(switcher, NUM)
+
+        assert report.outcome == LIVE_SESSION
+        post.assert_not_called()
+
     def test_refresh_respects_quarantine(self, temp_home):
         # A lineage the store already condemned (invalid_grant strike) must
         # not be re-POSTed — same parole rule as the collector.

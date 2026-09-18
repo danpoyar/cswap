@@ -121,6 +121,18 @@ def _read_profile_credentials(
     return read_profile_generation(session_dir)
 
 
+def _holds_login_family(credentials: str) -> bool:
+    """Whether a profile credential carries a LOGIN family a live claude can
+    rotate: an access token plus a refresh token. A cleared shape (Claude
+    Code's leftover after "could not be refreshed") and the attached
+    inference token (CON-1329, no family by design) do not — the inference
+    token keeps its own verdict (the process is legitimately live on it)."""
+    if is_inference_token_credentials(credentials):
+        return True
+    data = extract_oauth_data(credentials) or {}
+    return bool(data.get("accessToken")) and bool(data.get("refreshToken"))
+
+
 def _reseed_profile(session_dir: Path, credentials: str) -> None:
     """Persist a refreshed generation into the profile, bootstrap-shaped:
     stale keychain entry deleted (it would shadow the plaintext), plaintext
@@ -278,14 +290,48 @@ def _refresh_resolved(
             # Re-checked under the lock: a `cswap run` bootstrap racing us
             # holds the same lock, so a session that appears later than this
             # check will find the profile already reseeded — never half-written.
-            if switcher._live_session_pids(account_num, email):
-                return out(LIVE_SESSION)
-
-            profile_creds = None
             profile_owned = session_dir.is_dir() and not session_identity_drifted(
                 session_dir, email, org_uuid
             )
-            if profile_owned:
+            live_pids = switcher._live_session_pids(account_num, email)
+            live_orphan: str | None = None
+            if live_pids:
+                # A live claude owns the family only while its profile HOLDS
+                # a credential (readable, or present-but-unreadable — a
+                # consumed predecessor may sit below an unreadable entry).
+                # A process whose profile holds nothing at all (no Keychain
+                # entry, no plaintext seed) owns no family: the shape of a
+                # session whose login expired and whose profile a later
+                # ``cswap add`` invalidated (CON-3156, slot 35). Treating it
+                # as the owner parks the slot dead behind "live-session"
+                # while the healer waits for a healthy gauge that this very
+                # verdict prevents. The backup is the slot's only generation
+                # — refresh it (seed guard below still applies); the profile
+                # stays untouched under the live process.
+                if profile_owned:
+                    held, err = _read_profile_credentials(session_dir)
+                    if held is None and err is None:
+                        live_orphan = "profile holds no credential"
+                    elif held is not None and not _holds_login_family(held):
+                        # Claude Code leaves a cleared shape behind an
+                        # expired login (no refresh token, expiresAt 0):
+                        # `list --token-status` reads it as profile
+                        # "missing"; the refresh must agree.
+                        live_orphan = (
+                            "profile credential is a revoked shape "
+                            "(no refresh token)"
+                        )
+                    if live_orphan is not None:
+                        live_orphan += (
+                            " under live pid(s) "
+                            + ", ".join(str(p) for p in live_pids)
+                            + "; backup refreshed, profile untouched"
+                        )
+                if live_orphan is None:
+                    return out(LIVE_SESSION)
+
+            profile_creds = None
+            if profile_owned and live_orphan is None:
                 profile_creds, err = _read_profile_credentials(session_dir)
                 if profile_creds is None and err is not None:
                     return out(DEFERRED, err)
@@ -404,12 +450,12 @@ def _refresh_resolved(
                 # first (write_account_credentials expects the held lock),
                 # then the profile re-seed.
                 switcher.write_account_credentials(account_num, email, working)
-                if profile_owned and not token_profile:
+                if profile_owned and not token_profile and live_orphan is None:
                     _reseed_profile(session_dir, working)
             # A successful rotation is proof the lineage is alive: lift any
             # stale quarantine state the same way a re-login does.
             switcher._usage_store.clear_dead_token([account_num], identity)
-            return out(REFRESHED)
+            return out(REFRESHED, live_orphan)
     except LockError:
         # Covers ClaudeCodeLockTimeout too (a live claude mid-refresh on
         # this profile): the credential is being handled — never steal.
