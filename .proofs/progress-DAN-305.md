@@ -2,7 +2,7 @@
 
 ## Где стоп
 - Детектор, тесты и разбор закоммичены, полный pytest зелёный.
-- Далее: два PR, свежий независимый ревьюер через дверь; phase pr прочитана.
+- Р.1 получен; замечания исправлены. Закоммитить, прогнать проверки и продолжить ТОГО ЖЕ ревьюера ca471088 после завершения текущего хода.
 
 ## Проверено
 - Тикет прочитан целиком: /tmp/dan-305-start/issue.txt; контракт cswap корректен.
@@ -22,12 +22,12 @@
 
 ## Отвергнуто
 - Блок/предупреждение/переписывание argv: намерение по форме ввода недоказуемо, контракт сохраняется.
-- Общий запрет claude/python3: ломает легальные prompts и существующий call site.
+- Общий запрет claude/python3: ломает допустимые prompts и существующий call site; существование вызова не доказывает корректность.
 - Установка в системный Python, live model calls, деплой и перелогин — не делались.
 
 ## Открытые вопросы
 - Живой замер ложных ещё невозможен без развёртывания; назначен critic-week, стадия feed.
-- Проверить независимым ревью полноту тестов и границы обоих PR.
+- Р.1: cswap approve, config revise (major: ошибочно оправдан call site). Все 7 замечаний приняты, исправления подготовлены; нужен confirm того же ревьюера.
 
 ## Команды, которые уже гоняли
 - UV_CACHE_DIR=/tmp/dan-305-uv-cache timeout 180 uv sync --locked --group dev → изолированная .venv.
@@ -37,6 +37,16 @@
 - config: failure-catalog.py index --write/check → 195 записей, индекс совпадает.
 - config: system-md-index-check.sh → OK, 332 имён.
 - После Windows-кейса целевой прогон → 283 passed in 9.31s; отдельно детектор 17 passed.
-- config: guard-registry.py lint --base origin/master --head HEAD → 0 находок; повтор после коммита идёт.
+- config: guard-registry.py lint --base origin/master --head HEAD → 0 находок после коммита.
 - Обе ветки fetch+merge актуальной базы → Already up to date.
-- Config run-all: запятая в --only не поддержана, пустой набор rc=3; исправлен на два --only, прогон идёт.
+- Config run-all: запятая в --only не поддержана, пустой набор rc=3; два --only прошли сьюты, но коммит автора внутри окна вызвал герметичность; повтор полного прямого набора на неизменном HEAD → SUITES-VERDICT: green 5 (99s).
+
+- PR: https://github.com/danpoyar/cswap/pull/51 (Linux/Windows SUCCESS); https://github.com/3c418/config/pull/2848.
+- Ревьюер: /tmp/dan-305-start/reviewer-spawn.txt; риск tests/thresholds, автомерж запрещён наказом двери.
+- Сверка главных копий: новых status-строк нет, commit: с начала нет в обеих.
+
+- Первичный источник нового вывода: config/.proofs/progress-CON-2698.md:40 — повторное claude становится prompt, правильная форма без него.
+- Р.1: .proofs/review-verdict-fix-dan-305.json и config/.proofs/review-verdict-fix-dan-305-postmortem.json; файлы валидны.
+- Двойной отказ: /tmp/dan-305-review/probe_failures.py прочитан; RED stderr 3 failed, 17 passed → GREEN targeted 286 passed in 3.79s.
+- Исправлены: stderr=None/EPIPE/closed не рвут запуск; UTC assert; тест не называет blind spot легальным; каталог, связь карты с session.py, ограничения поиска транскрипта.
+- Хвост: слот-проба и docs с лишним claude — отдельная сверка хозяина, ущерб auth-пробе не доказан; не править здесь, тикет-следствие не создан.

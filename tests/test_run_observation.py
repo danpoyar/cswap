@@ -1,8 +1,10 @@
 """Observe the real CLI-to-exec boundary without launching a model."""
 
 import json
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -50,6 +52,7 @@ def test_incident_observed_before_unchanged_exec(handoff, tail, kind):
     assert len(rows) == 1, "incident reached exec without an observation"
     assert rows[0]["kind"] == kind
     assert rows[0]["argc"] == len(tail)
+    assert datetime.fromisoformat(rows[0]["timestamp"]).utcoffset() == timezone.utc.utcoffset(None)
     assert set(rows[0]) == {"id", "timestamp", "kind", "argc"}
     assert tail[-1] not in ledger.read_text()
 
@@ -61,7 +64,7 @@ def test_incident_observed_before_unchanged_exec(handoff, tail, kind):
     ["Tell me about python3"], ["claude logs 69a90090"],
     ["python3"], ["python3", "is", "useful"], ["claude", "logs"],
 ])
-def test_legal_tails_unchanged_without_observation(handoff, tail):
+def test_other_tails_forwarded_unchanged_without_observation(handoff, tail):
     dispatch, _ = handoff
     assert dispatch(tail) == []
 
@@ -82,6 +85,20 @@ def test_unwritable_ledger_reports_failure_but_preserves_exec(handoff, capsys):
     err = capsys.readouterr().err
     assert "cswap-command-as-prompt: observation unavailable" in err
     assert "SECRET" not in err
+
+
+@pytest.mark.parametrize("stderr_failure", [None, BrokenPipeError(), ValueError("closed")])
+def test_broken_stderr_does_not_break_handoff_or_write_stdout(handoff, capsys, stderr_failure):
+    dispatch, ledger = handoff
+    ledger.parent.parent.mkdir(parents=True)
+    ledger.parent.write_text("not a directory")
+    stream = None
+    if stderr_failure is not None:
+        stream = Mock()
+        stream.write.side_effect = stderr_failure
+    with patch.object(sys, "stderr", stream):
+        assert dispatch(["python3", "-c", "SECRET"]) == []
+    assert capsys.readouterr().out == ""
 
 
 def test_windows_handoff_preserves_argv_and_exit_code(tmp_path, monkeypatch):

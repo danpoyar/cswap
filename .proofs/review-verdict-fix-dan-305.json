@@ -1,0 +1,35 @@
+{
+  "role": "code-reviewer",
+  "ticket": "DAN-305",
+  "verdict": "approve",
+  "round": 1,
+  "head_sha": "732b42e6a5ca4edc2bc1d78c9ef38198b51a254a",
+  "summary": "2 фактических (minor), 1 нит; блокеров нет — можно принимать; проводка доказана, точность и полнота на живом потоке не измерены; альтернативы: n/a",
+  "findings": [
+    {
+      "severity": "minor",
+      "message": "Диагностика сбоя ленты сама не защищена: print в обработчике исключения при сломанном stderr (EPIPE или закрытый поток) бросает исключение и рвёт запуск claude, при sys.stderr=None строка уходит в stdout. Нужен двойной отказ (лента не пишется И stderr сломан), но обещание тела PR «does not prevent launch» и «never changes stdout» в нём не держится. Воспроизведение: /tmp/dan-305-review/probe_failures.py — «unwritable + stderr broken pipe -> LAUNCH ABORTED: BrokenPipeError», «unwritable + sys.stderr is None -> stdout='cswap-command-as-prompt: observation unavailable'».",
+      "file": "src/claude_swap/session.py",
+      "line": 104
+    },
+    {
+      "severity": "minor",
+      "message": "Тест закрепляет как «легальный» tail `claude -p ok --max-turns 1` (форма живого вызова config/scripts/slot-org-probe.sh:227). По коду конечный argv = [claude_bin, 'claude', '-p', 'ok', …] (session.py:702) — слово claude стоит на месте запроса, как в инциденте (JSONL профиля 28: user='claude'). Это зафиксированная слепая зона узкого детектора, а не доказательство легальности: из 4 известных экземпляров класса детектор видит 2 (оба — те, под которые написан), форму CON-2698 `claude --model … -p …` и форму пробы — нет. Поведение соответствует заявленной узости, блокером не является.",
+      "file": "tests/test_run_observation.py",
+      "line": 60
+    },
+    {
+      "severity": "nit",
+      "message": "UTC метки времени не закреплён ни одним ассертом: мутация datetime.now() без timezone.utc проходит все 17 тестов (13 из 15 мутаций убиты; вторая выжившая — расширение до python*/-c, безвредна).",
+      "file": "tests/test_run_observation.py",
+      "line": 53
+    }
+  ],
+  "run_refs": [
+    "https://github.com/danpoyar/cswap/actions/runs/36286062539"
+  ],
+  "landing_id": "landing-chore-dan-305-8694d37025606ff4",
+  "brief_hash": "sha256:75e5c037b8ed",
+  "brief_version": "1",
+  "skills_hash": "sha256:a0d2f315396a"
+}

@@ -101,7 +101,11 @@ def _observe_command_as_prompt(args: list[str]) -> None:
         with ledger.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row) + "\n")
     except (OSError, RuntimeError):
-        print("cswap-command-as-prompt: observation unavailable", file=sys.stderr)
+        if sys.stderr is not None:
+            try:
+                print("cswap-command-as-prompt: observation unavailable", file=sys.stderr)
+            except (OSError, ValueError):
+                pass  # A broken diagnostic channel must not prevent the handoff.
 
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
