@@ -1,8 +1,8 @@
 # DAN-305 · Наблюдение команд, переданных как запрос модели
 
 ## Где стоп
-- Детектор и тесты написаны, разбор в отдельной копии config. Идёт полный pytest.
-- Далее: итог тестов, коммиты, phase pr, два PR, свежий независимый ревьюер через дверь.
+- Детектор, тесты и разбор закоммичены, полный pytest зелёный.
+- Далее: два PR, свежий независимый ревьюер через дверь; phase pr прочитана.
 
 ## Проверено
 - Тикет прочитан целиком: /tmp/dan-305-start/issue.txt; контракт cswap корректен.
@@ -33,7 +33,10 @@
 - UV_CACHE_DIR=/tmp/dan-305-uv-cache timeout 180 uv sync --locked --group dev → изолированная .venv.
 - timeout 900 .venv/bin/python3 -m pytest tests/test_run_observation.py -q → RED 4 failed, 12 passed (до кода).
 - timeout 900 .venv/bin/python3 -m pytest tests/test_run_observation.py tests/test_cli.py tests/test_session.py -q → GREEN 282 passed in 5.89s.
-- timeout 900 .venv/bin/python3 -m pytest tests -q → идёт, вывод /tmp/dan-305-start/full.txt.
-- config: failure-catalog.py index --write/check → 194 записей, индекс совпадает.
+- Полный pytest в sandbox: 1 failed, 2232 passed; process env probe недоступен. Вне sandbox: 2234 passed, 3 skipped, 1 xfailed in 97.72s; /tmp/dan-305-start/full-unsandboxed.txt.
+- config: failure-catalog.py index --write/check → 195 записей, индекс совпадает.
 - config: system-md-index-check.sh → OK, 332 имён.
-- config: guard-registry.py lint --base origin/master --head HEAD → 0 находок; повторить после коммита.
+- После Windows-кейса целевой прогон → 283 passed in 9.31s; отдельно детектор 17 passed.
+- config: guard-registry.py lint --base origin/master --head HEAD → 0 находок; повтор после коммита идёт.
+- Обе ветки fetch+merge актуальной базы → Already up to date.
+- Config run-all: запятая в --only не поддержана, пустой набор rc=3; исправлен на два --only, прогон идёт.
