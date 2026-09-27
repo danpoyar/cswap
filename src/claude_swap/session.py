@@ -45,7 +45,8 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from datetime import date, datetime
+import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -74,6 +75,34 @@ from claude_swap.usage_store import FetchRecord
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
+
+
+def _observe_command_as_prompt(args: list[str]) -> None:
+    """Record ambiguous command-shaped tails without changing Claude's contract."""
+    if len(args) < 3:
+        return
+    if args[:2] == ["claude", "logs"]:
+        kind = "claude-logs"
+    elif args[:2] == ["python3", "-c"]:
+        kind = "python-c"
+    else:
+        return
+
+    # Feed only: these can still be intentional prompts. Never store their text.
+    try:
+        ledger = Path.home() / ".local/state/cswap/command-as-prompt.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        row = {
+            "id": uuid.uuid4().hex,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            "argc": len(args),
+        }
+        with ledger.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+    except (OSError, RuntimeError):
+        print("cswap-command-as-prompt: observation unavailable", file=sys.stderr)
+
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: ide/,
@@ -669,6 +698,7 @@ class SessionManager:
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
         """
+        _observe_command_as_prompt(claude_args)
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:
