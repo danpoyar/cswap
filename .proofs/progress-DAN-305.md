@@ -2,7 +2,7 @@
 
 ## Где стоп
 - Детектор, тесты и разбор закоммичены, полный pytest зелёный.
-- Р.1 получен; замечания исправлены. Закоммитить, прогнать проверки и продолжить ТОГО ЖЕ ревьюера ca471088 после завершения текущего хода.
+- Р.2 завершён: оба PR approve, findings=[]; JSON валиден. Остаётся коммит/пуш вердиктов и прогресса, сверка соседних копий, финал Codex (статусы/финал-коммент — watcher).
 
 ## Проверено
 - Тикет прочитан целиком: /tmp/dan-305-start/issue.txt; контракт cswap корректен.
@@ -27,7 +27,7 @@
 
 ## Открытые вопросы
 - Живой замер ложных ещё невозможен без развёртывания; назначен critic-week, стадия feed.
-- Р.1: cswap approve, config revise (major: ошибочно оправдан call site). Все 7 замечаний приняты, исправления подготовлены; нужен confirm того же ревьюера.
+- Открытых замечаний нет: р.2 того же ревьюера approve обоим PR. Деплой и замер живой точности вне этой посадки; до них только feed.
 
 ## Команды, которые уже гоняли
 - UV_CACHE_DIR=/tmp/dan-305-uv-cache timeout 180 uv sync --locked --group dev → изолированная .venv.
@@ -50,3 +50,13 @@
 - Двойной отказ: /tmp/dan-305-review/probe_failures.py прочитан; RED stderr 3 failed, 17 passed → GREEN targeted 286 passed in 3.79s.
 - Исправлены: stderr=None/EPIPE/closed не рвут запуск; UTC assert; тест не называет blind spot легальным; каталог, связь карты с session.py, ограничения поиска транскрипта.
 - Хвост: слот-проба и docs с лишним claude — отдельная сверка хозяина, ущерб auth-пробе не доказан; не править здесь, тикет-следствие не создан.
+
+- Р.2 input: /tmp/dan-305-start/review2-prompt.txt; вывод /tmp/dan-305-start/review2-output.txt.
+- Полный итог после фикса stderr: 2237 passed, 3 skipped, 1 xfailed in 118.11s; config SUITES-VERDICT green 5, 115s.
+- review-quality-log р.1: findings=7, dismissed=24, accepted=7, rejected=0.
+
+- Resume: первая foreground-попытка отказала (фоновый job держал claim при state=done); --bg --resume сделал копию ab435d39. Оба точных собственных job остановлены claude stop с профилем 31, история сохранена. Исходный ca471088 продолжен foreground --resume, копия не используется для вердикта. Не повторять --bg --resume при живом background claim.
+
+- Ревью р.2: cswap 233c9f6 и config f752477 — approve, findings=[], reviewer_resume=resume. Красный контроль подтверждён независимо, 7/7 мутаций фикса убиты.
+- CI на исправлении: cswap Linux/Windows SUCCESS; config test-cheat-guard SUCCESS.
+- Автомерж не включать: наказ риск-зоны; PR остаются открыты по Codex run contract. Phase final и ручной финал/status не вызывать.
