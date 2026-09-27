@@ -2,7 +2,7 @@
 
 ## Где стоп
 - Детектор, тесты и разбор закоммичены, полный pytest зелёный.
-- Р.2 завершён: оба PR approve, findings=[]; JSON валиден. Остаётся коммит/пуш вердиктов и прогресса, сверка соседних копий, финал Codex (статусы/финал-коммент — watcher).
+- Работа по коду и разбору завершена: оба PR approve р.2, findings=[], вердикты отправлены. PR #51 и #2848 остаются открыты; автомерж запрещён риск-наказом. Финал и статус — watcher Codex.
 
 ## Проверено
 - Тикет прочитан целиком: /tmp/dan-305-start/issue.txt; контракт cswap корректен.
@@ -60,3 +60,6 @@
 - Ревью р.2: cswap 233c9f6 и config f752477 — approve, findings=[], reviewer_resume=resume. Красный контроль подтверждён независимо, 7/7 мутаций фикса убиты.
 - CI на исправлении: cswap Linux/Windows SUCCESS; config test-cheat-guard SUCCESS.
 - Автомерж не включать: наказ риск-зоны; PR остаются открыты по Codex run contract. Phase final и ручной финал/status не вызывать.
+
+- Финальная сверка главных копий после всех коммитов: cswap/config new status lines=[], main checkout commits=none с метки /tmp/dan-305-start/time.
+- review-quality р.2: findings=0, dismissed=4, accepted=0, rejected=0; review-rounds обеих веток → Important 0, resume р.2.
