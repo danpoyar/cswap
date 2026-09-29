@@ -23,6 +23,7 @@ from claude_swap.models import Platform
 from claude_swap.refresh import OFFSITE, refresh_account
 from claude_swap.reseed import ReseedRefusal, reseed_account
 from claude_swap.session import SessionManager
+from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.settings import settings_path
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -171,3 +172,11 @@ def test_egress_journal_counts_requests_per_account(tmp_path):
 def test_cli_verbs_translate():
     assert _translate_subcommand(["offsite", "2", "--host", HOST]) == ["--offsite-account", "2", "--host", HOST]
     assert _translate_subcommand(["onsite", "2"]) == ["--onsite-account", "2"]
+
+
+def test_import_force_keeps_the_account_offsite(fleet, tmp_path):
+    fleet.set_account_offsite("2", HOST)
+    envelope = tmp_path / "b.json"
+    export_accounts(fleet, str(envelope), account="2")
+    import_accounts(fleet, str(envelope), force=True)
+    assert fleet.offsite_host("2") == HOST
