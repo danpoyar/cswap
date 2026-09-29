@@ -1,0 +1,13 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-4019",
+  "verdict": "approve",
+  "round": 3,
+  "reviewer_resume": "resume",
+  "head_sha": "e3901e4fdff6f35180124959da8f1846550aa5ed",
+  "summary": "фактических нет, можно принимать. Открытая находка р.2 закрыта: _perform_switch перепроверяет offsite под FileLock сразу после перечитки data (switcher.py:6820-6829), до любых записей; мой сценарий гонки (offsite внутри _heal_target_backup при switch_to) теперь даёт ConfigError на switcher.py:6825. Спот-чек tests/test_offsite.py — 18 passed на e3901e4; CI прогон 36639033591 на e3901e4 на момент вердикта pending — мерж только после зелёного. альтернативы: judged",
+  "findings": [],
+  "run_refs": ["https://github.com/danpoyar/cswap/actions/runs/36639033591"],
+  "proofs_opened": [],
+  "baselines_opened": []
+}
