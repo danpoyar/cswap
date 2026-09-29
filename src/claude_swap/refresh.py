@@ -81,6 +81,7 @@ TRANSIENT_ERROR = "transient-error"  # network blip; safe to retry later
 DEFERRED = "deferred"  # unsafe to act now (locks, unreadable keychain)
 NO_CREDENTIALS = "no-credentials"
 API_KEY = "api-key"  # API-key slots have no OAuth family to refresh
+OFFSITE = "offsite"  # the account lives on another machine (cswap offsite) — refreshed there
 # Pre-activation heal outcomes (CON-1579; ``heal_backup_before_activation``).
 BACKUP_CURRENT = "backup-current"  # backup is the slot's newest generation (or no profile)
 RESYNCED = "resynced"  # backup adopted the profile's FRESH generation — no grant consumed
@@ -266,6 +267,11 @@ def _refresh_resolved(
 
     if switcher._account_kind(account_num) == "api_key":
         return out(API_KEY)
+    offsite_host = switcher.offsite_host(account_num)
+    if offsite_host is not None:
+        # One network exit point per account (CON-4019): its refresh grant is
+        # consumed on the machine that owns it, never from here.
+        return out(OFFSITE, f"lives on {offsite_host}")
 
     session_dir = switcher._session_dir(account_num, email)
     try:

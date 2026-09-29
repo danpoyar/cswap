@@ -19,6 +19,9 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 _logger = logging.getLogger("claude-swap")
+# Egress journal (CON-4019, handler in logging_config): one line per request
+# sent on an account's behalf — "usage account=N" / "refresh account=N".
+_egress = logging.getLogger("claude-swap.egress")
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -589,6 +592,7 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
+        _egress.info("refresh account=%s", account_num)
         refresh = try_refresh_oauth_credentials(working_credentials)
         if refresh.credentials:
             working_credentials = refresh.credentials
@@ -609,6 +613,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
+        _egress.info("usage account=%s", account_num)
         data = request_usage_data(access_token)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
@@ -627,6 +632,7 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
+        _egress.info("refresh account=%s", account_num)
         refresh = try_refresh_oauth_credentials(working_credentials)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
@@ -647,6 +653,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
+            _egress.info("usage account=%s retry=after-refresh", account_num)
             data = request_usage_data(new_token)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:

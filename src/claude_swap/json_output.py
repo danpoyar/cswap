@@ -32,6 +32,10 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # replaces the credential; distinct from "token expired" (which Claude Code can
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
+# The account lives on another machine (``cswap offsite``): this machine keeps
+# the stored login but never polls, refreshes, switches to or runs it, so the
+# account has one network exit point (CON-4019). ``cswap onsite`` returns it.
+USAGE_OFFSITE = "offsite"
 
 # Plain-language notes keyed by ``usageStatus`` (CON-2639). One table for every
 # surface — the human ``list`` renderer, the menu bar and the JSON projection
@@ -43,6 +47,7 @@ STATUS_NOTES = {
     "keychain_unavailable": "keychain unavailable — locked or in use; try again",
     "relogin_required": "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
     "no_credentials": "no credentials stored for this slot — run: cswap add",
+    "offsite": "account lives on another machine — not polled here; return it with: cswap onsite",
 }
 
 # Plain-language notes for the fetch-error kinds ``oauth._classify_usage_error``
@@ -222,6 +227,8 @@ def usage_fields(
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
         return "relogin_required", None
+    if entry == USAGE_OFFSITE:
+        return "offsite", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
@@ -297,6 +304,7 @@ def account_row(
     consecutive_failures: int = 0,
     alias: str = "",
     disabled: bool = False,
+    offsite: dict | None = None,
     next_poll_at: float | None = None,
     token_expired_at: float | None = None,
     inference_token: bool = False,
@@ -329,6 +337,10 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive (CON-4019): present only while the account lives on another
+    # machine — ``{"host": ..., "since": ...}`` as ``cswap offsite`` wrote it.
+    if offsite:
+        row["offsite"] = {"host": offsite.get("host"), "since": offsite.get("since")}
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

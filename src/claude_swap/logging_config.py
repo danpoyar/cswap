@@ -5,6 +5,10 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+EGRESS_LOGGER = "claude-swap.egress"
+EGRESS_LOG_NAME = "claude-swap-egress.log"
+
+
 class _LazyDirRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler that creates its parent dir on first emit.
 
@@ -60,5 +64,22 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
         console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
         logger.addHandler(console_handler)
+
+    # Egress journal (CON-4019): one line per request this machine sends to
+    # Anthropic on an account's behalf (usage poll, token refresh), keyed by
+    # slot number — the proof that an account moved to another machine gets
+    # zero requests from here. Own file so the main log keeps its history.
+    egress = logging.getLogger(EGRESS_LOGGER)
+    egress.handlers.clear()
+    egress.setLevel(logging.INFO)
+    egress.propagate = False
+    egress_handler = _LazyDirRotatingFileHandler(
+        log_dir / EGRESS_LOG_NAME,
+        maxBytes=1024 * 1024,
+        backupCount=5,
+        delay=True,
+    )
+    egress_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    egress.addHandler(egress_handler)
 
     return logger

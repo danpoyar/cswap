@@ -559,6 +559,7 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
+        self.switcher.ensure_onsite(account_num, email, "a session")
 
         # CON-1971: set when the same-account fast path was skipped BECAUSE
         # of an attached token — the seed under the lock must then find the
@@ -711,6 +712,7 @@ class SessionManager:
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
+        self.switcher.ensure_onsite(account_num, email, "a session")
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
         # Deferred invalidation: backup credentials changed while this profile

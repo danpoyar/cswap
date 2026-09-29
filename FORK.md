@@ -625,6 +625,22 @@ read in one sitting.
   resumes. Away from home nothing changes. Fleet-shaped (the home pin is
   fork-only); the parole/backoff split is worth offering upstream.
 
+- `cswap offsite <num|email> --host H` / `cswap onsite` (CON-4019,
+  2026-09-29): one network exit point per account. The fleet moves Claude
+  accounts into disposable VMs of its own node; an account used from the
+  node while this Mac keeps polling it would show two addresses at once —
+  the shape of a stolen token. An offsite account keeps its stored login,
+  but this machine never polls it (collector sentinel `usageStatus:
+  "offsite"`, additive row field `offsite: {host, since}`), never refreshes
+  or reseeds it (`refresh` outcome `offsite`, `reseed` refusal `offsite`),
+  never switches to it (explicit `switch` refuses, rotation and strategies
+  skip it) and never runs a session on it. The active login and
+  `autoswitch.homeAccount` cannot go offsite. Proof channel: the egress
+  journal `claude-swap-egress.log` (own rotating file, logger
+  `claude-swap.egress`) — one line per usage GET or refresh POST sent on an
+  account's behalf, `usage account=N` / `refresh account=N`. Fleet-shaped;
+  the egress journal is worth offering upstream.
+
 ## Syncing with upstream
 
 ```

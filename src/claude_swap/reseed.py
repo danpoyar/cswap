@@ -215,6 +215,11 @@ def reseed_account(
             outcome, f"Account-{account_num} ({email}): {message}", live_pids=pids
         )
 
+    offsite_host = switcher.offsite_host(account_num)
+    if offsite_host is not None:
+        # One network exit point per account (CON-4019).
+        raise refuse("offsite", f"lives on {offsite_host} (cswap offsite) — reseed it there")
+
     def report(
         outcome: str, pids: list[int], generation: str | None, detail: str | None = None
     ) -> ReseedReport:

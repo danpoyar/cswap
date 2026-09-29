@@ -33,6 +33,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_OFFSITE,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -1519,7 +1520,92 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
+            and not self._offsite_from_data(data, str(num))
         ]
+
+    @staticmethod
+    def _offsite_from_data(data: dict, account_num: str) -> dict | None:
+        """``{"host", "since"}`` while the slot lives on another machine."""
+        record = data.get("accounts", {}).get(str(account_num))
+        offsite = record.get("offsite") if record else None
+        return offsite if isinstance(offsite, dict) else None
+
+    def offsite_host(self, account_num: str) -> str | None:
+        """The machine that owns this account's network exit, or ``None``."""
+        offsite = self._offsite_from_data(self._get_sequence_data() or {}, str(account_num))
+        return str(offsite.get("host") or "?") if offsite else None
+
+    def offsite_account_numbers(self) -> list[str]:
+        """Managed slots that live on another machine, in sequence order."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._offsite_from_data(data, str(num))
+        ]
+
+    def ensure_onsite(self, account_num: str, email: str, action: str) -> None:
+        """Refuse a network action for an account that lives elsewhere.
+
+        One network exit point per account (CON-4019): while the account is
+        offsite, this machine must not poll, refresh, switch to or run it —
+        two addresses using one login at once looks like a stolen token.
+        """
+        host = self.offsite_host(account_num)
+        if host is not None:
+            raise ConfigError(
+                f"Account-{account_num} ({email}) lives on {host} (cswap offsite) — "
+                f"{action} runs there, not on this machine. Return it first: "
+                f"cswap onsite {account_num}"
+            )
+
+    def set_account_offsite(self, identifier: str, host: str | None) -> None:
+        """Move an account's network exit to another machine, or bring it back.
+
+        ``host`` set: this machine stops polling, refreshing, switching to and
+        running the account (``usageStatus: "offsite"`` in ``list --json``);
+        the stored login stays so ``cswap onsite`` can take it back. The
+        active login and the configured home account cannot go offsite — they
+        are this machine's own. ``host=None`` returns the account.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+        account_num, email, _ = self.resolve_account(identifier)
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        if host is not None:
+            host = host.strip()
+            if not host or any(ch.isspace() for ch in host):
+                raise ValidationError(f"Invalid offsite host: {host!r}")
+            if str(data.get("activeAccountNumber")) == account_num:
+                raise ConfigError(
+                    f"Account-{account_num} ({email}) is the active login — "
+                    "switch away before moving it to another machine"
+                )
+            home = load_settings(self.backup_dir).home_account
+            if home is not None and str(home) == account_num:
+                raise ConfigError(
+                    f"Account-{account_num} ({email}) is autoswitch.homeAccount — "
+                    "the home login stays on this machine"
+                )
+            current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
+            if current and current.get("host") == host:
+                print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))
+                return
+            record["offsite"] = {"host": host, "since": get_timestamp()}
+            verb = f"offsite on {host}"
+        else:
+            if "offsite" not in record:
+                print(dimmed(f"Account-{account_num} ({email}) is already on this machine."))
+                return
+            record.pop("offsite", None)
+            verb = "back on this machine"
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Account {account_num} is {verb}: {email}")
+        print(f"{accent('Account-' + account_num)} ({email}) is {verb}.")
 
     @staticmethod
     def _disabled_from_data(data: dict, account_num: str) -> bool:
@@ -4682,6 +4768,11 @@ class ClaudeAccountSwitcher:
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        # One network exit point per account (CON-4019): an offsite account is
+        # polled on its own machine — never reserved or fetched here.
+        for num in self.offsite_account_numbers():
+            if num in info_by_num:
+                sentinels[num] = USAGE_OFFSITE
 
         entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine — but the quarantine condemns
@@ -4979,6 +5070,7 @@ class ClaudeAccountSwitcher:
             if str(n) != str(current_num)
             and self._account_is_switchable(str(n))
             and not self._disabled_from_data(data, str(n))
+            and not self._offsite_from_data(data, str(n))
         ]
         if not others:
             return None, "none"
@@ -5154,6 +5246,7 @@ class ClaudeAccountSwitcher:
                 consecutive_failures=entry.consecutive_failures,
                 alias=alias,
                 disabled=self._disabled_from_data(seq_data, str(num)),
+                offsite=self._offsite_from_data(seq_data, str(num)),
                 next_poll_at=entry.next_poll_at,
                 token_expired_at=entry.token_expired_at,
                 inference_token=self.has_inference_token(email),
@@ -5227,6 +5320,9 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            offsite = self._offsite_from_data(seq_data, str(num))
+            if offsite:
+                markers += f" {muted('(offsite: ' + str(offsite.get('host')) + ')')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
@@ -5536,8 +5632,11 @@ class ClaudeAccountSwitcher:
 
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
-            if target_disabled or not self._account_is_switchable(target):
-                if target_disabled:
+            target_offsite = self._offsite_from_data(data, target)
+            if target_disabled or target_offsite or not self._account_is_switchable(target):
+                if target_offsite:
+                    reason = console_reason = f"(offsite: {target_offsite.get('host')})"
+                elif target_disabled:
                     reason = console_reason = "(disabled)"
                 else:
                     reason = "(no stored credentials/config)"
@@ -5553,6 +5652,7 @@ class ClaudeAccountSwitcher:
                     (str(num) for num in sequence
                      if str(num) != target
                      and not self._disabled_from_data(data, str(num))
+                     and not self._offsite_from_data(data, str(num))
                      and self._account_is_switchable(str(num))),
                     None,
                 )
@@ -5752,6 +5852,14 @@ class ClaudeAccountSwitcher:
         skipped_exhausted: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
+            candidate_offsite = self._offsite_from_data(data, candidate)
+            if candidate_offsite:
+                note = f"(offsite: {candidate_offsite.get('host')})"
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} {note}")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} {note}")
+                continue
             if self._disabled_from_data(data, candidate):
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
@@ -5930,6 +6038,10 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(
                 f"No account found with identifier: {identifier}"
             )
+        target_email = (
+            (self._get_sequence_data() or {}).get("accounts", {}).get(target_account, {}).get("email", "")
+        )
+        self.ensure_onsite(target_account, target_email, "switching to it")
 
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
