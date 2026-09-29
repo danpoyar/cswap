@@ -60,6 +60,8 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
+    "offsite": "--offsite-account",
+    "onsite": "--onsite-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -1193,6 +1195,11 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s offsite <num|email> --host H
+                                   the account lives on machine H: this machine
+                                   stops polling, refreshing, switching to and
+                                   running it (one network exit per account)
+  %(prog)s onsite <num|email>         bring an offsite account back to this machine
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1290,6 +1297,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help="Specify slot number when adding account (use with 'add' or 'add-token')",
     )
     parser.add_argument(
+        "--host",
+        metavar="HOST",
+        help="Machine that owns an offsite account's network exit (use with 'offsite')",
+    )
+    parser.add_argument(
         "--email",
         metavar="EMAIL",
         help=(
@@ -1368,6 +1380,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     group.add_argument(
         "--enable-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--offsite-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--onsite-account",
         metavar="NUM|EMAIL",
         help=argparse.SUPPRESS,
     )
@@ -1465,6 +1487,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
+        or args.offsite_account is not None
+        or args.onsite_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1574,6 +1598,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
+        elif args.offsite_account is not None:
+            if not args.host:
+                parser.error("offsite needs --host <machine that owns the account>")
+            switcher.set_account_offsite(args.offsite_account, args.host)
+        elif args.onsite_account is not None:
+            switcher.set_account_offsite(args.onsite_account, None)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

@@ -1,0 +1,16 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-4019",
+  "verdict": "revise",
+  "round": 2,
+  "reviewer_resume": "resume",
+  "head_sha": "253c2b47b8fb1214f48865dbd3e0bc5d51a9ce9b",
+  "summary": "1 фактическая (Important), нитов нет. Закрыты все находки р.1: журнал egress в трёх функциях запросов (все вызыватели объявляют слот), флаг под FileLock, живой логин по ~/.claude.json, _perform_switch как точка + тесты путей (мутант best-фильтра красный), home по email, re-add сохраняет offsite, ниты. Открыта одна: проверка offsite в _perform_switch стоит ДО замка свитча — offsite, записанный в окне heal, даёт живой логин на offsite-аккаунте (воспроизведено). Размер 646 — виза Yor 30-09 00:07 в CON-4019, условие (pytest 2234 в теле PR) выполнено. альтернативы: judged",
+  "findings": [
+    {"severity": "major", "file": "src/claude_swap/switcher.py", "line": 6729,
+     "message": "Точка отказа offsite в _perform_switch — check-then-act вне замка: ensure_onsite читает sequence.json на 6726-6729, затем _heal_target_backup (6749, может слать refresh POST цели), и только на 6818 берётся FileLock, под которым data перечитывается (6819) и activeAccountNumber пишется без повторной проверки offsite. set_account_offsite теперь пишет под тем же замком и судит живой логин — но цель ещё не живая, замок свободен. Воспроизведено (сеть заглушена): второй инстанс зовёт set_account_offsite('2') внутри _heal_target_backup при switch_to('2') — итог: ~/.claude.json = b@ (слот 2 — живой логин мака) и offsite_host('2') = HOST одновременно. Это вторая сторона находки р.1 про гонку offsite↔switch: запись флага сериализована, чтение в свитче — нет. Лекарство: перепроверить self._offsite_from_data(data, target) под замком после 6819 и отказать до мутаций (тот же приём в autoswitch._freshen_target не нужен, если отказ под замком есть; остаточный refresh POST в heal/freshen в том же окне — сказать в FORK.md или закрыть ожиданием на стороне place).",
+     "cause": "code", "evidence": "src/claude_swap/switcher.py:6729; src/claude_swap/switcher.py:6818", "confidence": 0.8}
+  ],
+  "proofs_opened": [],
+  "baselines_opened": []
+}

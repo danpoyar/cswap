@@ -215,6 +215,11 @@ def reseed_account(
             outcome, f"Account-{account_num} ({email}): {message}", live_pids=pids
         )
 
+    offsite_host = switcher.offsite_host(account_num)
+    if offsite_host is not None:
+        # One network exit point per account (CON-4019).
+        raise refuse("offsite", f"lives on {offsite_host} (cswap offsite) — reseed it there")
+
     def report(
         outcome: str, pids: list[int], generation: str | None, detail: str | None = None
     ) -> ReseedReport:
@@ -425,9 +430,10 @@ def reseed_account(
                     # Inside the profile locks: a live claude mid-refresh
                     # re-reads the store under them and adopts the successor
                     # instead of POSTing its own (consumed) grant.
-                    result = oauth.try_refresh_oauth_credentials(
-                        backup, timeout_s=_RESEED_POST_TIMEOUT_S
-                    )
+                    with oauth.egress_account(account_num):
+                        result = oauth.try_refresh_oauth_credentials(
+                            backup, timeout_s=_RESEED_POST_TIMEOUT_S
+                        )
                     if result.error in ("invalid_grant", "no_refresh_token"):
                         switcher._usage_store.record(
                             {

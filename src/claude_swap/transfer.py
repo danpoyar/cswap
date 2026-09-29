@@ -533,6 +533,13 @@ def import_accounts(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        # An offsite account stays offsite through an overwrite (CON-4019):
+        # bringing it back is always the explicit `cswap onsite`, so a
+        # credential refresh from its owner machine never re-opens this
+        # machine's exit while the owner may still be polling it.
+        previous = data.get("accounts", {}).get(target_num) or {}
+        if isinstance(previous.get("offsite"), dict):
+            new_record["offsite"] = previous["offsite"]
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

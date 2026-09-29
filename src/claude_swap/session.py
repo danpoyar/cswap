@@ -60,7 +60,11 @@ from claude_swap.inference_token import inference_token_credentials
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import credential_fingerprint, try_refresh_oauth_credentials
+from claude_swap.oauth import (
+    credential_fingerprint,
+    egress_account,
+    try_refresh_oauth_credentials,
+)
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import (
@@ -559,6 +563,7 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
+        self.switcher.ensure_onsite(account_num, email, "a session")
 
         # CON-1971: set when the same-account fast path was skipped BECAUSE
         # of an attached token — the seed under the lock must then find the
@@ -711,6 +716,7 @@ class SessionManager:
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
+        self.switcher.ensure_onsite(account_num, email, "a session")
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
         # Deferred invalidation: backup credentials changed while this profile
@@ -1131,7 +1137,8 @@ class SessionManager:
                     f"cswap-relogin.sh {account_num} (or `cswap add --slot "
                     f"{account_num}` after logging in with {email})."
                 )
-            outcome = try_refresh_oauth_credentials(creds)
+            with egress_account(account_num):
+                outcome = try_refresh_oauth_credentials(creds)
             if outcome.credentials:
                 creds = outcome.credentials
                 self.switcher.write_account_credentials(account_num, email, creds)

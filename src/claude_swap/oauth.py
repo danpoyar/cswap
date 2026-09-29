@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import contextvars
 import json
 import logging
 import urllib.error
@@ -19,6 +21,25 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 _logger = logging.getLogger("claude-swap")
+# Egress journal (CON-4019, handler in logging_config): one line per HTTP
+# request to Anthropic, written by the three request functions below right
+# before the request leaves — "usage|refresh|profile account=N". N is the slot
+# the caller declared with ``egress_account`` (a context variable, so the
+# request functions keep their signatures); "?" when none was declared.
+_egress = logging.getLogger("claude-swap.egress")
+_egress_account: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "claude_swap_egress_account", default=None
+)
+
+
+@contextlib.contextmanager
+def egress_account(account_num: object):
+    """Declare the slot on whose behalf requests inside the block are sent."""
+    token = _egress_account.set(str(account_num))
+    try:
+        yield
+    finally:
+        _egress_account.reset(token)
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -129,6 +150,7 @@ def try_refresh_oauth_credentials(
             },
             method="POST",
         )
+        _egress.info("refresh account=%s", _egress_account.get() or "?")
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             resp_data = json.loads(resp.read().decode())
 
@@ -220,6 +242,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
+        _egress.info("profile account=%s", _egress_account.get() or "?")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
@@ -336,6 +359,7 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
+    _egress.info("usage account=%s", _egress_account.get() or "?")
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
@@ -566,6 +590,20 @@ def fetch_usage(access_token: str) -> dict | None:
 
 
 def try_fetch_usage_for_account(
+    account_num: str,
+    email: str,
+    credentials: str,
+    is_active: bool,
+    persist_credentials: Callable[[str, str, str], None] | None = None,
+) -> UsageOutcome:
+    """Journal-keyed wrapper (CON-4019): every request inside is ``account=N``."""
+    with egress_account(account_num):
+        return _try_fetch_usage_for_account(
+            account_num, email, credentials, is_active, persist_credentials
+        )
+
+
+def _try_fetch_usage_for_account(
     account_num: str,
     email: str,
     credentials: str,

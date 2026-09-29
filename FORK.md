@@ -625,6 +625,31 @@ read in one sitting.
   resumes. Away from home nothing changes. Fleet-shaped (the home pin is
   fork-only); the parole/backoff split is worth offering upstream.
 
+- `cswap offsite <num|email> --host H` / `cswap onsite` (CON-4019,
+  2026-09-29): one network exit point per account. The fleet moves Claude
+  accounts into disposable VMs of its own node; an account used from the
+  node while this Mac keeps polling it would show two addresses at once —
+  the shape of a stolen token. An offsite account keeps its stored login,
+  but this machine never polls it (collector sentinel `usageStatus:
+  "offsite"`, additive row field `offsite: {host, since}`), never refreshes
+  or reseeds it (`refresh` outcome `offsite`, `reseed` refusal `offsite`,
+  autoswitch freshen skips it), never switches to it (`_perform_switch`
+  refuses — the chokepoint every switch path reaches; rotation, strategies
+  and the fresh-machine fallback skip it first) and never runs a session on
+  it. The live login (by `~/.claude.json` identity), `autoswitch.homeAccount`
+  (number or email) and an account with a live session here cannot go
+  offsite; the flag is written under the switch lock, and `import --force`
+  and a re-`add` keep it — returning is always the explicit `onsite`.
+  Proof channel: the egress journal `claude-swap-egress.log` (own rotating
+  file, logger `claude-swap.egress`, a throwaway log for the XDG migration
+  check). The three request functions (`request_usage_data`,
+  `try_refresh_oauth_credentials`, `fetch_oauth_profile`) write one line per
+  request right before it leaves — `usage|refresh|profile account=N` — with
+  N from the `oauth.egress_account(num)` context the caller declares (a
+  context variable, so signatures and every test mock stay as upstream);
+  undeclared → `account=?`. Fleet-shaped; the egress journal is worth
+  offering upstream.
+
 ## Syncing with upstream
 
 ```

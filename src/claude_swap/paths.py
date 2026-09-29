@@ -142,7 +142,7 @@ def get_backup_root() -> Path:
 # migration treats a target containing only these as effectively empty, since
 # wiping them loses no real state.
 _THROWAWAY_NAMES = {"cache"}
-_THROWAWAY_PREFIXES = ("claude-swap.log",)
+_THROWAWAY_PREFIXES = ("claude-swap.log", "claude-swap-egress.log")  # + rotations (.1, .2 …)
 
 
 def _target_has_meaningful_data(target: Path) -> bool:

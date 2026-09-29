@@ -219,6 +219,9 @@ class TestMigrateLegacyBackupDir:
         (target / "cache" / "update_check.json").write_text("{}")
         (target / "claude-swap.log").write_text("noise")
         (target / "claude-swap.log.1").write_text("rotated")
+        # CON-4019: the egress journal is the same kind of throwaway log.
+        (target / "claude-swap-egress.log").write_text("usage account=1")
+        (target / "claude-swap-egress.log.1").write_text("rotated")
 
         assert migrate_legacy_backup_dir(target) is True
         assert not legacy.exists()
