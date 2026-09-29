@@ -301,3 +301,21 @@ def test_import_force_keeps_the_account_offsite(fleet, tmp_path):
     export_accounts(fleet, str(envelope), account="2")
     import_accounts(fleet, str(envelope), force=True)
     assert fleet.offsite_host("2") == HOST
+
+
+def test_offsite_set_mid_switch_is_refused_under_the_lock(fleet, temp_home):  # noqa: ARG001
+    """The pre-check passes, then another process sets offsite before the
+    switch takes its lock: the switch must still refuse, nothing written."""
+    real_heal = fleet._heal_target_backup
+
+    def heal_then_race(*args, **kwargs):
+        data = fleet._get_sequence_data()
+        data["accounts"]["2"]["offsite"] = {"host": HOST, "since": "2026-09-30T00:00:00Z"}
+        fleet._write_json(fleet.sequence_file, data)
+        return real_heal(*args, **kwargs)
+
+    with patch.object(fleet, "_heal_target_backup", side_effect=heal_then_race), \
+            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=_fake_anthropic):
+        with pytest.raises(ConfigError, match=f"lives on {HOST}"):
+            fleet.switch_to("2")
+    assert fleet._get_sequence_data()["activeAccountNumber"] != 2

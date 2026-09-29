@@ -6817,6 +6817,16 @@ class ClaudeAccountSwitcher:
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
+            # Re-judged under the lock (CON-4019, review r.2): `cswap offsite`
+            # writes under this same lock, so a flag set after the pre-check
+            # above is seen here — before anything is written.
+            target_offsite = self._offsite_from_data(data, target_account)
+            if target_offsite:
+                raise ConfigError(
+                    f"Account-{target_account} lives on {target_offsite.get('host')} "
+                    f"(cswap offsite) — switching to it runs there, not on this "
+                    f"machine. Return it first: cswap onsite {target_account}"
+                )
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
