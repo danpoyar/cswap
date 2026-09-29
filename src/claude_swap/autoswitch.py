@@ -1369,6 +1369,10 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
+        if self.switcher.offsite_host(number) is not None:
+            # CON-4019: the account lives on another machine — never refresh
+            # or activate it here (candidates already exclude it; belt).
+            return "skip-live-session"
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
         if self._live_login_pids(number, email):
@@ -1440,7 +1444,8 @@ class AutoSwitchEngine:
         )
         if not near_expiry:
             return "ok"
-        outcome = oauth.try_refresh_oauth_credentials(creds)
+        with oauth.egress_account(number):
+            outcome = oauth.try_refresh_oauth_credentials(creds)
         if outcome.error is None and outcome.credentials:
             # Persist first, unconditionally: the grant consumed a generation,
             # and not writing the successor would kill the lineage regardless

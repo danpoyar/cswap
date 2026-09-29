@@ -186,6 +186,7 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: STATUS_NOTES["api_key"],
     USAGE_KEYCHAIN_UNAVAILABLE: STATUS_NOTES["keychain_unavailable"],
     USAGE_RELOGIN_REQUIRED: STATUS_NOTES["relogin_required"],
+    USAGE_OFFSITE: STATUS_NOTES["offsite"],
 }
 
 
@@ -1564,28 +1565,23 @@ class ClaudeAccountSwitcher:
 
         ``host`` set: this machine stops polling, refreshing, switching to and
         running the account (``usageStatus: "offsite"`` in ``list --json``);
-        the stored login stays so ``cswap onsite`` can take it back. The
-        active login and the configured home account cannot go offsite — they
-        are this machine's own. ``host=None`` returns the account.
+        the stored login stays so ``cswap onsite`` can take it back. The live
+        login (by ``~/.claude.json`` identity, not only the recorded
+        ``activeAccountNumber``), ``autoswitch.homeAccount`` (number or email)
+        and an account with a live session here cannot go offsite — they are
+        this machine's own. ``host=None`` returns the account. The sequence
+        read-modify-write runs under the switch lock, so a concurrent switch
+        cannot write back a stale record that drops the flag.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
-        account_num, email, _ = self.resolve_account(identifier)
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        account_num, email, org_uuid = self.resolve_account(identifier)
         if host is not None:
             host = host.strip()
             if not host or any(ch.isspace() for ch in host):
                 raise ValidationError(f"Invalid offsite host: {host!r}")
-            if str(data.get("activeAccountNumber")) == account_num:
-                raise ConfigError(
-                    f"Account-{account_num} ({email}) is the active login — "
-                    "switch away before moving it to another machine"
-                )
             home = load_settings(self.backup_dir).home_account
-            if home is not None and str(home) == account_num:
+            if home is not None and str(home).strip() in (account_num, email):
                 raise ConfigError(
                     f"Account-{account_num} ({email}) is autoswitch.homeAccount — "
                     "the home login stays on this machine"
@@ -1593,20 +1589,35 @@ class ClaudeAccountSwitcher:
             # A live session here would keep using the account from this
             # machine while the other one takes over — two exits at once.
             self._ensure_no_live_session(account_num, email, "cswap offsite")
-            current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
-            if current and current.get("host") == host:
-                print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))
-                return
-            record["offsite"] = {"host": host, "since": get_timestamp()}
-            verb = f"offsite on {host}"
-        else:
-            if "offsite" not in record:
-                print(dimmed(f"Account-{account_num} ({email}) is already on this machine."))
-                return
-            record.pop("offsite", None)
-            verb = "back on this machine"
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            if host is not None:
+                live = self._get_current_account()
+                live_here = live is not None and live[0] == email and (
+                    not live[1] or not org_uuid or live[1] == org_uuid
+                )
+                if live_here or str(data.get("activeAccountNumber")) == account_num:
+                    raise ConfigError(
+                        f"Account-{account_num} ({email}) is the active login — "
+                        "switch away before moving it to another machine"
+                    )
+                current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
+                if current and current.get("host") == host:
+                    print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))
+                    return
+                record["offsite"] = {"host": host, "since": get_timestamp()}
+                verb = f"offsite on {host}"
+            else:
+                if "offsite" not in record:
+                    print(dimmed(f"Account-{account_num} ({email}) is already on this machine."))
+                    return
+                record.pop("offsite", None)
+                verb = "back on this machine"
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
         self._logger.info(f"Account {account_num} is {verb}: {email}")
         print(f"{accent('Account-' + account_num)} ({email}) is {verb}.")
 
@@ -2702,7 +2713,8 @@ class ClaudeAccountSwitcher:
         try:
             access_token = oauth.extract_access_token(live)
             if access_token:
-                resolved = oauth.fetch_oauth_profile(access_token)
+                with oauth.egress_account(identity_slot):
+                    resolved = oauth.fetch_oauth_profile(access_token)
         except Exception as e:
             self._logger.debug(f"Profile resolution raised: {e!r}")
         slot = (
@@ -3451,6 +3463,7 @@ class ClaudeAccountSwitcher:
 
         # Update sequence.json
         data = self._get_sequence_data()
+        previous = data["accounts"].get(account_num) or {}
         data["accounts"][account_num] = {
             "email": current_email,
             "uuid": account_uuid,
@@ -3461,6 +3474,10 @@ class ClaudeAccountSwitcher:
         carried_alias = alias if alias is not None else existing_alias
         if carried_alias:
             data["accounts"][account_num]["alias"] = carried_alias
+        # A re-add keeps an offsite account offsite (CON-4019): returning it
+        # is always the explicit `cswap onsite`.
+        if isinstance(previous.get("offsite"), dict) and previous.get("email") == current_email:
+            data["accounts"][account_num]["offsite"] = previous["offsite"]
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
@@ -3658,6 +3675,7 @@ class ClaudeAccountSwitcher:
         )
 
         data = self._get_sequence_data()
+        previous = data["accounts"].get(account_num) or {}
         record = {
             "email": email,
             "uuid": "",
@@ -3667,6 +3685,8 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        if isinstance(previous.get("offsite"), dict) and previous.get("email") == email:
+            record["offsite"] = previous["offsite"]  # re-add keeps offsite (CON-4019)
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -4308,9 +4328,10 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
-                        result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
-                        )
+                        with oauth.egress_account(account_num):
+                            result = oauth.try_refresh_oauth_credentials(
+                                refresh_input, timeout_s=6.0
+                            )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
                         ) or (
@@ -5665,7 +5686,8 @@ class ClaudeAccountSwitcher:
                     ):
                         raise ConfigError(
                             "No accounts remain in rotation. Re-enable one with: "
-                            "cswap enable <num|email>"
+                            "cswap enable <num|email> (or return an offsite one: "
+                            "cswap onsite <num|email>)"
                         )
                     raise ConfigError(
                         "No managed accounts have valid stored credentials/config. "
@@ -6211,7 +6233,8 @@ class ClaudeAccountSwitcher:
         if not access_token:
             return result  # raw API key / garbled JSON — nothing to resolve
         try:
-            result["resolved"] = oauth.fetch_oauth_profile(access_token)
+            with oauth.egress_account(slot):
+                result["resolved"] = oauth.fetch_oauth_profile(access_token)
         except Exception as e:
             # fetch_oauth_profile swallows its own failures; this belt keeps
             # the invariant structural — the oracle is advisory and must
@@ -6697,6 +6720,13 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
+        # One network exit point per account (CON-4019): the single chokepoint
+        # every switch path reaches — rotation, strategies, the fresh-machine
+        # fallback and explicit switch_to all land here.
+        offsite_email = (
+            (self._get_sequence_data() or {}).get("accounts", {}).get(str(target_account), {}).get("email", "")
+        )
+        self.ensure_onsite(str(target_account), offsite_email, "switching to it")
         warnings_out: list[str] = []
         # Session-mode drift notice: switching the default login to an
         # account that also has a live session profile puts the same refresh

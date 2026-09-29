@@ -60,7 +60,11 @@ from claude_swap.inference_token import inference_token_credentials
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import credential_fingerprint, try_refresh_oauth_credentials
+from claude_swap.oauth import (
+    credential_fingerprint,
+    egress_account,
+    try_refresh_oauth_credentials,
+)
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import (
@@ -1133,7 +1137,8 @@ class SessionManager:
                     f"cswap-relogin.sh {account_num} (or `cswap add --slot "
                     f"{account_num}` after logging in with {email})."
                 )
-            outcome = try_refresh_oauth_credentials(creds)
+            with egress_account(account_num):
+                outcome = try_refresh_oauth_credentials(creds)
             if outcome.credentials:
                 creds = outcome.credentials
                 self.switcher.write_account_credentials(account_num, email, creds)

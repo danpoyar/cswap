@@ -44,6 +44,7 @@ from claude_swap.exceptions import LockError
 from claude_swap.inference_token import is_inference_token_credentials
 from claude_swap.locking import FileLock
 from claude_swap.oauth import (
+    egress_account,
     credential_fingerprint,
     extract_oauth_data,
     is_oauth_token_expired,
@@ -441,9 +442,10 @@ def _refresh_resolved(
                 if profile_owned
                 else nullcontext()
             ):
-                result = try_refresh_oauth_credentials(
-                    candidate, timeout_s=_REFRESH_POST_TIMEOUT_S
-                )
+                with egress_account(account_num):
+                    result = try_refresh_oauth_credentials(
+                        candidate, timeout_s=_REFRESH_POST_TIMEOUT_S
+                    )
                 if result.error in ("invalid_grant", "no_refresh_token"):
                     # Permanently unrefreshable — advance the store's strike
                     # so every surface flips to "re-login needed" instead of

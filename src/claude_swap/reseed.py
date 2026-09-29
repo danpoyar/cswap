@@ -430,9 +430,10 @@ def reseed_account(
                     # Inside the profile locks: a live claude mid-refresh
                     # re-reads the store under them and adopts the successor
                     # instead of POSTing its own (consumed) grant.
-                    result = oauth.try_refresh_oauth_credentials(
-                        backup, timeout_s=_RESEED_POST_TIMEOUT_S
-                    )
+                    with oauth.egress_account(account_num):
+                        result = oauth.try_refresh_oauth_credentials(
+                            backup, timeout_s=_RESEED_POST_TIMEOUT_S
+                        )
                     if result.error in ("invalid_grant", "no_refresh_token"):
                         switcher._usage_store.record(
                             {

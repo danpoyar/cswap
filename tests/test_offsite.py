@@ -25,6 +25,7 @@ from claude_swap.reseed import ReseedRefusal, reseed_account
 from claude_swap.session import SessionManager
 from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.settings import settings_path
+from claude_swap import switcher as switcher_mod
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 HOST = "148.251.131.11"
@@ -155,18 +156,138 @@ def test_refresh_and_reseed_do_not_touch_an_offsite_account(fleet):
     assert refused.value.outcome == "offsite"
 
 
-def test_egress_journal_counts_requests_per_account(tmp_path):
-    setup_logging(tmp_path)
-    creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-7", "refreshToken": "rt-7",
-                                          "expiresAt": 9999999999999}})
-    with patch("claude_swap.oauth.request_usage_data", return_value={}):
-        oauth.try_fetch_usage_for_account("7", "g@example.com", creds, is_active=False)
+class _Resp:
+    def __init__(self, body: dict):
+        self._body = json.dumps(body).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_anthropic(req, timeout=None):
+    url = req.full_url
+    if "oauth/token" in url:
+        return _Resp({"access_token": "sk-new", "refresh_token": "rt-new", "expires_in": 3600})
+    return _Resp({})
+
+
+def _journal(path: Path) -> list[str]:
     for handler in logging.getLogger("claude-swap.egress").handlers:
         handler.flush()
-    lines = (tmp_path / EGRESS_LOG_NAME).read_text().splitlines()
-    assert len(lines) == 1 and lines[0].endswith("usage account=7")
-    assert "usage account=7" not in (tmp_path / "claude-swap.log").read_text() \
-        if (tmp_path / "claude-swap.log").exists() else True
+    log = path / EGRESS_LOG_NAME
+    return [line.split(" ", 2)[-1] for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_egress_journal_names_every_request_by_slot(tmp_path):
+    """The three request functions journal themselves; the slot comes from
+    ``egress_account`` — an expired inactive backup costs a refresh POST and a
+    usage GET, both keyed ``account=7``; a request outside any declared slot
+    is still journaled, as ``account=?``."""
+    setup_logging(tmp_path)
+    expired = json.dumps({"claudeAiOauth": {"accessToken": "sk-7", "refreshToken": "rt-7", "expiresAt": 1}})
+    with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=_fake_anthropic):
+        oauth.try_fetch_usage_for_account("7", "g@example.com", expired, is_active=False)
+        oauth.fetch_oauth_profile("sk-x")
+        with oauth.egress_account("9"):
+            oauth.try_refresh_oauth_credentials(expired)
+    assert _journal(tmp_path) == ["refresh account=7", "usage account=7", "profile account=?",
+                                  "refresh account=9"]
+    main_log = tmp_path / "claude-swap.log"
+    assert not main_log.exists() or "account=7" not in main_log.read_text()
+
+
+def test_refresh_command_journals_its_post(fleet, temp_home):  # noqa: ARG001
+    setup_logging(fleet.backup_dir)
+    fleet._write_account_credentials(
+        "3", "c@example.com",
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-3", "refreshToken": "rt-3", "expiresAt": 1}}))
+    with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=_fake_anthropic):
+        refresh_account(fleet, "3")
+    assert "refresh account=3" in _journal(fleet.backup_dir)
+
+
+def test_offsite_write_runs_under_the_switch_lock(fleet):
+    entered = []
+    real = switcher_mod.FileLock
+
+    class Recording(real):
+        def __enter__(self):
+            entered.append(self)
+            return super().__enter__()
+
+    with patch.object(switcher_mod, "FileLock", Recording):
+        fleet.set_account_offsite("2", HOST)
+    assert entered and fleet.offsite_host("2") == HOST
+
+
+def test_live_login_by_identity_cannot_go_offsite(fleet, temp_home):
+    # Recorded active is slot 1, but the live ~/.claude.json login is b@ (slot 2).
+    (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "b@example.com", "accountUuid": "uuid-2"}}))
+    with pytest.raises(ConfigError, match="active login"):
+        fleet.set_account_offsite("2", HOST)
+
+
+def test_home_account_by_email_stays(fleet):
+    settings_path(fleet.backup_dir).write_text(json.dumps({"autoswitch": {"homeAccount": "c@example.com"}}))
+    with pytest.raises(ConfigError, match="homeAccount"):
+        fleet.set_account_offsite("3", HOST)
+
+
+def test_every_switch_path_skips_or_refuses_an_offsite_account(fleet, temp_home, capsys):
+    fleet.set_account_offsite("2", HOST)
+    # rotation from the live slot 1 skips 2 and lands on 3
+    (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "a@example.com", "accountUuid": "uuid-1"}}))
+    (temp_home / ".claude").mkdir(exist_ok=True)
+    (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1", "expiresAt": 9999999999999}}))
+    with patch.object(fleet, "list_accounts"):
+        fleet.switch()
+    assert f"Skipping Account-2 (offsite: {HOST})" in capsys.readouterr().out
+    assert fleet._get_sequence_data()["activeAccountNumber"] == 3
+    # best strategy never names it, even with the most headroom
+    usage = {"1": {"five_hour": {"pct": 90.0}}, "2": {"five_hour": {"pct": 0.0}},
+             "3": {"five_hour": {"pct": 50.0}}}
+    target, _ = fleet._select_best_switchable("1", usage=usage)
+    assert target != "2"
+    # the single chokepoint refuses it outright
+    with pytest.raises(ConfigError, match=f"lives on {HOST}"):
+        fleet._perform_switch("2")
+
+
+def test_fresh_machine_fallback_skips_offsite(temp_home, capsys):  # noqa: ARG001
+    s = _setup()
+    _seed(s, 1, "a@example.com")
+    _seed(s, 2, "b@example.com")
+    _seed(s, 3, "c@example.com")
+    data = s._get_sequence_data()
+    data["activeAccountNumber"] = 2
+    s._write_json(s.sequence_file, data)
+    data["accounts"]["2"]["offsite"] = {"host": HOST, "since": "2026-09-29T21:00:00Z"}
+    s._write_json(s.sequence_file, data)
+    with patch.object(s, "list_accounts"):
+        s.switch()
+    assert f"Skipping Account-2 (offsite: {HOST})" in capsys.readouterr().out
+    assert s._get_sequence_data()["activeAccountNumber"] != 2
+
+
+def test_readd_from_token_keeps_offsite(fleet):
+    fleet.set_account_offsite("2", HOST)
+    with patch.object(fleet, "_live_session_pids", return_value=[]), \
+            patch("claude_swap.oauth.urllib.request.urlopen", side_effect=_fake_anthropic):  # no real network
+        try:
+            fleet.add_account_from_token("sk-ant-oat01-" + "Q" * 40, email="b@example.com", slot=2,
+                                         assume_yes=True)
+        except Exception as exc:  # noqa: BLE001 — the path may refuse for token reasons; the flag must survive
+            print(f"add_account_from_token: {exc!r}")
+    assert fleet.offsite_host("2") == HOST
 
 
 def test_cli_verbs_translate():
