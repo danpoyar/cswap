@@ -1590,6 +1590,9 @@ class ClaudeAccountSwitcher:
                     f"Account-{account_num} ({email}) is autoswitch.homeAccount — "
                     "the home login stays on this machine"
                 )
+            # A live session here would keep using the account from this
+            # machine while the other one takes over — two exits at once.
+            self._ensure_no_live_session(account_num, email, "cswap offsite")
             current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
             if current and current.get("host") == host:
                 print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))

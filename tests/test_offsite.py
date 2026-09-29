@@ -16,7 +16,7 @@ import pytest
 
 from claude_swap import oauth
 from claude_swap.cli import _translate_subcommand
-from claude_swap.exceptions import ConfigError, ValidationError
+from claude_swap.exceptions import ConfigError, SessionError, ValidationError
 from claude_swap.json_output import USAGE_OFFSITE, account_row, usage_fields
 from claude_swap.logging_config import EGRESS_LOG_NAME, setup_logging
 from claude_swap.models import Platform
@@ -82,7 +82,7 @@ def test_offsite_holds_the_account_out_and_onsite_returns_it(fleet, capsys):
     assert fleet.switchable_account_numbers() == ["1", "2", "3"]
 
 
-def test_active_and_home_accounts_stay_on_this_machine(fleet):
+def test_active_home_and_live_accounts_stay_on_this_machine(fleet):
     with pytest.raises(ConfigError, match="active login"):
         fleet.set_account_offsite("1", HOST)
     settings_path(fleet.backup_dir).write_text(json.dumps({"autoswitch": {"homeAccount": "3"}}))
@@ -90,6 +90,9 @@ def test_active_and_home_accounts_stay_on_this_machine(fleet):
         fleet.set_account_offsite("3", HOST)
     with pytest.raises(ValidationError):
         fleet.set_account_offsite("2", "two words")
+    with patch.object(fleet, "_live_session_pids", return_value=[4242]):
+        with pytest.raises(SessionError, match="4242"):
+            fleet.set_account_offsite("2", HOST)
     assert fleet.offsite_account_numbers() == []
 
 
