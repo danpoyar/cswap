@@ -1,0 +1,15 @@
+{
+  "role": "code-reviewer",
+  "ticket": "CON-3593",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "b7bad291c9e909521851f5cfe64ce9acc51eaf91",
+  "reviewer_resume": "resume",
+  "summary": "раунд 2: Important раунда 1 (shutil не импортирован) закрыта коммитом b7bad29 — import shutil, basename-кортеж claude/claude.exe/claude.cmd, два теста на ветку путей (красные без фикса, зелёные на HEAD), ruff F821 чист; фактических нет, можно принимать; альтернативы: judged",
+  "findings": [],
+  "run_refs": [
+    "https://github.com/danpoyar/cswap/actions/runs/37238238060/job/111541560874",
+    "https://github.com/danpoyar/cswap/actions/runs/37238238060",
+    "https://github.com/danpoyar/cswap/actions/runs/37237353868/job/111539038827"
+  ]
+}
