@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -101,6 +102,30 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
+def _names_claude_binary(word: str) -> bool:
+    """True when `word` is the claude program itself, by name or by path.
+
+    `cswap run N -- claude attach <id>` would exec `claude claude attach <id>`:
+    claude takes the second word as its prompt and silently drops the rest
+    (live probe 2026-10-04, Claude Code 2.1.289: `claude foo bar -p` → prompt
+    `foo`), so instead of attaching it started a stray interactive session
+    per call, and `-- claude -p "<brief>"` sent the prompt `claude` with the
+    brief dropped (CON-3593). Only the first forwarded word is judged: a later
+    `claude` is a value (`--resume claude`) and claude's own business, and a
+    leading path with another basename (`./brief.md`) is forwarded as-is.
+    """
+    if os.path.basename(word) in ("claude", "claude.exe", "claude.cmd"):
+        return True
+    if os.sep in word:
+        found = shutil.which("claude")
+        if found:
+            try:
+                return os.path.realpath(word) == os.path.realpath(found)
+            except OSError:
+                return False
+    return False
+
+
 def _run_command(argv: list[str]) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
@@ -136,6 +161,7 @@ Examples:
   cswap run 2 --no-share
   cswap run 2 --share-history
   cswap run 2 -- --resume
+  cswap run 2 -- -p --resume <id>   # claude itself is implied: never '-- claude …'
         """,
     )
     parser.add_argument(
@@ -172,6 +198,14 @@ Examples:
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
+    if tail and _names_claude_binary(tail[0]):
+        parser.error(
+            f"'{tail[0]}' after '--': cswap run launches claude itself and forwards "
+            "the words after '--' as claude's arguments, so a leading claude word "
+            "reaches claude as its prompt (`-- claude attach <id>` starts a stray "
+            "interactive session instead of attaching). Write the arguments only: "
+            "`cswap run N -- -p --resume <id>`."
+        )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)

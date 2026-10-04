@@ -137,6 +137,7 @@ Launch Claude Code as a specific account in the current terminal only — every 
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
+cswap run 2 -- -p --resume <id> # claude itself is implied: a leading 'claude' word is refused
 cswap run 2 --share-history     # share your chat history with this account too
 ```
 

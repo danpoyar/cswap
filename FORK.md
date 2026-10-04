@@ -709,3 +709,13 @@ do by accident.
   streak is open, and `(!) limit reached` on a maxed per-model window. `http-429`
   on the usage gauge is the endpoint's polling budget, so its note never reads as
   the account's own limit. Worth sending upstream.
+
+- `cswap run N -- claude …` is refused (CON-3593, 2026-10-04): `run` execs
+  `claude <tail>` verbatim, so a tail that starts with the claude word or
+  its path ran `claude claude attach <id>` — claude took the second word as
+  its prompt and dropped the rest (live probe on Claude Code 2.1.289), which
+  started a stray interactive session per call instead of attaching, and
+  `-- claude -p "<brief>"` sent the prompt `claude` with the brief dropped.
+  `_names_claude_binary` in `cli.py` judges only the first forwarded word
+  (`--resume claude` is a value and passes); the error names the fix
+  (`cswap run N -- -p --resume <id>`). Worth sending upstream.
