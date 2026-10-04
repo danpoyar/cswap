@@ -647,7 +647,7 @@ class TestRunCommand:
         Claude Code 2.1.289), so `-- claude attach <id>` births a stray
         interactive session instead of attaching (CON-3593). Refuse the word
         by name or by path; the fix is to drop it."""
-        for tail in (["claude", "attach", "2ecb8bb4"], ["/usr/local/bin/claude", "-p", "hi"]):
+        for tail in (["claude", "attach", "2ecb8bb4"], ["/usr/local/bin/claude", "-p", "hi"], ["claude.exe", "attach", "x"]):
             with patch.object(sys, "argv", ["claude-swap", "run", "2", "--", *tail]):
                 with pytest.raises(SystemExit) as excinfo:
                     cli.main()
@@ -655,6 +655,28 @@ class TestRunCommand:
             err = capsys.readouterr().err
             assert "cswap run" in err and "launches claude itself" in err, err
             assert "-- -p --resume" in err, err
+
+    def test_tail_path_not_claude_is_forwarded(self):
+        """A leading path whose basename isn't claude is claude's own value (a
+        brief file): it must reach claude, not crash the wrapper (review r.1:
+        the realpath branch ran without its import)."""
+        calls = self._dispatch(["run", "2", "--", "./brief.md"])
+        assert ("run", "2", ["./brief.md"], True, False) in calls
+
+    def test_tail_path_resolving_to_claude_is_refused(self, tmp_path, capsys):
+        """The claude binary by another path — the versions/<N> file behind the
+        PATH symlink — is still claude: judged by realpath against which()."""
+        real = tmp_path / "versions" / "2.1.289"
+        real.parent.mkdir()
+        real.write_text("")
+        link = tmp_path / "claude"
+        link.symlink_to(real)
+        with patch("claude_swap.cli.shutil.which", return_value=str(link)), \
+             patch.object(sys, "argv", ["claude-swap", "run", "2", "--", str(real), "attach", "x"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "launches claude itself" in capsys.readouterr().err
 
     def test_tail_value_named_claude_passes(self):
         """Only the FIRST forwarded word is judged: a value that happens to be

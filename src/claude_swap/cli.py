@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -110,9 +111,10 @@ def _names_claude_binary(word: str) -> bool:
     `foo`), so instead of attaching it started a stray interactive session
     per call, and `-- claude -p "<brief>"` sent the prompt `claude` with the
     brief dropped (CON-3593). Only the first forwarded word is judged: a later
-    `claude` is a value (`--resume claude`) and claude's own business.
+    `claude` is a value (`--resume claude`) and claude's own business, and a
+    leading path with another basename (`./brief.md`) is forwarded as-is.
     """
-    if os.path.basename(word) == "claude":
+    if os.path.basename(word) in ("claude", "claude.exe", "claude.cmd"):
         return True
     if os.sep in word:
         found = shutil.which("claude")
