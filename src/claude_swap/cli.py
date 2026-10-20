@@ -1229,7 +1229,7 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
-  %(prog)s offsite <num|email> --host H
+  %(prog)s offsite <num|email> --host H [--last]
                                    the account lives on machine H: this machine
                                    stops polling, refreshing, switching to and
                                    running it (one network exit per account)
@@ -1335,6 +1335,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         metavar="HOST",
         help="Machine that owns an offsite account's network exit (use with 'offsite')",
     )
+    parser.add_argument("--last", action="store_true",
+                        help="Save and log out the active login before offsite; leaves this machine signed out")
     parser.add_argument(
         "--email",
         metavar="EMAIL",
@@ -1504,6 +1506,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     args = parser.parse_args(argv)
 
+    if args.last and args.offsite_account is None:
+        parser.error("--last is only valid with offsite")
     # No action selected: emit a clean, subcommand-oriented message rather than
     # the raw argparse "one of the arguments ... is required" (which would list
     # the now-hidden legacy flags). Value actions can be falsy-but-set
@@ -1635,7 +1639,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.offsite_account is not None:
             if not args.host:
                 parser.error("offsite needs --host <machine that owns the account>")
-            switcher.set_account_offsite(args.offsite_account, args.host)
+            switcher.set_account_offsite(args.offsite_account, args.host, last=args.last)
         elif args.onsite_account is not None:
             switcher.set_account_offsite(args.onsite_account, None)
         elif args.list:
