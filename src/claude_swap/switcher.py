@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1560,7 +1561,7 @@ class ClaudeAccountSwitcher:
                 f"cswap onsite {account_num}"
             )
 
-    def set_account_offsite(self, identifier: str, host: str | None) -> None:
+    def set_account_offsite(self, identifier: str, host: str | None, *, last: bool = False) -> None:
         """Move an account's network exit to another machine, or bring it back.
 
         ``host`` set: this machine stops polling, refreshing, switching to and
@@ -1573,6 +1574,8 @@ class ClaudeAccountSwitcher:
         read-modify-write runs under the switch lock, so a concurrent switch
         cannot write back a stale record that drops the flag.
         """
+        if last and host is None:
+            raise ValidationError("--last is only valid with offsite")
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
         account_num, email, org_uuid = self.resolve_account(identifier)
@@ -1599,16 +1602,44 @@ class ClaudeAccountSwitcher:
                 live_here = live is not None and live[0] == email and (
                     not live[1] or not org_uuid or live[1] == org_uuid
                 )
-                if live_here or str(data.get("activeAccountNumber")) == account_num:
+                current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
+                active = live_here or str(data.get("activeAccountNumber")) == account_num
+                if current and current.get("host") == host and not active:
+                    print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))
+                    return
+                if active and not last:
                     raise ConfigError(
                         f"Account-{account_num} ({email}) is the active login — "
                         "switch away before moving it to another machine"
                     )
-                current = record.get("offsite") if isinstance(record.get("offsite"), dict) else None
-                if current and current.get("host") == host:
-                    print(dimmed(f"Account-{account_num} ({email}) is already offsite on {host}."))
-                    return
+                if last:
+                    if not live_here:
+                        raise ConfigError("--last requires the live login identity to match the selected account")
+                    sessions, _ = get_running_instances()
+                    if sessions:
+                        raise SessionError("Exit live Claude sessions before logging out the last account")
+                    executable = shutil.which("claude")
+                    if not executable:
+                        raise ConfigError("claude is unavailable; last account not moved")
+                    credentials = self._read_credentials()
+                    if not credentials:
+                        raise CredentialReadError("Cannot save the live login before logout")
+                    config = self._get_claude_config_path().read_text(encoding="utf-8")
+                    self._write_account_credentials(account_num, email, credentials)
+                    self._write_account_config(account_num, email, config)
+                    try:
+                        logout = subprocess.run([executable, "auth", "logout"], capture_output=True, timeout=60)
+                        if logout.returncode:
+                            raise ConfigError("claude auth logout failed; offsite was not set")
+                        status = subprocess.run([executable, "auth", "status"], capture_output=True, timeout=60)
+                        if status.returncode != 1 or json.loads(status.stdout).get("loggedIn") is not False:
+                            raise ConfigError("claude auth status did not confirm logout; offsite was not set")
+                    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+                        raise ConfigError("Cannot confirm logout; offsite was not set") from None
+                    data["activeAccountNumber"] = None
                 record["offsite"] = {"host": host, "since": get_timestamp()}
+                if last:
+                    record["offsite"]["last"] = True
                 verb = f"offsite on {host}"
             else:
                 if "offsite" not in record:

@@ -319,3 +319,85 @@ def test_offsite_set_mid_switch_is_refused_under_the_lock(fleet, temp_home):  # 
         with pytest.raises(ConfigError, match=f"lives on {HOST}"):
             fleet.switch_to("2")
     assert fleet._get_sequence_data()["activeAccountNumber"] != 2
+
+
+@pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+def test_last_saves_live_family_logs_out_then_marks_offsite(fleet, platform):
+    fleet.platform = platform
+    import subprocess
+    live_creds = json.dumps({'claudeAiOauth': {'accessToken': 'fixture-live', 'refreshToken': 'fixture-refresh'}})
+    config = fleet._get_claude_config_path()
+    config.write_text(json.dumps({'oauthAccount': {'emailAddress': 'a@example.com'}}))
+    seen = []
+
+    def run(argv, **kwargs):
+        assert fleet.offsite_host('1') is None
+        assert fleet._read_account_credentials('1', 'a@example.com') == live_creds
+        assert kwargs['capture_output'] is True and kwargs['timeout'] == 60
+        seen.append(argv[1:])
+        if argv[1:] == ['auth', 'logout']:
+            config.write_text('{}')
+            return subprocess.CompletedProcess(argv, 0, b'', b'')
+        return subprocess.CompletedProcess(argv, 1, b'{"loggedIn":false}', b'')
+
+    with patch.object(fleet, '_read_credentials', return_value=live_creds), \
+         patch.object(switcher_mod, 'get_running_instances', return_value=([], [])), \
+         patch.object(switcher_mod.shutil, 'which', return_value='/fixture/claude'), \
+         patch('subprocess.run', side_effect=run):
+        fleet.set_account_offsite('1', HOST, last=True)
+        fleet.set_account_offsite('1', HOST, last=True)
+    assert seen == [['auth', 'logout'], ['auth', 'status']]
+    data = fleet._get_sequence_data()
+    assert data['activeAccountNumber'] is None
+    assert data['accounts']['1']['offsite']['last'] is True
+    assert fleet.offsite_host('1') == HOST
+
+
+@pytest.mark.parametrize('failure', ['logout', 'status', 'timeout'])
+def test_last_failed_logout_never_marks_offsite(fleet, failure):
+    import subprocess
+    fleet._get_claude_config_path().write_text(json.dumps({'oauthAccount': {'emailAddress': 'a@example.com'}}))
+    creds = fleet._read_account_credentials('1', 'a@example.com')
+    def run(argv, **kwargs):
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired(argv, 60)
+        if argv[-1] == 'logout':
+            return subprocess.CompletedProcess(argv, 1 if failure == 'logout' else 0, b'', b'PRIVATE')
+        return subprocess.CompletedProcess(argv, 0, b'{"loggedIn":true}', b'PRIVATE')
+    with patch.object(fleet, '_read_credentials', return_value=creds), \
+         patch.object(switcher_mod, 'get_running_instances', return_value=([], [])), \
+         patch.object(switcher_mod.shutil, 'which', return_value='/fixture/claude'), \
+         patch('subprocess.run', side_effect=run), pytest.raises(ConfigError) as error:
+        fleet.set_account_offsite('1', HOST, last=True)
+    assert 'PRIVATE' not in str(error.value)
+    assert fleet.offsite_host('1') is None
+    assert fleet._get_sequence_data()['activeAccountNumber'] == 1
+
+
+def test_last_does_not_log_out_another_identity_or_live_session(fleet):
+    from types import SimpleNamespace
+    with patch('subprocess.run') as run:
+        with patch.object(fleet, '_get_current_account', return_value=('b@example.com', '')):
+            with pytest.raises(ConfigError, match='identity'):
+                fleet.set_account_offsite('1', HOST, last=True)
+        with patch.object(fleet, '_get_current_account', return_value=('a@example.com', '')), \
+             patch.object(switcher_mod, 'get_running_instances', return_value=([SimpleNamespace(pid=999)], [])):
+            with pytest.raises(SessionError):
+                fleet.set_account_offsite('1', HOST, last=True)
+        run.assert_not_called()
+
+
+def test_cli_forwards_last_only_to_offsite(fleet):
+    import sys
+    from claude_swap import cli
+    with patch.object(sys, 'argv', ['cswap', 'offsite', '1', '--host', HOST, '--last']), \
+         patch.object(cli, 'ClaudeAccountSwitcher', return_value=fleet), \
+         patch.object(fleet, 'set_account_offsite') as change, \
+         patch('claude_swap.update_check.check_for_update', return_value=None):
+        cli.main()
+        change.assert_called_once_with('1', HOST, last=True)
+    with patch.object(sys, 'argv', ['cswap', 'onsite', '1', '--last']), \
+         patch.object(fleet, 'set_account_offsite') as change, pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    change.assert_not_called()
