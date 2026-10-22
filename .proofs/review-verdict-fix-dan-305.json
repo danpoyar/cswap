@@ -1,0 +1,17 @@
+{
+  "role": "code-reviewer",
+  "ticket": "DAN-305",
+  "verdict": "approve",
+  "round": 2,
+  "head_sha": "233c9f6dfdc75892f79bdfba33c6f67d6922069b",
+  "summary": "фактических нет, можно принимать; подтверждение фикса 732b42e..233c9f6: двойной отказ (лента + stderr None/EPIPE/closed) больше не рвёт запуск и не пишет в stdout, UTC закреплён ассертом, имя теста не объявляет claude -p легальным; красный контроль 3 failed / 17 passed воспроизведён, 7 из 7 мутаций фикса убиты; альтернативы: n/a",
+  "findings": [],
+  "run_refs": [
+    "https://github.com/danpoyar/cswap/actions/runs/36287690326"
+  ],
+  "reviewer_resume": "resume",
+  "landing_id": "landing-chore-dan-305-8694d37025606ff4",
+  "brief_hash": "sha256:75e5c037b8ed",
+  "brief_version": "1",
+  "skills_hash": "sha256:a0d2f315396a"
+}
